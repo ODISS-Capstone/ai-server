@@ -1,0 +1,29 @@
+services:
+  odiss-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: odiss-server
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - APP_ENV=production
+      - DEBUG=false
+      - MD_DATABASE_PATH=/app/data/md_database
+      - STORAGE_PATH=/app/data/storage
+      - DATABASE_URL=sqlite+aiosqlite:///./data/senior_med.db
+    volumes:
+      - odiss-data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+volumes:
+  odiss-data:
+    driver: local

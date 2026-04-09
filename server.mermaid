@@ -1,0 +1,167 @@
+flowchart TD
+    %% 외부 환경
+
+    %% 클라우드 AI 서버 내부
+    subgraph Cloud_Server [클라우드 AI 서버: ODISS 서버엔진 아키텍처]
+        direction TB
+        
+        subgraph Database_Layer [MD Database Layer]
+            direction LR
+            subgraph Permanent_Memories [영구 데이터베이스 저장소]
+                DB_User[("Patient.md<br/>성별, 연령, 기저질환")]
+                DB_OCR_History[("OCRHistory.md<br/>OCR 결과, 신뢰도, 재시도 횟수,복용 이력")]
+                DB_Prescription_Raw_History[("Prescription.md<br/>처방전 정보, 처방 날짜, 기저질환 연계여부...")]
+                DB_Medication_Log[("MedicationLog.md<br/>질문 쿼리 및 주요 응답 이력")]
+                DB_DUR_Linkage_History[("DURLinkageHistory.md<br/>DUR Tool 호출 내역")]
+                DB_Health_Supplement_Log[("HealthSupplementLog.md<br/>건기식 쿼리 및 응답 이력")]
+            end
+            
+            subgraph Flash_Memories [휘발성 압축 메모리]
+                DB_Prescription_Main_Memory[("PrescriptionLog.md<br/>복용정보 주의사항 요약")]            
+                DB_Current_User_Profile[("CurrentUserProfile.md<br/>현재 환자 프로필")]
+                DB_Current_User_Requirement[("CurrentRequirement.md<br/>최근 5회 요구사항")]
+                DB_Current_User_Manual[("CurrentManual.md<br/>응답 대응 매뉴얼")]
+                DB_Context_Memory[("CurrentManual.md<br/>컨텍스트 엔진")]
+            end
+        end
+        
+        %% ==========================================
+        %% 1. 대화 엔진 (Conversation Engine)
+        %% ==========================================
+        subgraph Conversation_Engine [🗣️ 대화 엔진 Conversation Engine : 페르소나 및 인터페이스]
+            direction TB
+            CE_Input[STT 해석 데이터 수신]
+            CE_Latency[즉시 응답 처리 및 스몰토크<br/>'Latency Hiding']
+            CE_Tone[환자 맞춤형 언어 순화 및 최적화]
+            CE_Conversation_Core[대화 정책 코어 에이전트]
+            CE_Response[음성 출력 응답]
+                     
+            CE_Input --> CE_Latency
+            CE_Latency-->CE_Conversation_Core 
+            CE_Tone-->CE_Conversation_Core
+            RE_Core_Msg-->CE_Conversation_Core 
+            
+            CE_Conversation_Core --> CE_Response
+        end
+
+        %% ==========================================
+        %% 2. 메모리 엔진 (Memory Engine)
+        %% ==========================================
+        subgraph Memory_Engine [🧠 메모리 엔진 Memory Engine : 지식 창고 및 사서]
+            direction TB
+            OCR_Logging[처방전 OCR 로깅]
+            OCR_DUR_Interatction[OCR 처방전 DUR 동기화]
+            ME_Context[사용자 식별 및 컨텍스트 로드]
+            ME_Parse[환자 개인정보 구분 및 , 주요 정보 로그 파싱]
+            ME_RAG[환자 관리 및 관련 이력 검색]
+            ME_Update[데이터 업데이트 및 압축 저장<br/>MD 무결성 유지]
+          
+            ME_Context <--"새로운 환자의 사항인지 체킹"--> Database_Layer
+            ME_Context --> ME_Parse
+            ME_Parse --환자가 새로운 환자로 등록되면 확인-->DB_User
+            Permanent_Memories -->ME_Update
+            ME_Update --> Flash_Memories 
+        end
+
+        %% ==========================================
+        %% 3. 추론 엔진 (Reasoning Engine)
+        %% ==========================================
+        subgraph Reasoning_Engine [⚙️ 추론 엔진 Reasoning Engine : 지휘통제실]
+            direction TB
+            RE_Intent[의도 파악 및 태스크 설계<br/>Intent & Planning]
+            CE_Prescription_OCR[처방전 OCR 요청]
+            
+						RE_Intent-->CE_Prescription_OCR
+            
+            RE_Core_Msg[핵심 답변 생성<br/>순수 팩트 데이터 추출]
+
+        end
+ 
+        %% ==========================================
+        %% 4. LLM Performance Engine
+        %% ==========================================       
+        subgraph LLM_as_a_Judge_Engine [🧑‍⚖️프론티어 LLM 검증, 성능 증강 Engine: LLM as a Judge]
+            direction TB
+            LLM_as_a_Judge["LLM as a Judge"]
+            LLM_Search["LLM Search"]    
+        end
+        
+        subgraph DUR_Tool_Execution_Engine [Tool Execution Engine]
+            direction TB
+            T1[의약품 낱알식별정보조회]
+            T2[병용 금기 정보조회]
+            T3[노인주의 정보 조회]
+            T4[DUR 품목정보 조회] 
+            T5[특정연령대 금기 정보조회]
+            T6[용량주의 정보 조회]
+            T7[투여기간주의 정보조회]
+            T8[효능군중복 정보 조회] 
+            T9[서방정분할주의 정보조회]
+            T10[임부금기 정보조회] 
+            T11[건강기능식품 상세정보조회]
+            T12[건강기능식품 목록조회]
+            T13[LLM 에이전트 검색]
+
+            subgraph External_API [공공 API External Layer]
+                direction LR
+                API_HIRA[의약품 낱알식별 API]
+                API_MFDS_DUR[식약처 DUR API]
+                API_Health_Supplement[건강기능 식품 API]
+                OpenAI_API[OpenAI API]
+            end
+
+        end
+    end
+
+
+    %% ==========================================
+    %% 엔진 간 데이터 흐름 (Data Flow)
+    %% ==========================================
+    LocalAgent((로컬 에이전트)) --> |"음성데이터 처리 결과, 처방전 OCR결과"| CE_Input
+    LocalAgent --> |"처방전 MD파일"| OCR_Logging-->DB_OCR_History
+    DB_OCR_History-->OCR_DUR_Interatction -->T2 & T3 & T4 & T5 & T6 & T7 & T8 & T9 & T10-->DB_Prescription_Raw_History
+    
+    
+    CE_Latency --> |"입력 데이터 전달"| ME_Context
+    CE_Response --> ME_Context
+    ME_Context --> |"유저 프로필 및 컨텍스트 제공"| RE_Intent
+    
+    RE_Intent <--> |"과거 이력 조회 요청/반환"| ME_RAG
+    ME_RAG -->DUR_Tool_Execution_Engine-->Database_Layer
+    RE_Intent --> DUR_Tool_Execution_Engine --> RE_Core_Msg
+    RE_Intent <--"중요 추론 항목사항 사용시 팩트체킹 및 판단 검토"-->LLM_as_a_Judge
+    CE_Response-->DB_Medication_Log
+    %%API 호출관계 정의
+		T1 --> API_HIRA
+    T2 & T3 & T4 & T5 & T6 & T7 & T8 & T9 & T10 --> API_MFDS_DUR
+    T2 & T3 & T4 & T5 & T6 & T7 & T8 & T9 & T10 -->DB_DUR_Linkage_History
+    T11 & T12 -->DB_Health_Supplement_Log
+    T11 & T12 --> API_Health_Supplement
+    T13-->LLM_Search --> OpenAI_API
+    LLM_as_a_Judge-->OpenAI_API
+    
+    RE_Core_Msg --> |"검증 완료된 결과 저장"| ME_Update
+    RE_Core_Msg --> |"팩트 데이터 전달"| CE_Tone
+    
+    CE_Response --> |"음성 응답"| LocalAgent
+    CE_Prescription_OCR --> |"처방전 OCR 요청"| LocalAgent
+    
+    Flash_Memories -->CE_Tone
+    Flash_Memories -->CE_Conversation_Core 
+		
+    %% 스타일링
+    classDef ce fill:#fff3e0,stroke:#ff9800,stroke-width:2px;
+    classDef me fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px;
+    classDef re fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px;
+    classDef ext fill:#fce4ec,stroke:#c2185b,stroke-width:2px;
+    classDef db fill:#ffffff,stroke:#607d8b,stroke-width:1px,stroke-dasharray: 5 5;
+    classDef tool fill:#e1bee7,stroke:#8e24aa,stroke-width:1px;
+    classDef judge fill:#fffde7,stroke:#fbc02d,stroke-width:3px,stroke-dasharray: 5 5;
+    
+    class Conversation_Engine ce;
+    class Memory_Engine me;
+    class Reasoning_Engine re;
+    class External_API ext;
+    class Database_Layer db;
+    class T1,T2,T3,T4,T5,T6,T7,T8,T9,T10,T11,T12,T13 tool;
+    class LLM_as_a_Judge_Engine judge;
