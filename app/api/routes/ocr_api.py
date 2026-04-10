@@ -63,7 +63,11 @@ async def receive_ocr_result(payload: OCRResultInput) -> OCRProcessedResponse:
         dur_results = await check_dur_for_prescription(med_dicts)
 
         dur_dicts = [r.get("dur", {}) for r in dur_results]
-        await memory_engine.sync_ocr_dur(ocr_data, dur_dicts)
+        await memory_engine.sync_ocr_dur(
+            ocr_data,
+            dur_dicts,
+            speaker_id=payload.speaker_id,
+        )
 
     return OCRProcessedResponse(
         success=True,
@@ -77,5 +81,5 @@ async def receive_ocr_result(payload: OCRResultInput) -> OCRProcessedResponse:
 async def get_ocr_history() -> dict[str, Any]:
     """OCR 이력 조회."""
     await memory_engine.initialize()
-    history = await memory_engine.store.read_permanent("ocr_history")
+    history = await memory_engine.store.read_latest("ocr_history", n=20)
     return {"history": history}

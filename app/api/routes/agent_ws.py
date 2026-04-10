@@ -184,7 +184,7 @@ async def _handle_ocr(websocket: WebSocket, message: dict) -> None:
 
         dur_results = await check_dur_for_prescription(medications)
         dur_dicts = [r.get("dur", {}) for r in dur_results]
-        await memory_engine.sync_ocr_dur(ocr_data, dur_dicts)
+        await memory_engine.sync_ocr_dur(ocr_data, dur_dicts, speaker_id=speaker_id)
 
         await websocket.send_json({
             "type": "ocr_processed",

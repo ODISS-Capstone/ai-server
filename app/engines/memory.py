@@ -8,14 +8,16 @@ server.mermaid 매핑:
   ME_RAG              → search_history()
   ME_Update           → update_and_compress()
 
-모든 영구 데이터는 ``permanent/{category}/YYYY-MM-DD/NNN.md`` 개별 파일로 저장.
+메모리 조회 계층은 server.mermaid 기준의 MD Database Layer
+(`flash/` + `permanent/`) 위에서만 동작한다.
 """
 import json
 import logging
-from datetime import datetime, date
+from datetime import datetime
 from typing import Any, Optional
 
 from app.database.md_store import md_store
+from app.memory import StructuredMemoryService
 
 logger = logging.getLogger(__name__)
 
@@ -25,9 +27,11 @@ class MemoryEngine:
 
     def __init__(self):
         self.store = md_store
+        self.structured_memory = StructuredMemoryService()
 
     async def initialize(self) -> None:
         await self.store.initialize()
+        await self.structured_memory.initialize()
 
     # ── OCR_Logging: 처방전 OCR 로깅 ──
 
@@ -51,7 +55,12 @@ class MemoryEngine:
 
     # ── OCR_DUR_Interaction: OCR 처방전 DUR 동기화 ──
 
-    async def sync_ocr_dur(self, ocr_data: dict, dur_results: list[dict]) -> None:
+    async def sync_ocr_dur(
+        self,
+        ocr_data: dict,
+        dur_results: list[dict],
+        speaker_id: Optional[str] = None,
+    ) -> None:
         """처방전 + DUR 결과를 prescriptions/{날짜}/NNN.md 에 저장."""
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         meds = ocr_data.get("medications", [])
@@ -74,6 +83,15 @@ class MemoryEngine:
         )
         await self.store.save("prescriptions", content)
 
+        prescription_log = (
+            f"# 현재 복용 약 요약\n"
+            f"> 최종 갱신: {now}\n\n"
+            f"## 약품 목록\n"
+            + ("\n".join(f"- {name}" for name in med_names) if med_names else "- 확인된 약품 없음")
+            + "\n"
+        )
+        await self.store.write_flash("prescription_log", prescription_log)
+
     # ── ME_Context: 사용자 식별 및 컨텍스트 로드 ──
 
     async def load_context(self, speaker_id: Optional[str] = None) -> dict[str, Any]:
@@ -86,6 +104,10 @@ class MemoryEngine:
             "current_manual": "",
             "context_memory": "",
             "prescription_log": "",
+            "memory_prompt": "",
+            "memory_index": "",
+            "relevant_memories": [],
+            "memory_briefs": [],
         }
 
         if speaker_id:
@@ -101,7 +123,23 @@ class MemoryEngine:
         context["context_memory"] = await self.store.read_flash("context_memory")
         context["prescription_log"] = await self.store.read_flash("prescription_log")
 
+        structured_context = await self.structured_memory.build_context(
+            "",
+            speaker_id=speaker_id,
+        )
+        context.update(structured_context)
         return context
+
+    async def build_query_memory_context(
+        self,
+        query: str,
+        speaker_id: Optional[str] = None,
+    ) -> str:
+        structured_context = await self.structured_memory.build_context(
+            query,
+            speaker_id=speaker_id,
+        )
+        return structured_context.get("memory_prompt", "")
 
     # ── ME_Parse: 환자 개인정보 구분 및 주요 정보 로그 파싱 ──
 
@@ -119,7 +157,7 @@ class MemoryEngine:
     async def search_history(
         self, query: str, speaker_id: Optional[str] = None,
     ) -> dict[str, Any]:
-        """질문 키워드로 Permanent Memory 전체를 탐색."""
+        """질문 키워드로 Permanent Memory 전체와 structured memory를 함께 탐색."""
         if not query:
             return {}
 
@@ -135,6 +173,17 @@ class MemoryEngine:
             if user_history and self._text_relevant(user_history, query):
                 results["user_history"] = user_history
 
+        structured_context = await self.structured_memory.build_context(
+            query,
+            speaker_id=speaker_id,
+        )
+        if structured_context.get("relevant_memories"):
+            results["structured_memory"] = {
+                "items": structured_context["relevant_memories"],
+                "briefs": structured_context["memory_briefs"],
+                "prompt": structured_context["memory_prompt"],
+            }
+
         return results
 
     # ── ME_Update: 데이터 업데이트 및 압축 저장 ──
@@ -148,7 +197,6 @@ class MemoryEngine:
         answer_text = response_data.get("answer", "")
         resp_type = response_data.get("type", "unknown")
 
-        # medication_log — 상담 기록 개별 저장
         log_content = (
             f"# 상담 기록\n"
             f"> 기록 시각: {now}\n"
@@ -158,7 +206,6 @@ class MemoryEngine:
         )
         await self.store.save("medication_log", log_content)
 
-        # dur_linkage — DUR 호출이 있었으면 개별 저장
         dur_results = response_data.get("dur_results")
         if dur_results:
             dur_content = (
@@ -169,7 +216,6 @@ class MemoryEngine:
             )
             await self.store.save("dur_linkage", dur_content)
 
-        # Flash — context_memory 덮어쓰기
         context_summary = (
             f"# 대화 컨텍스트 메모리\n"
             f"> 최종 갱신: {now}\n\n"
@@ -179,7 +225,6 @@ class MemoryEngine:
         )
         await self.store.write_flash("context_memory", context_summary)
 
-        # Flash — current_requirement: 최근 5건 유지
         prev = await self.store.read_flash("current_requirement")
         lines = [l for l in prev.strip().split("\n") if l.startswith("- [")]
         lines.append(f"- [{now}] {query_text[:100]}")
@@ -191,7 +236,6 @@ class MemoryEngine:
         )
         await self.store.write_flash("current_requirement", req_content)
 
-        # 사용자별 히스토리 파일 추가 기록
         if speaker_id:
             existing = await self.store.read_user_file(speaker_id, "history.md")
             entry = (
