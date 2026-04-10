@@ -252,7 +252,12 @@ class ReasoningEngine:
 
         history_data = task_results.get("history", {})
         if history_data:
-            parts.append("과거 상담 이력을 참고하였습니다.")
+            structured = history_data.get("structured_memory", {})
+            briefs = structured.get("briefs", []) if isinstance(structured, dict) else []
+            for brief in briefs[:2]:
+                parts.append(brief)
+            if not briefs:
+                parts.append("과거 상담 이력을 참고하였습니다.")
 
         if not parts:
             search_result = await llm_search.llm_search(query)

@@ -11,6 +11,7 @@ services:
     environment:
       - APP_ENV=production
       - DEBUG=false
+      - PYTHONDONTWRITEBYTECODE=1
       - MD_DATABASE_PATH=/app/data/md_database
       - STORAGE_PATH=/app/data/storage
       - DATABASE_URL=sqlite+aiosqlite:///./data/senior_med.db

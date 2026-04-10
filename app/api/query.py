@@ -114,7 +114,16 @@ async def ask(req: AskRequest) -> AskResponse:
     if not query_text and not llm_doc:
         raise HTTPException(status_code=404, detail="Session not found or no data available")
 
-    answer_internal = await call_internal_llm(query_text, llm_doc)
+    memory_prompt = await memory_engine.build_query_memory_context(query_text)
+    llm_doc_with_memory = llm_doc
+    if memory_prompt:
+        llm_doc_with_memory = (
+            f"{llm_doc}\n\n[구조화 메모리]\n{memory_prompt}"
+            if llm_doc
+            else f"[구조화 메모리]\n{memory_prompt}"
+        )
+
+    answer_internal = await call_internal_llm(query_text, llm_doc_with_memory)
     censored = extract_censored_for_external(query_text, llm_doc, answer_internal)
     answer_external = await call_external_llm(censored)
     answer_verified, _ = verify_answer_against_dur(answer_external, dur_response)

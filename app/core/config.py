@@ -1,7 +1,8 @@
 """ODISS 서버엔진 설정 — 환경 변수 기반."""
 from functools import lru_cache
-from typing import Optional
+from typing import Any, Optional
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -63,6 +64,17 @@ class Settings(BaseSettings):
     clova_stt_client_secret: Optional[str] = None
     clova_tts_client_id: Optional[str] = None
     clova_tts_client_secret: Optional[str] = None
+
+    @field_validator("debug", mode="before")
+    @classmethod
+    def normalize_debug(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"release", "prod", "production", "false", "0", "off", "no"}:
+                return False
+            if normalized in {"debug", "dev", "development", "true", "1", "on", "yes"}:
+                return True
+        return value
 
 
 @lru_cache
