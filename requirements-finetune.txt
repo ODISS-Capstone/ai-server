@@ -1,0 +1,9 @@
+# Optional dependencies for Qwen reasoning-engine fine-tuning.
+# Keep separate from server runtime requirements to avoid pulling GPU stacks into API deploys.
+torch
+transformers
+datasets
+accelerate
+peft
+trl
+bitsandbytes

@@ -5,14 +5,12 @@ from typing import Any, Optional
 import httpx
 
 from app.core.config import settings
+from app.services.llm_queue import run_with_engine_queue
+from app.services.prompt_registry import DEFAULT_PROMPTS, get_prompt_registry
 
 logger = logging.getLogger(__name__)
 
-SEARCH_SYSTEM_PROMPT = (
-    "당신은 의약품 및 건강 관련 정보를 검색하는 전문 에이전트입니다.\n"
-    "사용자의 질문에 대해 정확하고 신뢰할 수 있는 의약 정보를 제공합니다.\n"
-    "불확실한 정보는 '확인이 필요합니다'라고 명시합니다."
-)
+SEARCH_SYSTEM_PROMPT = DEFAULT_PROMPTS["search"]["system"]
 
 
 async def llm_search(
@@ -28,30 +26,34 @@ async def llm_search(
             "answer": "",
         }
 
-    messages = [{"role": "system", "content": SEARCH_SYSTEM_PROMPT}]
     if context:
-        messages.append(
-            {"role": "user", "content": f"참고 정보:\n{context}\n\n질문: {query}"}
-        )
+        search_input = f"참고 정보:\n{context}\n\n질문: {query}"
     else:
-        messages.append({"role": "user", "content": query})
+        search_input = query
+    messages = get_prompt_registry().render_messages(
+        "search",
+        search_input=search_input,
+    )
 
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": settings.openai_model,
-                    "messages": messages,
-                    "max_tokens": 1024,
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
+        async def post_search() -> dict[str, Any]:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": settings.openai_model,
+                        "messages": messages,
+                        "max_tokens": 1024,
+                    },
+                )
+                resp.raise_for_status()
+                return resp.json()
+
+        data = await run_with_engine_queue("search", post_search)
 
         answer = (
             data.get("choices", [{}])[0]

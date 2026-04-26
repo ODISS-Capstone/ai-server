@@ -10,22 +10,12 @@ from typing import Any, Optional
 import httpx
 
 from app.core.config import settings
+from app.services.llm_queue import run_with_engine_queue
+from app.services.prompt_registry import DEFAULT_PROMPTS, get_prompt_registry
 
 logger = logging.getLogger(__name__)
 
-JUDGE_SYSTEM_PROMPT = """당신은 의약품 안전 정보를 검증하는 전문 판사(Judge) AI입니다.
-
-역할:
-1. 제공된 의약 정보가 사실에 부합하는지 검증합니다.
-2. 잘못된 정보나 위험한 조언이 포함되어 있으면 지적합니다.
-3. 누락된 중요 안전 정보가 있으면 보충합니다.
-
-출력 형식:
-- "VERIFIED": 정보가 정확하고 안전합니다
-- "NEEDS_CORRECTION: [수정 사항]": 수정이 필요합니다
-- "DANGER: [위험 사항]": 위험한 정보가 포함되어 있습니다
-
-항상 환자 안전을 최우선으로 판단합니다."""
+JUDGE_SYSTEM_PROMPT = DEFAULT_PROMPTS["judge_verify"]["system"]
 
 
 class LLMJudgeEngine:
@@ -50,34 +40,38 @@ class LLMJudgeEngine:
                 "message": "LLM Judge 미설정 — 검증 생략",
             }
 
-        user_content = (
-            f"다음 의약 정보를 검증해 주세요.\n\n"
-            f"[원본 질문]\n{original_query}\n\n"
-            f"[검증 대상 정보]\n{statement}\n"
+        additional_context_block = (
+            f"\n[추가 맥락]\n{additional_context}\n"
+            if additional_context
+            else ""
         )
-        if additional_context:
-            user_content += f"\n[추가 맥락]\n{additional_context}\n"
+        messages = get_prompt_registry().render_messages(
+            "judge_verify",
+            original_query=original_query,
+            statement=statement,
+            additional_context_block=additional_context_block,
+        )
 
         try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                resp = await client.post(
-                    "https://api.openai.com/v1/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": self.model,
-                        "messages": [
-                            {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
-                            {"role": "user", "content": user_content},
-                        ],
-                        "max_tokens": 512,
-                        "temperature": 0.1,
-                    },
-                )
-                resp.raise_for_status()
-                data = resp.json()
+            async def post_judge_verify() -> dict[str, Any]:
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    resp = await client.post(
+                        "https://api.openai.com/v1/chat/completions",
+                        headers={
+                            "Authorization": f"Bearer {api_key}",
+                            "Content-Type": "application/json",
+                        },
+                        json={
+                            "model": self.model,
+                            "messages": messages,
+                            "max_tokens": 512,
+                            "temperature": 0.1,
+                        },
+                    )
+                    resp.raise_for_status()
+                    return resp.json()
+
+            data = await run_with_engine_queue("judge", post_judge_verify)
 
             answer = (
                 data.get("choices", [{}])[0]
@@ -118,34 +112,32 @@ class LLMJudgeEngine:
             "완전성: 중요 정보가 누락되지 않았는가",
         ]
         criteria_text = "\n".join(f"- {c}" for c in (criteria or default_criteria))
+        messages = get_prompt_registry().render_messages(
+            "judge_evaluate",
+            criteria_text=criteria_text,
+            response_text=response_text,
+        )
 
         try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                resp = await client.post(
-                    "https://api.openai.com/v1/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": self.model,
-                        "messages": [
-                            {
-                                "role": "system",
-                                "content": (
-                                    "다음 기준으로 응답을 1~10점으로 평가하세요.\n"
-                                    f"{criteria_text}\n\n"
-                                    "형식: SCORE: N/10\nFEEDBACK: ..."
-                                ),
-                            },
-                            {"role": "user", "content": response_text},
-                        ],
-                        "max_tokens": 256,
-                        "temperature": 0.1,
-                    },
-                )
-                resp.raise_for_status()
-                data = resp.json()
+            async def post_judge_evaluate() -> dict[str, Any]:
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    resp = await client.post(
+                        "https://api.openai.com/v1/chat/completions",
+                        headers={
+                            "Authorization": f"Bearer {api_key}",
+                            "Content-Type": "application/json",
+                        },
+                        json={
+                            "model": self.model,
+                            "messages": messages,
+                            "max_tokens": 256,
+                            "temperature": 0.1,
+                        },
+                    )
+                    resp.raise_for_status()
+                    return resp.json()
+
+            data = await run_with_engine_queue("judge", post_judge_evaluate)
 
             answer = (
                 data.get("choices", [{}])[0]

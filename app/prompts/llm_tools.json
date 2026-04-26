@@ -1,0 +1,198 @@
+{
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "Tool_Get_Drug_Identification",
+        "description": "의약품의 외형적 특성(모양, 색상, 각인 등)을 기반으로 품목명과 제조사를 확인한다. OCR 결과에 의약품명이 불분명하고 외형 기술만 있을 때 사용한다. (HIRA 의약품 낱알식별 API)",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "item_name": {"type": "string", "description": "품목명 (일부 일치 가능)"},
+            "entp_name": {"type": "string", "description": "제조사/품목허가자"},
+            "item_seq": {"type": "string", "description": "품목기준코드"},
+            "print_front": {"type": "string", "description": "앞면 각인"},
+            "print_back": {"type": "string", "description": "뒷면 각인"},
+            "drug_shape": {"type": "string", "description": "제형 모양 (예: 원형, 타원형)"},
+            "color_class1": {"type": "string", "description": "색상 (예: 하양, 노랑)"},
+            "page_no": {"type": "integer", "minimum": 1, "default": 1},
+            "num_of_rows": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10}
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "Tool_Check_DUR_Combination_Contraindication",
+        "description": "두 가지 이상의 성분 또는 품목 간 동시 투여 시의 금기 정보를 조회한다. 복용 로그의 복수 약물 상호작용 여부 확인에 사용한다. (식약처 DUR T2)",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "item_name": {"type": "string", "description": "품목명"},
+            "item_seq": {"type": "string", "description": "품목기준코드"},
+            "page_no": {"type": "integer", "minimum": 1, "default": 1},
+            "num_of_rows": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10}
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "Tool_Check_DUR_Geriatric_Caution",
+        "description": "65세 이상 노인 환자에게 투여 시 주의가 필요한 품목 정보를 제공한다. 피처방자가 노인군일 때 부작용 위험성을 대조한다. (식약처 DUR T3)",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "item_name": {"type": "string", "description": "품목명"},
+            "item_seq": {"type": "string", "description": "품목기준코드"},
+            "page_no": {"type": "integer", "minimum": 1, "default": 1},
+            "num_of_rows": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10}
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "Tool_Get_DUR_Basic_Item_Info",
+        "description": "식약처 관리 DUR 대상 의약품의 마스터 정보를 조회한다. OCR 텍스트 기반 품목의 DUR 점검 대상 여부 확인과 기초 데이터 확보에 사용한다. (식약처 DUR T4)",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "item_name": {"type": "string", "description": "품목명"},
+            "item_seq": {"type": "string", "description": "품목기준코드"},
+            "page_no": {"type": "integer", "minimum": 1, "default": 1},
+            "num_of_rows": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10}
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "Tool_Check_DUR_Age_Specific_Contraindication",
+        "description": "영유아, 소아 등 특정 연령대에서 사용이 금지된 품목 정보를 조회한다. 피처방자가 소아 등 특정 연령대일 때 안전성을 사전 점검한다. (식약처 DUR T5)",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "item_name": {"type": "string", "description": "품목명"},
+            "item_seq": {"type": "string", "description": "품목기준코드"},
+            "page_no": {"type": "integer", "minimum": 1, "default": 1},
+            "num_of_rows": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10}
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "Tool_Check_DUR_Dosage_Caution",
+        "description": "해당 의약품의 1일 최대 권장 복용량 기준 정보를 제공한다. 복용 로그의 처방 용량이 안전 용량을 초과했는지 분석한다. (식약처 DUR T6)",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "item_name": {"type": "string", "description": "품목명"},
+            "item_seq": {"type": "string", "description": "품목기준코드"},
+            "page_no": {"type": "integer", "minimum": 1, "default": 1},
+            "num_of_rows": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10}
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "Tool_Check_DUR_Duration_Caution",
+        "description": "해당 의약품의 안전한 연속 복용 가능 기간 기준 정보를 확인한다. 처방 기간이 안전 기준을 초과했는지 분석한다. (식약처 DUR T7)",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "item_name": {"type": "string", "description": "품목명"},
+            "item_seq": {"type": "string", "description": "품목기준코드"},
+            "page_no": {"type": "integer", "minimum": 1, "default": 1},
+            "num_of_rows": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10}
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "Tool_Check_DUR_Duplicate_Therapeutic_Class",
+        "description": "동일 또는 유사 효능군의 의약품 중복 처방 정보를 확인한다. 복수의 의료기관 처방전 간 효능군 중복에 따른 과다 복용 위험을 분석한다. (식약처 DUR T8)",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "item_name": {"type": "string", "description": "품목명"},
+            "item_seq": {"type": "string", "description": "품목기준코드"},
+            "page_no": {"type": "integer", "minimum": 1, "default": 1},
+            "num_of_rows": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10}
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "Tool_Check_DUR_Sustained_Release_Caution",
+        "description": "제형 특성상 분할 또는 마쇄(가루)하여 복용해서는 안 되는 정보를 확인한다. 정확한 복용법 안내용 기초 정보 확보에 사용한다. (식약처 DUR T9)",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "item_name": {"type": "string", "description": "품목명"},
+            "item_seq": {"type": "string", "description": "품목기준코드"},
+            "page_no": {"type": "integer", "minimum": 1, "default": 1},
+            "num_of_rows": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10}
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "Tool_Check_DUR_Pregnancy_Contraindication",
+        "description": "임부 또는 임신 가능성이 있는 여성에게 투여 시 부작용 위험성이 높은 품목 정보를 조회한다. 피처방자가 가임기 여성/임산부일 때 최우선 안전성 검증에 사용한다. (식약처 DUR T10)",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "item_name": {"type": "string", "description": "품목명"},
+            "item_seq": {"type": "string", "description": "품목기준코드"},
+            "page_no": {"type": "integer", "minimum": 1, "default": 1},
+            "num_of_rows": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10}
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "Tool_Get_Health_Supplement_Detail",
+        "description": "정식 등록된 건강기능식품의 기능성 성분, 섭취 방법, 주의사항 정보를 조회한다. 의약품과의 상호작용 분석에 활용한다. (식약처 건강기능식품 T11)",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "product_name": {"type": "string", "description": "건강기능식품 제품명"},
+            "page_no": {"type": "integer", "minimum": 1, "default": 1},
+            "num_of_rows": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10}
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "Tool_Search_Health_Supplement_List",
+        "description": "식품안전나라에 등록된 건강기능식품 목록을 검색해 품목 정보를 확인한다. OCR된 제품명이 유효한 건강기능식품인지 확인할 때 사용한다. (식약처 건강기능식품 T12)",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "page_no": {"type": "integer", "minimum": 1, "default": 1},
+            "num_of_rows": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10}
+          }
+        }
+      }
+    }
+  ]
+}
