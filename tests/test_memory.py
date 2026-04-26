@@ -1,4 +1,4 @@
-"""Architecture-backed memory tests."""
+"""structured_memory 동작 검증 테스트."""
 import asyncio
 import sys
 from pathlib import Path
@@ -16,132 +16,118 @@ def run(coro):
     return asyncio.run(coro)
 
 
-def test_structured_memory_selects_relevant_architecture_backed_context(tmp_path):
-    store = MDStore(base_path=str(tmp_path))
-    service = StructuredMemoryService(base_path=str(tmp_path))
+def test_upsert_memory_creates_topic_file_and_entrypoint(tmp_path):
+    memory_dir = tmp_path / "structured_memory"
+    service = StructuredMemoryService(base_path=str(memory_dir))
 
-    run(store.initialize())
     run(
-        store.save_user_file(
-            "speaker-001",
-            "profile.md",
-            (
-                "# 환자 프로필\n"
-                "| 항목 | 값 |\n|------|----|\n"
-                "| ID | speaker-001 |\n"
-                "| 이름 | 홍길동 |\n"
-                "| 성별 | 남 |\n"
-                "| 연령 | 75 |\n"
-                "| 기저질환 | 고혈압 |\n"
-            ),
-        )
-    )
-    run(
-        store.write_flash(
-            "current_manual",
-            "# 응답 매뉴얼\n- 혈압약 상담 시 현재 복용 약과 주의사항을 먼저 설명한다.\n",
+        service.upsert_memory(
+            filename="blood_pressure.md",
+            name="혈압약 복약 주의",
+            description="혈압약A 복약 시 어지러움 확인",
+            memory_type="project",
+            body="# 혈압약 복약 주의\n\n- 혈압약A 복용 후 어지러움 여부를 확인한다.",
         )
     )
 
-    context = run(service.build_context("홍길동 고혈압", speaker_id="speaker-001"))
+    topic = memory_dir / "global" / "blood_pressure.md"
+    entrypoint = memory_dir / "global" / "MEMORY.md"
 
+    assert topic.exists()
+    assert "type: project" in topic.read_text(encoding="utf-8")
+    assert "- [혈압약 복약 주의](blood_pressure.md) - 혈압약A 복약 시 어지러움 확인" in entrypoint.read_text(
+        encoding="utf-8"
+    )
+
+
+def test_build_context_loads_entrypoint_and_relevant_topic(tmp_path):
+    service = StructuredMemoryService(base_path=str(tmp_path / "structured_memory"))
+
+    run(
+        service.upsert_memory(
+            filename="medication_context.md",
+            name="최신 복약 맥락",
+            description="혈압약A와 당뇨약B를 함께 복용 중",
+            memory_type="project",
+            body="# 최신 복약 맥락\n\n- 혈압약A와 당뇨약B를 함께 복용 중이다.",
+            speaker_id="speaker-001",
+        )
+    )
+
+    context = run(service.build_context("혈압약A 복용", speaker_id="speaker-001"))
+
+    assert "Speaker speaker-001 MEMORY.md" in context["memory_prompt"]
+    assert "Relevant memories" in context["memory_prompt"]
     assert context["relevant_memories"]
-    assert any("홍길동" in item["body"] for item in context["relevant_memories"])
-    assert "Patient Memories" in context["memory_prompt"]
+    assert any("혈압약A" in item["body"] for item in context["relevant_memories"])
 
 
-def test_structured_memory_does_not_surface_irrelevant_memories_for_empty_query(tmp_path):
-    store = MDStore(base_path=str(tmp_path))
-    service = StructuredMemoryService(base_path=str(tmp_path))
+def test_empty_query_does_not_surface_relevant_memories(tmp_path):
+    service = StructuredMemoryService(base_path=str(tmp_path / "structured_memory"))
 
-    run(store.initialize())
-    run(store.write_flash("current_requirement", "# 최근 요구사항\n- 천천히 설명해 주세요.\n"))
+    run(
+        service.upsert_memory(
+            filename="manual.md",
+            name="응답 매뉴얼",
+            description="복약 안내 시 최신 처방을 먼저 확인",
+            memory_type="reference",
+            body="# 응답 매뉴얼\n\n- 최신 처방을 먼저 확인한다.",
+        )
+    )
 
-    context = run(service.build_context("", speaker_id="patient-kor"))
+    context = run(service.build_context("", speaker_id="speaker-001"))
 
     assert context["relevant_memories"] == []
     assert "Relevant memories" not in context["memory_prompt"]
+    assert "Global MEMORY.md" in context["memory_prompt"]
 
 
-def test_structured_memory_reads_korean_profile_file(tmp_path):
-    store = MDStore(base_path=str(tmp_path))
-    service = StructuredMemoryService(base_path=str(tmp_path))
+def test_patient_profile_sync_writes_speaker_memory(tmp_path):
+    service = StructuredMemoryService(base_path=str(tmp_path / "structured_memory"))
 
-    run(store.initialize())
     run(
-        store.save_user_file(
+        service.sync_patient_profile(
             "patient-kor",
-            "profile.md",
-            (
-                "# 환자 프로필\n"
-                "| 항목 | 값 |\n|------|----|\n"
-                "| ID | patient-kor |\n"
-                "| 이름 | 홍길동 |\n"
-                "| 성별 | 남 |\n"
-                "| 연령 | 75 |\n"
-                "| 기저질환 | 고혈압 |\n"
-            ),
+            {
+                "name": "홍길동",
+                "age": 75,
+                "gender": "남",
+                "conditions": ["고혈압"],
+            },
         )
     )
 
-    context = run(service.build_context("홍길동 어르신 고혈압", speaker_id="patient-kor"))
+    context = run(service.build_context("홍길동 고혈압", speaker_id="patient-kor"))
 
     assert any("홍길동" in item["body"] for item in context["relevant_memories"])
-    assert "홍길동" in context["memory_prompt"]
+    assert "patient_profile.md" in context["memory_index"]
 
 
-def test_memory_index_is_truncated_when_permanent_history_is_too_large(tmp_path):
-    store = MDStore(base_path=str(tmp_path))
-    service = StructuredMemoryService(base_path=str(tmp_path))
+def test_memory_index_is_truncated_when_entrypoint_is_too_large(tmp_path):
+    service = StructuredMemoryService(base_path=str(tmp_path / "structured_memory"))
 
-    run(store.initialize())
-    long_query = "혈압약" + (" 아주길게설명" * 40)
-    for idx in range(120):
+    for idx in range(220):
         run(
-            store.save(
-                "medication_log",
-                f"# 상담 기록\n## 질문\n{long_query} {idx}\n## 응답\n응답 {idx}\n",
+            service.upsert_memory(
+                filename=f"topic_{idx}.md",
+                name=f"테스트 메모리 {idx}",
+                description=f"긴 인덱스 테스트 {idx}",
+                memory_type="project",
+                body=f"# 테스트 메모리 {idx}\n\n- 인덱스 절단 테스트",
             )
         )
 
-    context = run(service.build_context("혈압약"))
-
-    assert "WARNING: MEMORY.md was truncated" in context["memory_prompt"]
-    assert "Permanent Memories" in context["memory_prompt"]
-
-
-def test_memory_policy_matches_architecture_layout(tmp_path):
-    service = StructuredMemoryService(base_path=str(tmp_path))
-
     context = run(service.build_context(""))
 
-    assert "flash/" in context["memory_prompt"]
-    assert "permanent/" in context["memory_prompt"]
-    assert "server.mermaid" in context["memory_prompt"]
-    assert "별도 저장소" not in context["memory_prompt"]
+    assert "WARNING: MEMORY.md was truncated" in context["memory_prompt"]
 
 
-def test_memory_engine_search_history_returns_architecture_backed_memory(tmp_path):
+def test_memory_engine_syncs_ocr_dur_into_structured_memory(tmp_path):
     engine = MemoryEngine()
-    engine.store = MDStore(base_path=str(tmp_path))
-    engine.structured_memory = StructuredMemoryService(base_path=str(tmp_path))
+    engine.store = MDStore(base_path=str(tmp_path / "md_database"))
+    engine.structured_memory = StructuredMemoryService(base_path=str(tmp_path / "structured_memory"))
 
     run(engine.initialize())
-    run(
-        engine.store.save_user_file(
-            "speaker-001",
-            "profile.md",
-            (
-                "# 환자 프로필\n"
-                "| 항목 | 값 |\n|------|----|\n"
-                "| ID | speaker-001 |\n"
-                "| 이름 | 홍길동 |\n"
-                "| 성별 | 남 |\n"
-                "| 연령 | 75 |\n"
-                "| 기저질환 | 고혈압 |\n"
-            ),
-        )
-    )
     run(
         engine.sync_ocr_dur(
             {"medications": [{"name": "혈압약A"}]},
@@ -150,32 +136,36 @@ def test_memory_engine_search_history_returns_architecture_backed_memory(tmp_pat
         )
     )
 
+    topic = tmp_path / "structured_memory" / "speakers" / "speaker-001" / "current_medication.md"
     history = run(engine.search_history("혈압약A", speaker_id="speaker-001"))
 
+    assert topic.exists()
     assert "structured_memory" in history
     assert history["structured_memory"]["items"]
     assert any("혈압약A" in brief for brief in history["structured_memory"]["briefs"])
 
 
-def test_query_memory_context_uses_flash_and_permanent_layers(tmp_path):
+def test_memory_engine_syncs_flash_profile_into_structured_memory(tmp_path):
     engine = MemoryEngine()
-    engine.store = MDStore(base_path=str(tmp_path))
-    engine.structured_memory = StructuredMemoryService(base_path=str(tmp_path))
+    engine.store = MDStore(base_path=str(tmp_path / "md_database"))
+    engine.structured_memory = StructuredMemoryService(base_path=str(tmp_path / "structured_memory"))
 
     run(engine.initialize())
-    run(engine.store.write_flash("current_manual", "# 현재 매뉴얼\n- 혈압약은 최신 복용 목록부터 확인.\n"))
     run(
-        engine.store.save(
-            "medication_log",
-            "# 상담 기록\n## 질문\n혈압약 같이 먹어도 되나요\n## 응답\n기록된 상담 응답\n",
+        engine.update_flash_profile(
+            "speaker-002",
+            {
+                "name": "김영희",
+                "age": 80,
+                "gender": "여",
+                "conditions": ["당뇨"],
+            },
         )
     )
 
-    prompt = run(engine.build_query_memory_context("혈압약", speaker_id=None))
+    context = run(engine.structured_memory.build_context("김영희 당뇨", speaker_id="speaker-002"))
 
-    assert "Flash Memories" in prompt
-    assert "Permanent Memories" in prompt
-    assert "혈압약" in prompt
+    assert any("김영희" in item["body"] for item in context["relevant_memories"])
 
 
 if __name__ == "__main__":
