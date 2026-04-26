@@ -20,6 +20,7 @@ class Settings(BaseSettings):
 
     database_url: str = "sqlite+aiosqlite:///./data/senior_med.db"
     md_database_path: str = "./data/md_database"
+    structured_memory_path: str = "./data/md_database/structured_memory"
 
     # OCR — DeepSeek
     deepseek_ocr_api_url: Optional[str] = None

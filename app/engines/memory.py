@@ -8,8 +8,8 @@ server.mermaid 매핑:
   ME_RAG              → search_history()
   ME_Update           → update_and_compress()
 
-메모리 조회 계층은 server.mermaid 기준의 MD Database Layer
-(`flash/` + `permanent/`) 위에서만 동작한다.
+메모리 조회 계층은 Claude Code 방식의 `structured_memory`
+(`MEMORY.md` 인덱스 + frontmatter topic 파일)도 함께 사용한다.
 """
 import json
 import logging
@@ -91,6 +91,12 @@ class MemoryEngine:
             + "\n"
         )
         await self.store.write_flash("prescription_log", prescription_log)
+        await self.structured_memory.sync_medication_context(
+            med_names=med_names,
+            dur_results=dur_results,
+            recorded_at=now,
+            speaker_id=speaker_id,
+        )
 
     # ── ME_Context: 사용자 식별 및 컨텍스트 로드 ──
 
@@ -259,6 +265,7 @@ class MemoryEngine:
             f"| 기저질환 | {', '.join(profile.get('conditions', []))} |\n"
         )
         await self.store.write_flash("current_user_profile", content)
+        await self.structured_memory.sync_patient_profile(speaker_id, profile)
 
     # ── 내부 유틸 ──
 
@@ -272,6 +279,15 @@ class MemoryEngine:
             f"| 이름 | - |\n| 성별 | - |\n| 연령 | - |\n| 기저질환 | - |\n"
         )
         await self.store.save_user_file(speaker_id, "profile.md", profile)
+        await self.structured_memory.sync_patient_profile(
+            speaker_id,
+            {
+                "name": "",
+                "age": "",
+                "gender": "",
+                "conditions": [],
+            },
+        )
 
         registration = (
             f"# 신규 환자 등록\n"

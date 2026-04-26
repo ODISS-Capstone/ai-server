@@ -1,4 +1,4 @@
-"""메모리 조회용 관련도 점수를 계산하는 선택기."""
+"""structured_memory topic 파일의 관련도 점수를 계산하는 선택기."""
 from __future__ import annotations
 
 import math
@@ -47,13 +47,14 @@ def _read_memory_body(path: Path) -> str:
 def _build_excerpt(body: str, fallback: str) -> str:
     """본문에서 요약 노출에 적합한 한 줄 발췌문을 만든다."""
     raw_lines = [line.strip() for line in body.splitlines() if line.strip()]
+    metadata_prefixes = ("기록 시각:", "화자 ID:", "ID:")
 
     bullet_lines = []
     for line in raw_lines:
         if not line.startswith("- "):
             continue
         candidate = line[2:].strip()
-        if candidate:
+        if candidate and not candidate.startswith(metadata_prefixes):
             bullet_lines.append(candidate)
 
     for line in bullet_lines:
