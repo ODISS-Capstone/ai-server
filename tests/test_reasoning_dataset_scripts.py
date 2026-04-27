@@ -26,8 +26,12 @@ def test_seed_dataset_records_are_valid_tool_call_samples():
         validate_sample(row, tool_names)
         assert row["messages"][0]["role"] == "system"
         assert any(message.get("tool_calls") for message in row["messages"])
+        assistant_messages = [m for m in row["messages"] if m.get("role") == "assistant"]
+        assert all(m["content"].strip().startswith("<think>") for m in assistant_messages)
+        assert all("</think>" in m["content"] for m in assistant_messages)
         assert row["messages"][-1]["role"] == "assistant"
         assert "정확한 판단은 의사·약사 상담이 필요합니다" in row["messages"][-1]["content"]
+        assert row["metadata"]["format"] == "qwen3.5_think_tool_calling"
 
 
 def test_generation_prompt_mentions_available_tools():
@@ -37,6 +41,7 @@ def test_generation_prompt_mentions_available_tools():
     assert "available_tools" in prompt
     assert "Tool_Check_DUR_Combination_Contraindication" in prompt["available_tools"]
     assert prompt["scenario_seed"]["target_tools"]
+    assert "Every assistant content must start" in " ".join(prompt["constraints"])
 
 
 def test_validate_sample_rejects_unknown_tool():

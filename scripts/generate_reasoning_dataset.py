@@ -32,6 +32,7 @@ REASONING_SYSTEM_PROMPT = (
     "당신은 ODISS의 Qwen reasoning-engine fine-tuning 데이터 생성기입니다. "
     "복약 상담 상황에서 어떤 공공데이터 tool을 호출해야 하는지와, "
     "tool 결과를 근거로 최종 답변하는 OpenAI chat-format SFT 샘플을 만드세요. "
+    "assistant content는 Qwen3.5 thinking 형식에 맞춰 반드시 <think>...</think>로 시작해야 합니다. "
     "반드시 JSON 객체 하나만 출력하세요."
 )
 
@@ -99,7 +100,7 @@ def build_generation_prompt(index: int, tool_names: list[str]) -> str:
                     {"role": "user", "content": "string"},
                     {
                         "role": "assistant",
-                        "content": "",
+                        "content": "<think>\nintent: ...\nneeded_tools: ...\nsafety_policy: ...\n</think>",
                         "tool_calls": [
                             {
                                 "id": "call_001",
@@ -117,7 +118,10 @@ def build_generation_prompt(index: int, tool_names: list[str]) -> str:
                         "name": "same as tool call",
                         "content": "JSON string with success/items fields",
                     },
-                    {"role": "assistant", "content": "final Korean answer"},
+                    {
+                        "role": "assistant",
+                        "content": "<think>\ntool_result_summary: ...\nanswer_policy: ...\n</think>\nfinal Korean answer",
+                    },
                 ],
                 "expected_tools": ["tool names used"],
                 "metadata": {
@@ -130,6 +134,9 @@ def build_generation_prompt(index: int, tool_names: list[str]) -> str:
             "constraints": [
                 "Use only tool names from available_tools.",
                 "Use Korean for user and assistant text.",
+                "Every assistant content must start with a short <think>...</think> block.",
+                "The <think> block must be a concise structured reasoning trace: intent, needed_tools or tool_result_summary, safety_policy or answer_policy.",
+                "Do not write long hidden chain-of-thought; keep <think> auditable and short.",
                 "The final answer must be cautious and include '정확한 판단은 의사·약사 상담이 필요합니다.'",
                 "Make tool result content realistic but synthetic; do not include real personal data.",
                 "Return only valid JSON, no markdown.",
@@ -189,6 +196,21 @@ def validate_sample(sample: dict[str, Any], tool_names: list[str]) -> None:
     final_message = messages[-1]
     if final_message.get("role") != "assistant" or not final_message.get("content"):
         raise ValueError("last message must be a non-empty assistant answer")
+    if not _has_think_block(final_message["content"]):
+        raise ValueError("last assistant message must start with <think>...</think>")
+
+    assistant_messages = [m for m in messages if m.get("role") == "assistant"]
+    if not assistant_messages:
+        raise ValueError("sample must contain assistant messages")
+    for idx, message in enumerate(assistant_messages, start=1):
+        content = message.get("content", "")
+        if not _has_think_block(content):
+            raise ValueError(f"assistant message {idx} must start with <think>...</think>")
+
+
+def _has_think_block(content: str) -> bool:
+    stripped = content.strip()
+    return stripped.startswith("<think>") and "</think>" in stripped
 
 
 async def generate_dataset(args: argparse.Namespace) -> None:
