@@ -32,7 +32,8 @@ REASONING_SYSTEM_PROMPT = (
     "당신은 ODISS의 Qwen reasoning-engine fine-tuning 데이터 생성기입니다. "
     "복약 상담 상황에서 어떤 공공데이터 tool을 호출해야 하는지와, "
     "tool 결과를 근거로 최종 답변하는 OpenAI chat-format SFT 샘플을 만드세요. "
-    "추론 및 API 호출 지시는 assistant 출력이 아니라 system 메시지에 넣으세요. "
+    "런타임 system prompt에는 tool call API 양식을 넣고, 훈련용 assistant 메시지에는 "
+    "<think>...</think> longCOT 블록을 넣으세요. "
     "반드시 JSON 객체 하나만 출력하세요."
 )
 
@@ -103,7 +104,7 @@ def build_generation_prompt(index: int, tool_names: list[str]) -> str:
                     {"role": "user", "content": "string"},
                     {
                         "role": "assistant",
-                        "content": "",
+                        "content": "<think>\n1. 의도: ...\n2. 입력 근거: ...\n3. 위험 후보: ...\n4. 필요한 API: ...\n5. tool 인자 결정: ...\n6. 답변 보류: ...\n</think>",
                         "tool_calls": [
                             {
                                 "id": "call_001",
@@ -123,7 +124,7 @@ def build_generation_prompt(index: int, tool_names: list[str]) -> str:
                     },
                     {
                         "role": "assistant",
-                        "content": "final Korean answer",
+                        "content": "<think>\n1. tool 결과 요약: ...\n2. 근거 평가: ...\n3. 답변 전략: ...\n4. 안전 문구: ...\n</think>\nfinal Korean answer",
                     },
                 ],
                 "expected_tools": ["tool names used"],
@@ -132,15 +133,16 @@ def build_generation_prompt(index: int, tool_names: list[str]) -> str:
                     "source": "openai_synthetic",
                     "risk": "low|medium|high",
                     "api_family": "dur|hira|health_supplement|mixed",
-                    "format": "qwen3.5_system_tool_calling",
+                    "format": "qwen3.5_longcot_tool_calling",
                 },
             },
             "constraints": [
                 "Use only tool names from available_tools.",
                 "Use Korean for user and assistant text.",
-                "Do not include <think> blocks in assistant messages.",
                 "The first system message must instruct the model to reason internally, choose public-data API tools when needed, call tools before answering, and answer safely from tool results.",
-                "When tool use is needed, the assistant tool-call message should have empty content and a valid tool_calls array.",
+                "The first system message must explicitly include the tool call API format: assistant content is empty when calling tools, tool_calls array is used, each call has id/type/function.name/function.arguments, function.arguments is a JSON string, and tool results arrive as role='tool' with tool_call_id/name/content.",
+                "Assistant messages must include longCOT <think>...</think> blocks for training data.",
+                "When tool use is needed, the assistant message should include a longCOT <think> block plus a valid tool_calls array.",
                 "The final answer must be cautious and include '정확한 판단은 의사·약사 상담이 필요합니다.'",
                 "Make tool result content realistic but synthetic; do not include real personal data.",
                 "Return only valid JSON, no markdown.",
@@ -207,14 +209,26 @@ def validate_sample(sample: dict[str, Any], tool_names: list[str]) -> None:
     system_content = system_message["content"]
     if "tool" not in system_content.lower() and "API" not in system_content:
         raise ValueError("system prompt must include tool/API usage instructions")
+    required_system_terms = ["tool_calls", "function.arguments", "tool_call_id"]
+    missing_terms = [term for term in required_system_terms if term not in system_content]
+    if missing_terms:
+        raise ValueError(
+            "system prompt must include tool call API format terms: "
+            + ", ".join(missing_terms)
+        )
 
     assistant_messages = [m for m in messages if m.get("role") == "assistant"]
     if not assistant_messages:
         raise ValueError("sample must contain assistant messages")
     for idx, message in enumerate(assistant_messages, start=1):
         content = message.get("content", "")
-        if "<think>" in content or "</think>" in content:
-            raise ValueError(f"assistant message {idx} must not include <think> blocks")
+        if not _has_think_block(content):
+            raise ValueError(f"assistant message {idx} must include <think>...</think>")
+
+
+def _has_think_block(content: str) -> bool:
+    stripped = content.strip()
+    return stripped.startswith("<think>") and "</think>" in stripped
 
 
 async def generate_dataset(args: argparse.Namespace) -> None:

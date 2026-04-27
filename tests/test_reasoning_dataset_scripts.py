@@ -27,13 +27,16 @@ def test_seed_dataset_records_are_valid_tool_call_samples():
         assert row["messages"][0]["role"] == "system"
         assert "tool" in row["messages"][0]["content"].lower()
         assert "API" in row["messages"][0]["content"]
+        assert "tool_calls" in row["messages"][0]["content"]
+        assert "function.arguments" in row["messages"][0]["content"]
+        assert "tool_call_id" in row["messages"][0]["content"]
         assert any(message.get("tool_calls") for message in row["messages"])
         assistant_messages = [m for m in row["messages"] if m.get("role") == "assistant"]
-        assert all("<think>" not in m["content"] for m in assistant_messages)
-        assert all("</think>" not in m["content"] for m in assistant_messages)
+        assert all(m["content"].strip().startswith("<think>") for m in assistant_messages)
+        assert all("</think>" in m["content"] for m in assistant_messages)
         assert row["messages"][-1]["role"] == "assistant"
         assert "정확한 판단은 의사·약사 상담이 필요합니다" in row["messages"][-1]["content"]
-        assert row["metadata"]["format"] == "qwen3.5_system_tool_calling"
+        assert row["metadata"]["format"] == "qwen3.5_longcot_tool_calling"
 
 
 def test_generation_prompt_mentions_available_tools():
@@ -45,7 +48,8 @@ def test_generation_prompt_mentions_available_tools():
     assert prompt["scenario_seed"]["target_tools"]
     constraints = " ".join(prompt["constraints"])
     assert "system message" in constraints
-    assert "Do not include <think>" in constraints
+    assert "longCOT <think>" in constraints
+    assert "tool call API format" in constraints
 
 
 def test_validate_sample_rejects_unknown_tool():
