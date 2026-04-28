@@ -72,6 +72,14 @@ class Settings(BaseSettings):
     clova_tts_client_id: Optional[str] = None
     clova_tts_client_secret: Optional[str] = None
 
+    # TurboQuant compressed KV cache — enabled by default on all Transformers
+    # loads; see turboquant.runtime for details.
+    turboquant_auto_wrap: bool = True
+    turboquant_key_bits: int = 3
+    turboquant_value_bits: int = 3
+    turboquant_compress_values: bool = False
+    turboquant_require_cuda: bool = False
+
     @field_validator("debug", mode="before")
     @classmethod
     def normalize_debug(cls, value: Any) -> Any:

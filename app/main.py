@@ -17,9 +17,10 @@ from typing import Any
 from fastapi import FastAPI
 
 from app.api import dur, health, query, upload
-from app.api.routes import agent_ws, ocr_api
+from app.api.routes import agent_ws, ocr_api, stt_api
 from app.core.config import settings
 from app.database.md_store import md_store
+from app.services import turboquant_runtime
 
 logging.basicConfig(
     level=getattr(logging, settings.log_level.upper(), logging.INFO),
@@ -38,6 +39,8 @@ async def lifespan(app: FastAPI):
 
     await md_store.initialize()
     logger.info("MD Database Layer 초기화 완료 (%s)", settings.md_database_path)
+
+    turboquant_runtime.install()
 
     logger.info("ODISS 서버엔진 준비 완료")
     yield
@@ -65,6 +68,7 @@ app.include_router(query.router)
 # ── ODISS 신규 엔드포인트 ──
 app.include_router(agent_ws.router, tags=["websocket"])
 app.include_router(ocr_api.router)
+app.include_router(stt_api.router)
 
 
 @app.get("/")

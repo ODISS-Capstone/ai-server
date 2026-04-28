@@ -11,6 +11,13 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from faster_whisper import WhisperModel
 from PIL import Image
 
+try:
+    from app.services.turboquant_runtime import install as _install_turboquant, wrap as _turboquant_wrap
+    _install_turboquant()
+except Exception:  # noqa: BLE001
+    def _turboquant_wrap(model):  # type: ignore[no-redef]
+        return model
+
 class SmartSpeakerOnDevice:
     def __init__(self):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -43,6 +50,7 @@ class SmartSpeakerOnDevice:
                 trust_remote_code=True,
                 torch_dtype=torch.float16
             ).to(self.device)
+            self.tts_model = _turboquant_wrap(self.tts_model)
             self.tts_model.eval()
         except Exception as e:
             print(f"⚠️ TTS Load Error (비프음으로 대체됩니다): {e}")
@@ -76,6 +84,7 @@ class SmartSpeakerOnDevice:
                     device_map="auto",
                     trust_remote_code=True
                 )
+                self.ocr_model = _turboquant_wrap(self.ocr_model)
                 self.ocr_model.eval()
             except Exception as e:
                 print(f"Error loading OCR model: {e}")
