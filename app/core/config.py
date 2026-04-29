@@ -45,6 +45,7 @@ class Settings(BaseSettings):
     # Internal LLM (Qwen / EXAONE)
     internal_llm_api_url: Optional[str] = None
     internal_llm_api_key: Optional[str] = None
+    internal_llm_model: str = "qwen"
     llm_prompts_path: str = "./app/prompts/llm_prompts.json"
     llm_tools_path: str = "./app/prompts/llm_tools.json"
     llm_engine_max_concurrency_internal: int = 1
@@ -55,6 +56,7 @@ class Settings(BaseSettings):
     # External LLM (OpenAI — LLM as a Judge + LLM Search)
     openai_api_key: Optional[str] = None
     openai_model: str = "gpt-4o-mini"
+    openai_judge_model: Optional[str] = "gpt-5"
     anthropic_api_key: Optional[str] = None
     google_ai_api_key: Optional[str] = None
 

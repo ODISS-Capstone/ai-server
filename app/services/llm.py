@@ -8,6 +8,7 @@ from typing import Any, Optional
 import httpx
 
 from app.core.config import settings
+from app.core.safety import ensure_disclaimer
 from app.services.llm_queue import run_with_engine_queue
 from app.services.prompt_registry import DEFAULT_PROMPTS, get_prompt_registry
 from app.services.tool_registry import ToolRegistry, get_tool_registry
@@ -35,6 +36,7 @@ async def call_internal_llm(
     use_tools: bool = False,
     max_tool_rounds: int = 3,
     tool_registry: Optional[ToolRegistry] = None,
+    model: Optional[str] = None,
 ) -> str:
     """내부 LLM(Qwen, EXAONE 등) 호출. 미설정 시 목업 응답.
 
@@ -44,7 +46,7 @@ async def call_internal_llm(
     url = api_url or settings.internal_llm_api_url
     key = api_key or settings.internal_llm_api_key
     if not url or not key:
-        return "(내부 LLM 미설정) 녹용은 일반적으로 고혈압 약과 함께 드셔도 되는 경우가 많습니다. 다만 개인에 따라 다를 수 있으니, 약사나 의사에게 한 번 여쭤보시는 것이 좋습니다. 정확한 판단은 의사·약사 상담이 필요합니다."
+        return _safe_internal_fallback(query_text, llm_doc)
 
     messages = get_prompt_registry().render_messages(
         "main_answer",
@@ -53,12 +55,22 @@ async def call_internal_llm(
     )
 
     if not use_tools:
-        return await _post_chat_once(url, key, messages)
+        return await _post_chat_once(
+            url,
+            key,
+            messages,
+            model=model or settings.internal_llm_model,
+        )
 
     registry = tool_registry or get_tool_registry()
     tools = registry.get_tool_schemas()
     if not tools:
-        return await _post_chat_once(url, key, messages)
+        return await _post_chat_once(
+            url,
+            key,
+            messages,
+            model=model or settings.internal_llm_model,
+        )
 
     return await run_chat_with_tools(
         messages=messages,
@@ -66,7 +78,47 @@ async def call_internal_llm(
         api_key=key,
         tool_registry=registry,
         max_tool_rounds=max_tool_rounds,
+        model=model or settings.internal_llm_model,
     )
+
+
+async def call_local_delivery_llm(
+    *,
+    original_query: str,
+    reviewed_message: str,
+    user_profile: Optional[dict[str, Any]] = None,
+    conversation_context: str = "",
+    api_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    model: Optional[str] = None,
+) -> str:
+    """로컬 모델이 GPT Judge 검토문을 최종 사용자 발화로 변환."""
+    source = reviewed_message.strip()
+    if not source:
+        return ensure_disclaimer(
+            "확인된 정보가 부족해 바로 답변드리기 어렵습니다."
+        )
+
+    url = api_url or settings.internal_llm_api_url
+    key = api_key or settings.internal_llm_api_key
+    if not url or not key:
+        return ensure_disclaimer(source)
+
+    messages = get_prompt_registry().render_messages(
+        "local_delivery",
+        original_query=original_query,
+        reviewed_message=source,
+        user_profile=json.dumps(user_profile or {}, ensure_ascii=False),
+        conversation_context=conversation_context or "(없음)",
+    )
+
+    answer = await _post_chat_once(
+        url,
+        key,
+        messages,
+        model=model or settings.internal_llm_model,
+    )
+    return ensure_disclaimer(answer or source)
 
 
 async def call_external_llm(
@@ -88,7 +140,7 @@ async def call_external_llm(
                     url,
                     headers={"Authorization": f"Bearer {settings.openai_api_key}", "Content-Type": "application/json"},
                     json={
-                        "model": "gpt-4o-mini",
+                        "model": settings.openai_model,
                         "messages": messages,
                         "max_tokens": 512,
                     },
@@ -192,6 +244,20 @@ async def _execute_tool_call(
         "name": tool_name,
         "content": json.dumps(result, ensure_ascii=False),
     }
+
+
+def _safe_internal_fallback(query_text: str, llm_doc: str) -> str:
+    """내부 LLM이 꺼져 있을 때 특정 약효를 추측하지 않는 안전 fallback."""
+    context_hint = llm_doc.strip()
+    if context_hint:
+        return ensure_disclaimer(
+            f"'{query_text}'에 대해 확인된 기록은 있지만, 로컬 답변 모델이 아직 설정되지 않아 "
+            "자세한 판단을 바로 드리기 어렵습니다. 복용 중인 약과 처방전을 가지고 약사나 의사에게 확인하세요."
+        )
+    return ensure_disclaimer(
+        f"'{query_text}'에 대해 확인된 정보가 부족합니다. 약 이름, 처방전, 복용 중인 약 정보를 확인한 뒤 "
+        "약사나 의사에게 상담하세요."
+    )
 
 
 async def _post_chat_once(

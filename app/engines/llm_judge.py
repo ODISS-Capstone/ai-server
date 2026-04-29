@@ -22,7 +22,7 @@ class LLMJudgeEngine:
     """LLM as a Judge: 팩트 체킹 및 판단 검토."""
 
     def __init__(self):
-        self.model = settings.openai_model
+        self.model = settings.openai_judge_model or settings.openai_model
 
     async def verify_fact(
         self,
@@ -92,6 +92,90 @@ class LLMJudgeEngine:
             return {
                 "verified": True,
                 "needs_correction": False,
+                "message": f"LLM Judge 오류: {e}",
+            }
+
+    async def review_final_answer(
+        self,
+        core_message: str,
+        original_query: str,
+        additional_context: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """GPT Judge로 사용자 전달 전 핵심 답변을 최종 안전 검토."""
+        if not core_message or not core_message.strip():
+            return {
+                "reviewed": False,
+                "reviewed_text": "",
+                "message": "검토할 핵심 메시지가 없습니다.",
+            }
+
+        api_key = settings.openai_api_key
+        if not api_key:
+            logger.warning("OpenAI API key not set — using core message as reviewed text")
+            return {
+                "reviewed": False,
+                "reviewed_text": core_message,
+                "message": "LLM Judge 미설정 — 최종 검토 생략",
+            }
+
+        additional_context_block = (
+            f"\n[추가 맥락]\n{additional_context}\n"
+            if additional_context
+            else ""
+        )
+        messages = get_prompt_registry().render_messages(
+            "judge_final_review",
+            original_query=original_query,
+            core_message=core_message,
+            additional_context_block=additional_context_block,
+        )
+
+        try:
+            async def post_final_review() -> dict[str, Any]:
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    resp = await client.post(
+                        "https://api.openai.com/v1/chat/completions",
+                        headers={
+                            "Authorization": f"Bearer {api_key}",
+                            "Content-Type": "application/json",
+                        },
+                        json={
+                            "model": self.model,
+                            "messages": messages,
+                            "max_tokens": 700,
+                            "temperature": 0.1,
+                        },
+                    )
+                    resp.raise_for_status()
+                    return resp.json()
+
+            data = await run_with_engine_queue("judge", post_final_review)
+            reviewed_text = (
+                data.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+                .strip()
+            )
+
+            return {
+                "reviewed": bool(reviewed_text),
+                "reviewed_text": reviewed_text or core_message,
+                "model": self.model,
+                "message": "최종 검토 완료" if reviewed_text else "빈 검토 결과 — 원문 사용",
+            }
+
+        except httpx.HTTPStatusError as e:
+            logger.error("LLM Judge final review API error: %s", e.response.status_code)
+            return {
+                "reviewed": False,
+                "reviewed_text": core_message,
+                "message": f"LLM Judge API 오류: {e.response.status_code}",
+            }
+        except Exception as e:
+            logger.error("LLM Judge final review error: %s", e)
+            return {
+                "reviewed": False,
+                "reviewed_text": core_message,
                 "message": f"LLM Judge 오류: {e}",
             }
 

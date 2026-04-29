@@ -213,7 +213,10 @@ class ReasoningEngine:
     # ── RE_Core_Msg: 핵심 답변 생성 ──
 
     async def synthesize_core_message(
-        self, execution_results: dict[str, Any]
+        self,
+        execution_results: dict[str, Any],
+        *,
+        verify_with_judge: bool = True,
     ) -> str:
         """실행 결과를 종합하여 순수 팩트 데이터 문자열 생성."""
         intent = execution_results.get("intent", "")
@@ -268,9 +271,10 @@ class ReasoningEngine:
         else:
             core_msg = " ".join(parts)
 
-        verified = await self.llm_judge.verify_fact(core_msg, query)
-        if verified.get("needs_correction"):
-            core_msg = verified.get("corrected", core_msg)
+        if verify_with_judge:
+            verified = await self.llm_judge.verify_fact(core_msg, query)
+            if verified.get("needs_correction"):
+                core_msg = verified.get("corrected", core_msg)
 
         return core_msg
 

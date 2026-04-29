@@ -19,6 +19,7 @@ from app.engines.conversation import ConversationEngine
 from app.engines.memory import MemoryEngine
 from app.engines.reasoning import ReasoningEngine
 from app.engines.llm_judge import LLMJudgeEngine
+from app.services.llm import call_local_delivery_llm
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -132,31 +133,50 @@ async def _handle_stt(websocket: WebSocket, message: dict) -> None:
 
     # 7. RE_Core_Msg: 핵심 답변 생성
     core_message = await reasoning_engine.synthesize_core_message(
-        execution_results
+        execution_results,
+        verify_with_judge=False,
     )
 
-    # 8. CE_Tone + CE_Conversation_Core: 톤앤매너 적용 및 최종 합성
+    # 8. GPT Judge: 추론 결과 최종 안전 검토
     flash_context = context.get("context_memory", "")
     user_profile = context.get("user_profile")
+    review_context = _build_review_context(context, execution_results)
+    judge_review = await llm_judge.review_final_answer(
+        core_message,
+        text,
+        additional_context=review_context,
+    )
+    reviewed_message = judge_review.get("reviewed_text") or core_message
+
+    # 9. Local LLM: 검토 완료 문장을 실제 사용자 발화로 변환
+    local_answer = await call_local_delivery_llm(
+        original_query=text,
+        reviewed_message=reviewed_message,
+        user_profile=user_profile,
+        conversation_context=flash_context,
+    )
 
     synthesis = conversation_engine.synthesize_response(
         input_data,
-        fact_data=core_message,
+        fact_data=local_answer,
         filler_sent=True,
         user_profile=user_profile,
         flash_context=flash_context,
+        apply_tone=False,
     )
 
-    # 9. CE_Response: 최종 응답 빌드 및 전송
+    # 10. CE_Response: 최종 응답 빌드 및 전송
     response = conversation_engine.build_response(synthesis)
     await websocket.send_json({"type": "response", **response})
 
-    # 10. ME_Update: 결과 저장 및 Flash Memory 압축
+    # 11. ME_Update: 결과 저장 및 Flash Memory 압축
     await memory_engine.update_and_compress(
         {
             "query": text,
             "answer": synthesis["text"],
             "type": intent,
+            "core_message": core_message,
+            "judge_review": judge_review,
             "dur_results": execution_results.get("task_results", {}).get("dur"),
         },
         speaker_id=speaker_id,
@@ -198,3 +218,42 @@ async def _handle_ocr(websocket: WebSocket, message: dict) -> None:
             "message": "OCR 결과가 저장되었습니다.",
             "medication_count": 0,
         })
+
+
+def _build_review_context(context: dict, execution_results: dict[str, Any]) -> str:
+    """GPT Judge에 넘길 최소 맥락을 구성한다."""
+    task_results = execution_results.get("task_results", {})
+    parts: list[str] = [
+        f"의도: {execution_results.get('intent', '')}",
+    ]
+
+    prescription_log = context.get("prescription_log")
+    if prescription_log:
+        parts.append(f"[현재 복약 요약]\n{prescription_log[:1200]}")
+
+    memory_prompt = context.get("memory_prompt")
+    if memory_prompt:
+        parts.append(f"[관련 메모리]\n{memory_prompt[:1200]}")
+
+    dur_results = task_results.get("dur")
+    if dur_results:
+        parts.append(
+            "[DUR 실행 결과 요약]\n"
+            + json.dumps(dur_results, ensure_ascii=False, default=str)[:2000]
+        )
+
+    supplement_results = task_results.get("supplements")
+    if supplement_results:
+        parts.append(
+            "[건강기능식품 조회 결과]\n"
+            + json.dumps(supplement_results, ensure_ascii=False, default=str)[:1200]
+        )
+
+    hira_results = task_results.get("hira")
+    if hira_results:
+        parts.append(
+            "[의약품 식별 결과]\n"
+            + json.dumps(hira_results, ensure_ascii=False, default=str)[:1200]
+        )
+
+    return "\n\n".join(parts)
