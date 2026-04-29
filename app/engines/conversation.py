@@ -143,6 +143,7 @@ class ConversationEngine:
         filler_sent: bool = False,
         user_profile: Optional[dict] = None,
         flash_context: Optional[str] = None,
+        apply_tone: bool = True,
     ) -> dict:
         """최종 응답을 합성. 팩트 데이터가 없으면 스몰토크로 처리."""
         if input_data.get("is_smalltalk") and not fact_data:
@@ -154,7 +155,11 @@ class ConversationEngine:
             }
 
         if fact_data:
-            toned_text = self.apply_tone(fact_data, user_profile, flash_context)
+            toned_text = (
+                self.apply_tone(fact_data, user_profile, flash_context)
+                if apply_tone
+                else fact_data.strip()
+            )
             return {
                 "text": toned_text,
                 "type": "medical_response",
