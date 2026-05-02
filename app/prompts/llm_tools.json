@@ -4,7 +4,7 @@
       "type": "function",
       "function": {
         "name": "Tool_Get_Drug_Identification",
-        "description": "의약품의 외형적 특성(모양, 색상, 각인 등)을 기반으로 품목명과 제조사를 확인한다. OCR 결과에 의약품명이 불분명하고 외형 기술만 있을 때 사용한다. (HIRA 의약품 낱알식별 API)",
+        "description": "의약품의 외형적 특성(모양, 색상, 각인 등)을 기반으로 품목명과 제조사를 확인한다. OCR 결과에 의약품명이 불분명하고 외형 기술만 있을 때 사용한다. item_name, item_seq, 각인, 모양, 색상 등 식별 단서가 하나 이상 있을 때만 호출한다. (HIRA 의약품 낱알식별 API)",
         "parameters": {
           "type": "object",
           "properties": {
@@ -17,7 +17,8 @@
             "color_class1": {"type": "string", "description": "색상 (예: 하양, 노랑)"},
             "page_no": {"type": "integer", "minimum": 1, "default": 1},
             "num_of_rows": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10}
-          }
+          },
+          "additionalProperties": false
         }
       }
     },
@@ -25,7 +26,7 @@
       "type": "function",
       "function": {
         "name": "Tool_Check_DUR_Combination_Contraindication",
-        "description": "두 가지 이상의 성분 또는 품목 간 동시 투여 시의 금기 정보를 조회한다. 복용 로그의 복수 약물 상호작용 여부 확인에 사용한다. (식약처 DUR T2) item_name 또는 item_seq 중 하나를 입력한다. 약 이름이 있으면 item_name을 우선 사용한다. 조회 결과는 안전성 참고 정보이며, 처방 변경·복용 중단·용량 조절·진단 지시의 단독 근거로 사용하지 않는다.",
+        "description": "한 품목 또는 성분을 기준으로 동시 투여 금기 대상 정보를 조회한다. 복용 로그의 복수 약물 상호작용 여부 확인 시 각 의약품을 기준으로 조회한다. (식약처 DUR T2) item_name 또는 item_seq 중 하나를 입력한다. 약 이름이 있으면 item_name을 우선 사용한다. 두 약 이름을 한 필드에 합쳐 넣지 않는다. 조회 결과는 안전성 참고 정보이며, 처방 변경·복용 중단·용량 조절·진단 지시의 단독 근거로 사용하지 않는다.",
         "parameters": {
           "type": "object",
           "properties": {
@@ -33,7 +34,12 @@
             "item_seq": {"type": "string", "description": "품목기준코드"},
             "page_no": {"type": "integer", "minimum": 1, "default": 1},
             "num_of_rows": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10}
-          }
+          },
+          "additionalProperties": false,
+          "anyOf": [
+            {"required": ["item_name"]},
+            {"required": ["item_seq"]}
+          ]
         }
       }
     },
@@ -49,7 +55,12 @@
             "item_seq": {"type": "string", "description": "품목기준코드"},
             "page_no": {"type": "integer", "minimum": 1, "default": 1},
             "num_of_rows": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10}
-          }
+          },
+          "additionalProperties": false,
+          "anyOf": [
+            {"required": ["item_name"]},
+            {"required": ["item_seq"]}
+          ]
         }
       }
     },
@@ -65,7 +76,12 @@
             "item_seq": {"type": "string", "description": "품목기준코드"},
             "page_no": {"type": "integer", "minimum": 1, "default": 1},
             "num_of_rows": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10}
-          }
+          },
+          "additionalProperties": false,
+          "anyOf": [
+            {"required": ["item_name"]},
+            {"required": ["item_seq"]}
+          ]
         }
       }
     },
@@ -81,7 +97,12 @@
             "item_seq": {"type": "string", "description": "품목기준코드"},
             "page_no": {"type": "integer", "minimum": 1, "default": 1},
             "num_of_rows": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10}
-          }
+          },
+          "additionalProperties": false,
+          "anyOf": [
+            {"required": ["item_name"]},
+            {"required": ["item_seq"]}
+          ]
         }
       }
     },
@@ -97,7 +118,12 @@
             "item_seq": {"type": "string", "description": "품목기준코드"},
             "page_no": {"type": "integer", "minimum": 1, "default": 1},
             "num_of_rows": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10}
-          }
+          },
+          "additionalProperties": false,
+          "anyOf": [
+            {"required": ["item_name"]},
+            {"required": ["item_seq"]}
+          ]
         }
       }
     },
@@ -113,7 +139,12 @@
             "item_seq": {"type": "string", "description": "품목기준코드"},
             "page_no": {"type": "integer", "minimum": 1, "default": 1},
             "num_of_rows": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10}
-          }
+          },
+          "additionalProperties": false,
+          "anyOf": [
+            {"required": ["item_name"]},
+            {"required": ["item_seq"]}
+          ]
         }
       }
     },
@@ -129,7 +160,12 @@
             "item_seq": {"type": "string", "description": "품목기준코드"},
             "page_no": {"type": "integer", "minimum": 1, "default": 1},
             "num_of_rows": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10}
-          }
+          },
+          "additionalProperties": false,
+          "anyOf": [
+            {"required": ["item_name"]},
+            {"required": ["item_seq"]}
+          ]
         }
       }
     },
@@ -145,7 +181,12 @@
             "item_seq": {"type": "string", "description": "품목기준코드"},
             "page_no": {"type": "integer", "minimum": 1, "default": 1},
             "num_of_rows": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10}
-          }
+          },
+          "additionalProperties": false,
+          "anyOf": [
+            {"required": ["item_name"]},
+            {"required": ["item_seq"]}
+          ]
         }
       }
     },
@@ -161,7 +202,12 @@
             "item_seq": {"type": "string", "description": "품목기준코드"},
             "page_no": {"type": "integer", "minimum": 1, "default": 1},
             "num_of_rows": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10}
-          }
+          },
+          "additionalProperties": false,
+          "anyOf": [
+            {"required": ["item_name"]},
+            {"required": ["item_seq"]}
+          ]
         }
       }
     },
@@ -176,7 +222,9 @@
             "product_name": {"type": "string", "description": "건강기능식품 제품명"},
             "page_no": {"type": "integer", "minimum": 1, "default": 1},
             "num_of_rows": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10}
-          }
+          },
+          "required": ["product_name"],
+          "additionalProperties": false
         }
       }
     },
@@ -188,9 +236,11 @@
         "parameters": {
           "type": "object",
           "properties": {
+            "product_name": {"type": "string", "description": "검색할 건강기능식품 제품명 또는 제품명 일부"},
             "page_no": {"type": "integer", "minimum": 1, "default": 1},
             "num_of_rows": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10}
-          }
+          },
+          "additionalProperties": false
         }
       }
     }

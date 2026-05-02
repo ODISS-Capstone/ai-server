@@ -153,9 +153,11 @@ class LLMJudgeEngine:
     def _parse_judge_response(
         self, response: str, original: str
     ) -> dict[str, Any]:
-        response_upper = response.upper().strip()
+        stripped = response.strip()
+        first_line = next((line.strip() for line in stripped.splitlines() if line.strip()), "")
+        first_line_upper = first_line.upper()
 
-        if response_upper.startswith("DANGER"):
+        if first_line_upper.startswith("DANGER"):
             correction = response.split(":", 1)[-1].strip() if ":" in response else response
             return {
                 "verified": False,
@@ -165,7 +167,7 @@ class LLMJudgeEngine:
                 "message": response,
             }
 
-        if response_upper.startswith("NEEDS_CORRECTION"):
+        if first_line_upper.startswith("NEEDS_CORRECTION"):
             correction = response.split(":", 1)[-1].strip() if ":" in response else response
             return {
                 "verified": False,
@@ -175,11 +177,20 @@ class LLMJudgeEngine:
                 "message": response,
             }
 
+        if first_line_upper.startswith("VERIFIED"):
+            return {
+                "verified": True,
+                "needs_correction": False,
+                "danger": False,
+                "message": response,
+            }
+
         return {
-            "verified": True,
-            "needs_correction": False,
+            "verified": False,
+            "needs_correction": True,
             "danger": False,
-            "message": response,
+            "corrected": original,
+            "message": f"Unrecognized judge response format: {response}",
         }
 
     def _parse_evaluation(self, response: str) -> dict[str, Any]:

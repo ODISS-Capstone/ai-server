@@ -35,6 +35,17 @@ def test_project_schema_exposes_twelve_tools():
     assert set(DEFAULT_TOOL_HANDLERS.keys()) == EXPECTED_TOOL_NAMES
 
 
+def test_health_supplement_search_schema_accepts_product_name():
+    registry = ToolRegistry(schema_path=PROJECT_SCHEMA)
+    schemas = {
+        schema["function"]["name"]: schema
+        for schema in registry.get_tool_schemas()
+    }
+
+    search_schema = schemas["Tool_Search_Health_Supplement_List"]["function"]["parameters"]
+    assert "product_name" in search_schema["properties"]
+
+
 def test_registry_falls_back_to_empty_when_schema_missing(tmp_path):
     registry = ToolRegistry(schema_path=tmp_path / "missing.json")
     assert registry.get_tool_schemas() == []

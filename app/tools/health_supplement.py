@@ -61,10 +61,11 @@ async def get_supplement_detail(
 
 
 async def list_supplements(
+    product_name: Optional[str] = None,
     page_no: int = 1,
     num_of_rows: int = 10,
 ) -> dict[str, Any]:
-    """건강기능식품 목록 조회 (T12)."""
+    """건강기능식품 목록 조회 및 제품명 검색 (T12)."""
     service_key = settings.data_go_kr_service_key
     if not service_key:
         return {
@@ -81,6 +82,8 @@ async def list_supplements(
         "numOfRows": str(num_of_rows),
         "type": "json",
     }
+    if product_name:
+        params["prdlstNm"] = product_name
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
