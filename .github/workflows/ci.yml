@@ -49,6 +49,31 @@ jobs:
       - name: Run tests
         run: pytest -q
 
+      - name: Split monolithic reasoning dataset by engine contract
+        run: |
+          python scripts/split_reasoning_dataset.py
+
+      - name: Enforce per-engine dataset fit gates
+        run: |
+          python scripts/evaluate_engine_datasets.py \
+            --dataset data/fine_tuning/qwen_router_samples.jsonl \
+            --task-family router \
+            --strict
+          python scripts/evaluate_engine_datasets.py \
+            --dataset data/fine_tuning/qwen_memory_samples.jsonl \
+            --task-family memory \
+            --strict
+          python scripts/evaluate_engine_datasets.py \
+            --dataset data/fine_tuning/qwen_delivery_samples.jsonl \
+            --task-family delivery \
+            --strict
+
+      - name: Report legacy reasoning runtime mismatch (non-blocking)
+        run: |
+          python scripts/evaluate_engine_datasets.py \
+            --dataset data/fine_tuning/qwen_reasoning_samples.jsonl \
+            --task-family reasoning
+
       - name: TurboQuant auto-wrap lifespan smoke (CPU)
         env:
           TURBOQUANT_AUTO_WRAP: "1"

@@ -13,13 +13,27 @@ server.mermaid 매핑:
 """
 import json
 import logging
+import re
 from datetime import datetime
 from typing import Any, Optional
 
+from app.core.config import settings
 from app.database.md_store import md_store
 from app.memory import StructuredMemoryService
+from app.schemas.engine_contracts import (
+    MemoryArtifactRef,
+    MemoryEvidenceBundle,
+    MemoryEvidenceRequest,
+)
+from app.tools import llm_search
 
 logger = logging.getLogger(__name__)
+
+OCR_TYPO_MAP = {
+    "타이레롤": "타이레놀",
+    "와파린정정": "와파린정",
+    "아스피린장용정정": "아스피린장용정",
+}
 
 
 class MemoryEngine:
@@ -146,6 +160,62 @@ class MemoryEngine:
             speaker_id=speaker_id,
         )
         return structured_context.get("memory_prompt", "")
+
+    async def prepare_evidence_bundle(
+        self,
+        request: MemoryEvidenceRequest,
+    ) -> MemoryEvidenceBundle:
+        """Prepare normalized memory evidence for reasoning/conversation.
+
+        Ownership:
+        - Memory engine normalizes OCR entities and picks minimal artifact refs.
+        - It may use frontier search only when DUR-search is not feasible.
+        """
+        normalized_query = " ".join(request.query.strip().split())
+        history = await self.search_history(
+            normalized_query,
+            speaker_id=request.speaker_id,
+        )
+        normalized_meds = self.normalize_ocr_medications(request.ocr_payload)
+        if not normalized_meds:
+            normalized_meds = self._extract_query_medications(normalized_query)
+        dur_searchable = bool(normalized_meds) and all(
+            self._is_dur_search_supported(name) for name in normalized_meds
+        )
+
+        artifact_refs = self._select_artifacts(history)
+        structured_memory = history.get("structured_memory", {})
+        memory_prompt = (
+            structured_memory.get("prompt", "")
+            if isinstance(structured_memory, dict)
+            else ""
+        )
+        summary = self._summarize_artifacts(history)
+
+        used_frontier_fallback = False
+        frontier_answer_preview = ""
+        if request.allow_frontier_fallback and not dur_searchable and normalized_query:
+            fallback = await llm_search.llm_search(normalized_query, context=memory_prompt)
+            if fallback.get("success") and fallback.get("answer"):
+                used_frontier_fallback = True
+                frontier_answer_preview = fallback["answer"][:500].strip()
+                if frontier_answer_preview:
+                    summary = (
+                        f"{summary}\n\n[fallback]\n{frontier_answer_preview}"
+                        if summary
+                        else frontier_answer_preview
+                    )
+
+        return MemoryEvidenceBundle(
+            normalized_query=normalized_query,
+            normalized_medications=normalized_meds,
+            dur_searchable=dur_searchable,
+            used_frontier_fallback=used_frontier_fallback,
+            frontier_answer_preview=frontier_answer_preview,
+            artifact_refs=artifact_refs,
+            summary=summary,
+            memory_prompt=memory_prompt,
+        )
 
     # ── ME_Parse: 환자 개인정보 구분 및 주요 정보 로그 파싱 ──
 
@@ -312,3 +382,131 @@ class MemoryEngine:
             return False
         keywords = [w for w in query.split() if len(w) > 1]
         return any(kw in text for kw in keywords)
+
+    def normalize_ocr_medications(self, ocr_payload: Optional[dict[str, Any]]) -> list[str]:
+        """Normalize OCR medication names and apply typo fixes."""
+        if not ocr_payload:
+            return []
+
+        names: list[str] = []
+        meds = ocr_payload.get("medications", [])
+        if isinstance(meds, list):
+            for med in meds:
+                if isinstance(med, dict):
+                    raw = str(med.get("name", "")).strip()
+                else:
+                    raw = str(med).strip()
+                if raw:
+                    names.append(raw)
+
+        ocr_results = ocr_payload.get("ocr_results", {})
+        if isinstance(ocr_results, dict):
+            structured_data = ocr_results.get("structured_data", {})
+            if isinstance(structured_data, dict):
+                drugs = structured_data.get("drugs", [])
+                if isinstance(drugs, list):
+                    for drug in drugs:
+                        if isinstance(drug, dict) and drug.get("name"):
+                            names.append(str(drug["name"]).strip())
+
+        normalized: list[str] = []
+        for name in names:
+            canon = self._normalize_medication_name(name)
+            if canon and canon not in normalized:
+                normalized.append(canon)
+        return normalized
+
+    def _normalize_medication_name(self, raw: str) -> str:
+        cleaned = raw.strip()
+        if not cleaned:
+            return ""
+        cleaned = re.sub(r"[\s\t\r\n]+", "", cleaned)
+        cleaned = re.sub(r"[()\\[\\]{}.,;:\"'`~!@#$%^&*_+=|<>?/\\\\-]", "", cleaned)
+        if cleaned in OCR_TYPO_MAP:
+            cleaned = OCR_TYPO_MAP[cleaned]
+        return cleaned
+
+    def _is_dur_search_supported(self, medication_name: str) -> bool:
+        """Heuristic DUR-searchability gate used before deterministic tool calls."""
+        if not medication_name or len(medication_name) < 2:
+            return False
+        if not (settings.data_go_kr_service_key or settings.kpic_dur_api_key):
+            return False
+        # At least one Korean/alpha/num token should exist.
+        return bool(re.search(r"[가-힣A-Za-z0-9]", medication_name))
+
+    def _select_artifacts(self, history: dict[str, Any]) -> list[MemoryArtifactRef]:
+        """Pick minimal artifacts likely needed for this turn."""
+        refs: list[MemoryArtifactRef] = []
+
+        for category, payload in history.items():
+            if category == "structured_memory" and isinstance(payload, dict):
+                items = payload.get("items", [])
+                for item in items[:3]:
+                    if isinstance(item, dict):
+                        refs.append(
+                            MemoryArtifactRef(
+                                category=category,
+                                path=item.get("path"),
+                                reason="semantic_match",
+                                score=0.9,
+                            )
+                        )
+                continue
+
+            if isinstance(payload, list):
+                for entry in payload[:2]:
+                    if isinstance(entry, dict):
+                        refs.append(
+                            MemoryArtifactRef(
+                                category=category,
+                                path=entry.get("path"),
+                                reason="keyword_match",
+                                score=0.7,
+                            )
+                        )
+            elif isinstance(payload, str) and payload.strip():
+                refs.append(
+                    MemoryArtifactRef(
+                        category=category,
+                        path=None,
+                        reason="direct_text_hit",
+                        score=0.6,
+                    )
+                )
+        return refs[:8]
+
+    def _summarize_artifacts(self, history: dict[str, Any]) -> str:
+        parts: list[str] = []
+        structured = history.get("structured_memory")
+        if isinstance(structured, dict):
+            briefs = structured.get("briefs", [])
+            if isinstance(briefs, list) and briefs:
+                parts.extend(str(brief).strip() for brief in briefs[:3] if str(brief).strip())
+
+        if not parts:
+            for category, payload in history.items():
+                if category == "structured_memory":
+                    continue
+                if isinstance(payload, list) and payload:
+                    parts.append(f"{category}: {len(payload)}건")
+                elif isinstance(payload, str) and payload.strip():
+                    parts.append(f"{category}: 텍스트 히트")
+        return " | ".join(parts[:5])
+
+    def _extract_query_medications(self, query: str) -> list[str]:
+        meds: list[str] = []
+        for token in query.split():
+            token = self._normalize_medication_name(token)
+            if not token:
+                continue
+            if len(token) < 2:
+                continue
+            if "정" in token or "캡슐" in token or "시럽" in token:
+                meds.append(token)
+        # keep uniqueness
+        unique: list[str] = []
+        for med in meds:
+            if med not in unique:
+                unique.append(med)
+        return unique[:5]

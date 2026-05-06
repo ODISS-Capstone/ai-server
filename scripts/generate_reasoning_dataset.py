@@ -8,9 +8,20 @@ The output format is one JSON object per line:
   "metadata": {"intent": "...", "source": "openai_synthetic"}
 }
 
-Usage:
-    OPENAI_API_KEY=... python scripts/generate_reasoning_dataset.py \
-        --count 50 \
+In-context exemplars: the script reads validated samples from
+``--exemplars-path`` (default: ``data/fine_tuning/qwen_reasoning_samples.jsonl``)
+and embeds 1–3 of them inside the generation prompt so GPT can imitate the
+exact JSON shape, longCOT pattern, and Korean tone.
+
+Usage::
+
+    # 1. fill .env with OPENAI_API_KEY
+    OPENAI_API_KEY=sk-...
+    OPENAI_DATASET_MODEL=gpt-5.5        # optional override
+
+    # 2. generate
+    python scripts/generate_reasoning_dataset.py \
+        --count 100 \
         --output data/fine_tuning/qwen_reasoning_synthetic.jsonl
 """
 from __future__ import annotations
@@ -19,6 +30,7 @@ import argparse
 import asyncio
 import json
 import os
+import random
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +39,25 @@ import httpx
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TOOLS_PATH = PROJECT_ROOT / "app" / "prompts" / "llm_tools.json"
 DEFAULT_OUTPUT_PATH = PROJECT_ROOT / "data" / "fine_tuning" / "qwen_reasoning_synthetic.jsonl"
+DEFAULT_EXEMPLARS_PATH = PROJECT_ROOT / "data" / "fine_tuning" / "qwen_reasoning_samples.jsonl"
+
+
+def _load_dotenv(path: Path) -> None:
+    """Minimal .env loader: only sets vars that aren't already in os.environ."""
+    if not path.exists():
+        return
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_dotenv(PROJECT_ROOT / ".env")
 
 REASONING_SYSTEM_PROMPT = (
     "당신은 ODISS의 Qwen reasoning-engine fine-tuning 데이터 생성기입니다. "
@@ -90,11 +121,73 @@ def load_tool_names(path: Path) -> list[str]:
     return [tool["function"]["name"] for tool in data.get("tools", [])]
 
 
-def build_generation_prompt(index: int, tool_names: list[str]) -> str:
+def load_exemplars(path: Path) -> list[dict[str, Any]]:
+    """Read validated SFT samples used as in-context examples."""
+    if not path.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return rows
+
+
+def _pick_exemplars(
+    exemplars: list[dict[str, Any]],
+    *,
+    intent: str,
+    k: int,
+    rng: random.Random,
+) -> list[dict[str, Any]]:
+    """Pick up to ``k`` exemplars, preferring matching intent."""
+    if not exemplars or k <= 0:
+        return []
+    same_intent = [
+        e for e in exemplars if e.get("metadata", {}).get("intent") == intent
+    ]
+    others = [
+        e for e in exemplars if e.get("metadata", {}).get("intent") != intent
+    ]
+    rng.shuffle(same_intent)
+    rng.shuffle(others)
+    picked = (same_intent + others)[:k]
+    return picked
+
+
+def _supports_temperature(model: str) -> bool:
+    """Return whether the Chat Completions request should include temperature.
+
+    GPT-5 reasoning-family models reject legacy sampling controls such as
+    ``temperature`` on this endpoint.  Keep the CLI option for older models,
+    but omit the field automatically for GPT-5+ slugs.
+    """
+    normalized = model.lower().strip()
+    return not normalized.startswith("gpt-5")
+
+
+def build_generation_prompt(
+    index: int,
+    tool_names: list[str],
+    *,
+    exemplars: list[dict[str, Any]] | None = None,
+    rng: random.Random | None = None,
+    exemplar_count: int = 2,
+) -> str:
     seed = SCENARIO_SEEDS[index % len(SCENARIO_SEEDS)]
+    rng = rng or random.Random(index)
+    chosen = _pick_exemplars(
+        exemplars or [], intent=seed["intent"], k=exemplar_count, rng=rng
+    )
     return json.dumps(
         {
             "task": "Create one Korean SFT sample for Qwen tool-calling reasoning.",
+            "in_context_examples": chosen,
             "required_output_schema": {
                 "messages": [
                     {
@@ -139,6 +232,8 @@ def build_generation_prompt(index: int, tool_names: list[str]) -> str:
             "constraints": [
                 "Use only tool names from available_tools.",
                 "Use Korean for user and assistant text.",
+                "Mirror the exact JSON shape, message ordering, longCOT structure, and Korean tone of in_context_examples; treat them as canonical reference samples.",
+                "Do NOT copy the user query, drug names, or numeric facts from in_context_examples. Invent a new realistic scenario consistent with scenario_seed.",
                 "The first system message must instruct the model to reason internally, choose public-data API tools when needed, call tools before answering, and answer safely from tool results.",
                 "The first system message must explicitly include the tool call API format: assistant content is empty when calling tools, tool_calls array is used, each call has id/type/function.name/function.arguments, function.arguments is a JSON string, and tool results arrive as role='tool' with tool_call_id/name/content.",
                 "Assistant messages must include longCOT <think>...</think> blocks for training data.",
@@ -161,23 +256,34 @@ async def generate_one(
     model: str,
     index: int,
     tool_names: list[str],
+    exemplars: list[dict[str, Any]],
+    rng: random.Random,
+    exemplar_count: int,
+    temperature: float,
 ) -> dict[str, Any]:
+    user_prompt = build_generation_prompt(
+        index, tool_names,
+        exemplars=exemplars, rng=rng, exemplar_count=exemplar_count,
+    )
+    request_body: dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": REASONING_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        "response_format": {"type": "json_object"},
+    }
+    if _supports_temperature(model):
+        request_body["temperature"] = temperature
+
     response = await client.post(
         "https://api.openai.com/v1/chat/completions",
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         },
-        json={
-            "model": model,
-            "messages": [
-                {"role": "system", "content": REASONING_SYSTEM_PROMPT},
-                {"role": "user", "content": build_generation_prompt(index, tool_names)},
-            ],
-            "temperature": 0.7,
-            "response_format": {"type": "json_object"},
-        },
-        timeout=90.0,
+        json=request_body,
+        timeout=120.0,
     )
     response.raise_for_status()
     content = response.json()["choices"][0]["message"]["content"]
@@ -234,34 +340,88 @@ def _has_think_block(content: str) -> bool:
 async def generate_dataset(args: argparse.Namespace) -> None:
     api_key = args.api_key or os.getenv("OPENAI_API_KEY")
     if not api_key:
-        raise RuntimeError("OPENAI_API_KEY is required")
+        raise RuntimeError(
+            "OPENAI_API_KEY is required. Set it in ai-server/.env (preferred) "
+            "or export OPENAI_API_KEY=... before running, or pass --api-key."
+        )
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     tool_names = load_tool_names(Path(args.tools_path))
+    exemplars = load_exemplars(Path(args.exemplars_path))
+    rng = random.Random(args.seed)
 
+    if args.dry_run:
+        sample_prompt = build_generation_prompt(
+            0, tool_names,
+            exemplars=exemplars, rng=rng,
+            exemplar_count=args.exemplars,
+        )
+        print("# dry-run: example prompt that would be sent to OpenAI")
+        print(f"# model: {args.model}")
+        print(sample_prompt[:4000])
+        print("...")
+        print(f"# exemplars loaded: {len(exemplars)}")
+        return
+
+    failed = 0
     async with httpx.AsyncClient() as client:
         with output_path.open("a", encoding="utf-8") as f:
             for idx in range(args.count):
-                sample = await generate_one(
-                    client=client,
-                    api_key=api_key,
-                    model=args.model,
-                    index=idx,
-                    tool_names=tool_names,
-                )
+                try:
+                    sample = await generate_one(
+                        client=client,
+                        api_key=api_key,
+                        model=args.model,
+                        index=idx,
+                        tool_names=tool_names,
+                        exemplars=exemplars,
+                        rng=rng,
+                        exemplar_count=args.exemplars,
+                        temperature=args.temperature,
+                    )
+                except (httpx.HTTPError, ValueError, json.JSONDecodeError) as exc:
+                    failed += 1
+                    detail = ""
+                    if isinstance(exc, httpx.HTTPStatusError):
+                        detail = f" | response={exc.response.text[:1000]}"
+                    print(
+                        f"[skip {idx + 1}/{args.count}] "
+                        f"{type(exc).__name__}: {exc}{detail}"
+                    )
+                    if failed >= args.max_failures:
+                        raise RuntimeError(
+                            f"aborted after {failed} consecutive/total failures"
+                        ) from exc
+                    continue
                 f.write(json.dumps(sample, ensure_ascii=False) + "\n")
                 f.flush()
                 print(f"wrote sample {idx + 1}/{args.count} -> {output_path}")
+    print(f"done. wrote {args.count - failed} samples (skipped {failed})")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--count", type=int, default=20)
-    parser.add_argument("--model", default="gpt-4o-mini")
-    parser.add_argument("--api-key", default=None)
+    parser.add_argument("--count", type=int, default=20,
+                        help="how many samples to generate")
+    parser.add_argument("--model",
+                        default=os.getenv("OPENAI_DATASET_MODEL", "gpt-5.5"),
+                        help="OpenAI model id (env: OPENAI_DATASET_MODEL)")
+    parser.add_argument("--api-key", default=None,
+                        help="overrides OPENAI_API_KEY from env/.env")
     parser.add_argument("--tools-path", default=str(DEFAULT_TOOLS_PATH))
+    parser.add_argument("--exemplars-path", default=str(DEFAULT_EXEMPLARS_PATH),
+                        help="JSONL file with hand-written reference samples for in-context learning")
+    parser.add_argument("--exemplars", type=int, default=2,
+                        help="number of in-context examples per generation request (0 disables)")
+    parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument("--seed", type=int, default=20260506,
+                        help="RNG seed for exemplar shuffling")
+    parser.add_argument("--max-failures", type=int, default=10,
+                        help="abort run after this many failed generations")
     parser.add_argument("--output", default=str(DEFAULT_OUTPUT_PATH))
+    parser.add_argument("--dry-run", action="store_true",
+                        help="print the first generation prompt without calling OpenAI")
     return parser.parse_args()
 
 

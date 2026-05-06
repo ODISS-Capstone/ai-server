@@ -9,10 +9,16 @@ server.mermaid 매핑:
 """
 import logging
 import random
+import re
 from datetime import datetime
 from typing import Optional
 
 from app.core.config import settings
+from app.schemas.engine_contracts import (
+    ConversationComposeRequest,
+    ConversationComposeResponse,
+    ReasoningMode,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -183,6 +189,69 @@ class ConversationEngine:
             "timestamp": datetime.now().isoformat(),
         }
 
+    def compose_from_contract(
+        self,
+        contract: ConversationComposeRequest,
+    ) -> ConversationComposeResponse:
+        """Compose elder-facing output from typed engine contracts.
+
+        Runtime policy:
+        - Never expose ``<think>`` blocks.
+        - Conversation engine consumes user profile + reasoning decision
+          + reviewed/delivery text candidates.
+        """
+        if contract.decision.mode == ReasoningMode.ASK_USER_CLARIFY:
+            text = (
+                "어르신, 확인이 필요한 약 이름이나 증상을 조금 더 자세히 말씀해 주세요. "
+                "예: 약 이름, 하루 몇 번 드시는지, 언제부터 불편하셨는지."
+            )
+            return ConversationComposeResponse(
+                response_text=text,
+                response_type="clarify",
+                requires_tts=True,
+            )
+
+        source = (
+            contract.delivery_message.strip()
+            or contract.reviewed_message.strip()
+            or contract.core_message.strip()
+        )
+        source = self._strip_think_tags(source)
+
+        if not source:
+            fallback = "어르신, 현재 기록만으로는 정확한 판단이 어렵습니다."
+            if contract.decision.mode == ReasoningMode.MEMORY_ONLY:
+                fallback = (
+                    "어르신, 지금은 가벼운 안내만 가능한 상태예요. "
+                    "복용 중인 약 이름이나 처방전을 알려주시면 더 정확히 도와드릴 수 있어요."
+                )
+            return ConversationComposeResponse(
+                response_text=self.apply_tone(
+                    fallback,
+                    user_profile=contract.user_profile,
+                    flash_context=contract.evidence.summary if contract.evidence else None,
+                ),
+                response_type="fallback",
+                requires_tts=True,
+            )
+
+        response_type = (
+            "smalltalk"
+            if contract.decision.mode == ReasoningMode.MEMORY_ONLY
+            and contract.decision.intent == "smalltalk"
+            else "medical_response"
+        )
+        text = self.apply_tone(
+            source,
+            user_profile=contract.user_profile,
+            flash_context=contract.evidence.summary if contract.evidence else None,
+        )
+        return ConversationComposeResponse(
+            response_text=text,
+            response_type=response_type,
+            requires_tts=True,
+        )
+
     # ── 내부 유틸 ──
 
     def _detect_smalltalk(self, text: str) -> bool:
@@ -206,3 +275,10 @@ class ConversationEngine:
         if any(kw in text_lower for kw in THANKS_KEYWORDS):
             return "thanks"
         return None
+
+    def _strip_think_tags(self, text: str) -> str:
+        """Remove training-only longCoT blocks from runtime responses."""
+        if not text:
+            return ""
+        cleaned = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
+        return cleaned.strip()

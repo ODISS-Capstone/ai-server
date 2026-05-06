@@ -6,6 +6,7 @@ import pytest
 
 from scripts.generate_reasoning_dataset import (
     build_generation_prompt,
+    _supports_temperature,
     load_tool_names,
     validate_sample,
 )
@@ -50,6 +51,12 @@ def test_generation_prompt_mentions_available_tools():
     assert "system message" in constraints
     assert "longCOT <think>" in constraints
     assert "tool call API format" in constraints
+
+
+def test_gpt5_family_omits_temperature_parameter():
+    assert _supports_temperature("gpt-5.5") is False
+    assert _supports_temperature("gpt-5") is False
+    assert _supports_temperature("gpt-4o-mini") is True
 
 
 def test_validate_sample_rejects_unknown_tool():

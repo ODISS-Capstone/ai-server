@@ -10,6 +10,12 @@ from typing import Any, Optional
 
 from app.engines.memory import MemoryEngine
 from app.engines.llm_judge import LLMJudgeEngine
+from app.schemas.engine_contracts import (
+    ReasoningMode,
+    ReasoningRouteDecision,
+    ReasoningRouteInput,
+    ReasoningTask,
+)
 from app.tools import dur_api, hira_api, health_supplement, llm_search
 
 logger = logging.getLogger(__name__)
@@ -63,11 +69,11 @@ class ReasoningEngine:
             return IntentType.DRUG_IDENTIFICATION
 
         if any(kw in text_lower for kw in SUPPLEMENT_KEYWORDS):
-            if any(kw in text_lower for kw in MEDICATION_KEYWORDS):
+            if self._contains_medication_signal(text_lower):
                 return IntentType.MEDICATION_QUERY
             return IntentType.SUPPLEMENT_QUERY
 
-        if any(kw in text_lower for kw in MEDICATION_KEYWORDS):
+        if self._contains_medication_signal(text_lower):
             return IntentType.MEDICATION_QUERY
 
         return IntentType.SMALLTALK
@@ -139,6 +145,67 @@ class ReasoningEngine:
 
         return sorted(tasks, key=lambda t: t["priority"])
 
+    def route_execution(self, route_input: ReasoningRouteInput) -> ReasoningRouteDecision:
+        """Decide tool/frontier/memory route before task execution."""
+        text = route_input.text.strip()
+        context = route_input.context or {}
+
+        if not text:
+            return ReasoningRouteDecision(
+                mode=ReasoningMode.ASK_USER_CLARIFY,
+                intent=IntentType.UNKNOWN,
+                rationale="empty_user_input",
+                tasks=[],
+            )
+
+        intent = self.classify_intent(text)
+        if route_input.is_smalltalk and intent == IntentType.SMALLTALK:
+            return ReasoningRouteDecision(
+                mode=ReasoningMode.MEMORY_ONLY,
+                intent=intent,
+                rationale="smalltalk_detected",
+                tasks=[],
+            )
+
+        if intent == IntentType.EMERGENCY:
+            return ReasoningRouteDecision(
+                mode=ReasoningMode.TOOL_FIRST,
+                intent=intent,
+                rationale="emergency_policy_first",
+                tasks=[
+                    ReasoningTask(
+                        type="emergency_alert",
+                        priority=0,
+                        description="긴급 상황 감지 — 즉시 경고",
+                    )
+                ],
+            )
+
+        planned = self.plan_tasks(intent, context)
+        if planned:
+            return ReasoningRouteDecision(
+                mode=ReasoningMode.TOOL_FIRST,
+                intent=intent,
+                rationale="deterministic_tools_available",
+                tasks=[ReasoningTask(**task) for task in planned],
+            )
+
+        prescription_log = str(context.get("prescription_log", "")).strip()
+        if prescription_log:
+            return ReasoningRouteDecision(
+                mode=ReasoningMode.MEMORY_ONLY,
+                intent=intent,
+                rationale="memory_context_available_without_tool_plan",
+                tasks=[],
+            )
+
+        return ReasoningRouteDecision(
+            mode=ReasoningMode.FRONTIER_FIRST,
+            intent=intent,
+            rationale="no_deterministic_tool_plan_or_memory_context",
+            tasks=[],
+        )
+
     # ── 태스크 실행 오케스트레이션 ──
 
     async def execute_tasks(
@@ -146,7 +213,7 @@ class ReasoningEngine:
         text: str,
         intent: str,
         context: dict,
-        tasks: list[dict],
+        tasks: list[dict[str, Any] | ReasoningTask],
     ) -> dict[str, Any]:
         """태스크 목록을 순차 실행하고 결과를 수집."""
         results: dict[str, Any] = {
@@ -156,8 +223,17 @@ class ReasoningEngine:
             "emergency": False,
         }
 
+        normalized_tasks: list[dict[str, Any]] = []
         for task in tasks:
-            task_type = task["type"]
+            if isinstance(task, ReasoningTask):
+                normalized_tasks.append(task.model_dump())
+            elif isinstance(task, dict):
+                normalized_tasks.append(task)
+
+        for task in normalized_tasks:
+            task_type = task.get("type", "")
+            if not task_type:
+                continue
             try:
                 if task_type == "emergency_alert":
                     results["emergency"] = True
@@ -357,3 +433,10 @@ class ReasoningEngine:
         if summaries:
             return f"{drug_name} DUR 확인 결과: " + "; ".join(summaries)
         return ""
+
+    def _contains_medication_signal(self, text_lower: str) -> bool:
+        if any(kw in text_lower for kw in MEDICATION_KEYWORDS if kw != "약"):
+            return True
+        # Prevent false positives like "요약" while keeping short utterances such as
+        # "약 맞나요?" as medication queries.
+        return "약" in text_lower and "요약" not in text_lower

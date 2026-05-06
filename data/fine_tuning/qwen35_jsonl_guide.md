@@ -130,15 +130,124 @@ Tool 결과 후 최종 assistant:
 pytest
 ```
 
-OpenAI API로 synthetic 데이터를 만들 때:
+## OpenAI API로 synthetic 데이터 만들기 (in-context learning)
+
+스크립트는 `data/fine_tuning/qwen_reasoning_samples.jsonl`의 손작성 샘플을
+in-context exemplar로 자동 주입한다. GPT는 이 예시들의 JSON 모양, longCOT
+구조, 한국어 톤을 따라 **새로운** 시나리오를 만든다.
+
+### 1. API 키 입력 위치
+
+다음 중 한 곳만 채우면 된다(우선순위 높은 순):
+
+1. `--api-key sk-...` 명령행 인자
+2. `OPENAI_API_KEY` 환경변수
+3. `ai-server/.env`의 `OPENAI_API_KEY=sk-...` 줄 (`.env.example` 참고)
+
+`.env`에 있는 값은 스크립트가 시작 시 자동으로 로드한다.
 
 ```bash
-OPENAI_API_KEY=... python scripts/generate_reasoning_dataset.py \
-  --count 50 \
+# ai-server/.env 에 한 줄 추가하면 충분
+echo 'OPENAI_API_KEY=sk-...' >> ai-server/.env
+# 모델 변경이 필요하면
+echo 'OPENAI_DATASET_MODEL=gpt-5.5' >> ai-server/.env
+```
+
+### 2. 100개 샘플 생성 레시피
+
+```bash
+cd ai-server
+
+# 먼저 prompt가 의도대로 만들어지는지 dry-run으로 확인
+python scripts/generate_reasoning_dataset.py --dry-run --exemplars 2
+
+# 실제 100개 생성 (intent 5종을 라운드로빈으로 순환)
+python scripts/generate_reasoning_dataset.py \
+  --count 100 \
+  --exemplars 2 \
   --output data/fine_tuning/qwen_reasoning_synthetic.jsonl
 ```
 
-LoRA 훈련:
+시나리오 `intent`는 `SCENARIO_SEEDS`에 정의된 5종(medication_query,
+drug_identification, supplement_query, duration_or_dosage,
+pregnancy_or_age_specific)으로 라운드로빈된다. count=100이면 각 intent당
+20샘플이 만들어진다.
+
+각 호출마다 GPT는 다음 입력을 받는다.
+
+* `task` 명령
+* `in_context_examples`: 같은 intent 우선으로 시드에서 1–3개를 골라 넣음
+* `required_output_schema`: 출력 JSON 스키마
+* `constraints`: 톤·안전·tool 제약 등
+* `scenario_seed`: 이번 샘플의 intent/환자/질문 좌표
+* `available_tools`: `app/prompts/llm_tools.json`에서 추출한 사용 가능 tool
+
+응답은 `response_format=json_object`로 강제하고,
+`scripts/generate_reasoning_dataset.py:validate_sample`이
+구조·`<think>`·tool 이름 유효성을 즉시 검사한다. 검증 실패 샘플은 건너뛴다.
+
+### 3. 비용·속도 가이드
+
+* 평균 한 샘플 = prompt 약 4–6 KB + 응답 약 1–2 KB.
+* 기본 모델은 `gpt-5.5`다. 가격은 변동될 수 있으므로 실행 전 OpenAI 계정의 최신 usage/pricing 화면에서 확인한다.
+* 100샘플은 직렬 호출 기준 몇 분에서 수십 분까지 걸릴 수 있다. 더 빠르게 만들고 싶으면 `--exemplars 1`로 줄이거나 `--model`로 저지연 모델을 명시한다.
+* GPT-5 계열(`gpt-5`, `gpt-5.5` 등)은 Chat Completions에서 `temperature`를 받지 않으므로 스크립트가 자동으로 생략한다. `--temperature`는 GPT-4 계열 같은 레거시 모델에만 적용된다.
+* 결과 파일은 `--output`으로 지정하며, **append 모드**로 열린다. 실패 후
+  재시도 시 같은 파일에 이어 붙으니, 새 파일을 원하면 다른 경로를 주거나
+  먼저 지운다.
+
+### 4. 옵션 표
+
+| 옵션 | 기본값 | 설명 |
+| --- | --- | --- |
+| `--count` | 20 | 생성할 샘플 수 |
+| `--model` | `gpt-5.5` (env: `OPENAI_DATASET_MODEL`) | OpenAI 모델 id |
+| `--exemplars` | 2 | 한 호출에 in-context로 넣을 시드 샘플 수(0이면 비활성) |
+| `--exemplars-path` | `data/fine_tuning/qwen_reasoning_samples.jsonl` | exemplar 풀 |
+| `--temperature` | 0.7 | GPT-4 계열 등 temperature 지원 모델에서만 사용. GPT-5 계열은 자동 생략 |
+| `--seed` | 20260506 | exemplar 셔플 시드(재현 가능) |
+| `--max-failures` | 10 | 누적 실패 허용 횟수, 초과 시 abort |
+| `--api-key` | (env / .env) | 명령행 직접 지정 시 환경변수 무시 |
+| `--dry-run` | off | 첫 prompt만 출력하고 OpenAI 호출 안 함 |
+
+## 엔진 역할 분리 데이터셋 (권장 기본)
+
+현재 런타임 오케스트레이션은 엔진별 계약으로 분리되어 있으므로, 학습 데이터도
+`router / memory / delivery` 3종으로 나누는 것을 기본 경로로 사용한다.
+
+### 1) 모놀리식 reasoning 데이터 분해
+
+```bash
+cd ai-server
+python scripts/split_reasoning_dataset.py
+```
+
+기본 출력:
+
+- `data/fine_tuning/qwen_router_samples.jsonl`
+- `data/fine_tuning/qwen_memory_samples.jsonl`
+- `data/fine_tuning/qwen_delivery_samples.jsonl`
+
+### 2) 아키텍처 적합성 게이트
+
+```bash
+python scripts/evaluate_engine_datasets.py \
+  --dataset data/fine_tuning/qwen_router_samples.jsonl \
+  --task-family router --strict
+
+python scripts/evaluate_engine_datasets.py \
+  --dataset data/fine_tuning/qwen_memory_samples.jsonl \
+  --task-family memory --strict
+
+python scripts/evaluate_engine_datasets.py \
+  --dataset data/fine_tuning/qwen_delivery_samples.jsonl \
+  --task-family delivery --strict
+```
+
+레거시 `qwen_reasoning_samples.jsonl`은 `<think>` + monolithic tool-calling 학습
+검증 용도로만 유지하고, 런타임 직접 배포 모델 학습에는 사용하지 않는 것을 권장한다.
+
+## LoRA 훈련
 
 ```bash
 pip install -r requirements-finetune.txt
@@ -146,6 +255,37 @@ pip install -r requirements-finetune.txt
 python scripts/train_qwen_reasoning_lora.py \
   --model Qwen/Qwen3.5-7B-Instruct \
   --train data/fine_tuning/qwen_reasoning_samples.jsonl \
+  --output models/qwen-odiss-reasoning-lora \
+  --load-in-4bit
+```
+
+엔진별 헤드는 `--task-family`로 바로 지정할 수 있다:
+
+```bash
+python scripts/train_qwen_reasoning_lora.py \
+  --task-family router \
+  --output models/qwen-odiss-router-lora \
+  --load-in-4bit
+
+python scripts/train_qwen_reasoning_lora.py \
+  --task-family memory \
+  --output models/qwen-odiss-memory-lora \
+  --load-in-4bit
+
+python scripts/train_qwen_reasoning_lora.py \
+  --task-family delivery \
+  --output models/qwen-odiss-delivery-lora \
+  --load-in-4bit
+```
+
+훈련용 데이터는 시드(`qwen_reasoning_samples.jsonl`)와 합성
+(`qwen_reasoning_synthetic.jsonl`) 두 파일을 모두 넘기는 것이 권장된다:
+
+```bash
+python scripts/train_qwen_reasoning_lora.py \
+  --model Qwen/Qwen3.5-7B-Instruct \
+  --train data/fine_tuning/qwen_reasoning_samples.jsonl \
+          data/fine_tuning/qwen_reasoning_synthetic.jsonl \
   --output models/qwen-odiss-reasoning-lora \
   --load-in-4bit
 ```

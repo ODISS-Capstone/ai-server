@@ -24,6 +24,14 @@ import json
 from pathlib import Path
 from typing import Any
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+TASK_FAMILY_DEFAULTS = {
+    "reasoning": PROJECT_ROOT / "data" / "fine_tuning" / "qwen_reasoning_samples.jsonl",
+    "router": PROJECT_ROOT / "data" / "fine_tuning" / "qwen_router_samples.jsonl",
+    "memory": PROJECT_ROOT / "data" / "fine_tuning" / "qwen_memory_samples.jsonl",
+    "delivery": PROJECT_ROOT / "data" / "fine_tuning" / "qwen_delivery_samples.jsonl",
+}
+
 
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
@@ -51,13 +59,29 @@ def render_chat_text(tokenizer: Any, sample: dict[str, Any]) -> str:
     )
 
 
-def build_dataset(tokenizer: Any, train_path: Path):
-    """Build a Hugging Face Dataset with one `text` field."""
+def build_dataset(tokenizer: Any, train_paths: list[Path] | Path):
+    """Build a Hugging Face Dataset with one ``text`` field.
+
+    Accepts a single path or a list of JSONL files; rows from all files are
+    concatenated.  Useful for training on hand-written seed samples plus
+    GPT-generated synthetic samples in one run.
+    """
     from datasets import Dataset
 
-    rows = load_jsonl(train_path)
+    if isinstance(train_paths, (str, Path)):
+        paths = [Path(train_paths)]
+    else:
+        paths = [Path(p) for p in train_paths]
+
+    rows: list[dict[str, Any]] = []
+    for path in paths:
+        rows.extend(load_jsonl(path))
+
     return Dataset.from_list(
-        [{"text": render_chat_text(tokenizer, row), "metadata": row.get("metadata", {})} for row in rows]
+        [
+            {"text": render_chat_text(tokenizer, row), "metadata": row.get("metadata", {})}
+            for row in rows
+        ]
     )
 
 
@@ -93,7 +117,8 @@ def train(args: argparse.Namespace) -> None:
         quantization_config=quantization_config,
     )
 
-    dataset = build_dataset(tokenizer, Path(args.train))
+    train_paths = resolve_train_paths(args)
+    dataset = build_dataset(tokenizer, train_paths)
 
     peft_config = LoraConfig(
         r=args.lora_r,
@@ -135,7 +160,18 @@ def train(args: argparse.Namespace) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="Qwen/Qwen3.5-7B-Instruct")
-    parser.add_argument("--train", default="data/fine_tuning/qwen_reasoning_samples.jsonl")
+    parser.add_argument(
+        "--train",
+        nargs="+",
+        default=["data/fine_tuning/qwen_reasoning_samples.jsonl"],
+        help="one or more JSONL paths; rows are concatenated for training",
+    )
+    parser.add_argument(
+        "--task-family",
+        choices=sorted(TASK_FAMILY_DEFAULTS),
+        default="reasoning",
+        help="dataset family contract to train (reasoning/router/memory/delivery)",
+    )
     parser.add_argument("--output", default="models/qwen-odiss-reasoning-lora")
     parser.add_argument("--epochs", type=float, default=2)
     parser.add_argument("--batch-size", type=int, default=1)
@@ -152,6 +188,20 @@ def parse_args() -> argparse.Namespace:
         default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
     )
     return parser.parse_args()
+
+
+def resolve_train_paths(args: argparse.Namespace) -> list[Path]:
+    """Resolve training file list by explicit --train and task-family defaults."""
+    explicit_paths = [Path(p) for p in args.train]
+    # If user provided non-default train values, honor them.
+    default_single = Path("data/fine_tuning/qwen_reasoning_samples.jsonl")
+    if len(explicit_paths) != 1 or explicit_paths[0] != default_single:
+        return explicit_paths
+
+    family_default = TASK_FAMILY_DEFAULTS.get(args.task_family)
+    if family_default is None:
+        return explicit_paths
+    return [family_default]
 
 
 if __name__ == "__main__":

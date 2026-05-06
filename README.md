@@ -47,6 +47,34 @@ pytest
 
 `pytest.ini`에서 `tests/`만 수집하도록 고정해 두었기 때문에, 루트의 실험용 스크립트는 자동 수집되지 않습니다.
 
+### 엔진 계약/데이터셋 게이트
+
+`ai-server/.github/workflows/ci.yml`의 `test` job은 아래 계약 게이트를 추가로 강제한다.
+
+```bash
+python scripts/split_reasoning_dataset.py
+
+python scripts/evaluate_engine_datasets.py \
+  --dataset data/fine_tuning/qwen_router_samples.jsonl \
+  --task-family router --strict
+
+python scripts/evaluate_engine_datasets.py \
+  --dataset data/fine_tuning/qwen_memory_samples.jsonl \
+  --task-family memory --strict
+
+python scripts/evaluate_engine_datasets.py \
+  --dataset data/fine_tuning/qwen_delivery_samples.jsonl \
+  --task-family delivery --strict
+```
+
+레거시 monolithic 셋(`qwen_reasoning_samples.jsonl`)은 아래 명령으로 런타임 불일치(`"<think>"`, tool-calling 혼합)를 리포트한다.
+
+```bash
+python scripts/evaluate_engine_datasets.py \
+  --dataset data/fine_tuning/qwen_reasoning_samples.jsonl \
+  --task-family reasoning
+```
+
 ## 환경 변수
 
 `.env.example` 참고. 필수: `DATABASE_URL`, OCR/DUR/LLM 관련 API URL·키(해당 단계 사용 시).

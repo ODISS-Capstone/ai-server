@@ -5,24 +5,31 @@ from typing import Optional
 from fastapi import APIRouter, File, Form, UploadFile, HTTPException
 
 from app.database.md_store import md_store
+from app.engines.conversation import ConversationEngine
+from app.engines.llm_judge import LLMJudgeEngine
 from app.engines.memory import MemoryEngine
+from app.engines.reasoning import ReasoningEngine
 from app.schemas.answer import AskRequest, AskResponse
-from app.schemas.dur import DurItem, DurResponse
 from app.schemas.ocr import OcrResponse
 from app.schemas.query import PipelineResponse
 from app.services import dur as dur_service
 from app.services import ocr as ocr_service
-from app.services.censoring import extract_censored_for_external
-from app.services.communication_agent import to_senior_friendly_text
 from app.services.device_api import send_to_device
 from app.services.documentation import build_llm_doc
-from app.services.llm import call_external_llm, call_internal_llm
+from app.services.engine_orchestrator import EngineOrchestrator
 from app.services.mcp_client import send_verified_to_mcp
-from app.services.verification import verify_answer_against_dur
-from app.core.safety import ensure_disclaimer
 
 router = APIRouter(prefix="/query", tags=["query"])
 memory_engine = MemoryEngine()
+llm_judge = LLMJudgeEngine()
+reasoning_engine = ReasoningEngine(memory_engine, llm_judge)
+conversation_engine = ConversationEngine()
+engine_orchestrator = EngineOrchestrator(
+    memory_engine=memory_engine,
+    reasoning_engine=reasoning_engine,
+    conversation_engine=conversation_engine,
+    llm_judge=llm_judge,
+)
 
 
 @router.post("/pipeline", response_model=PipelineResponse)
@@ -80,13 +87,12 @@ async def pipeline(
 
 @router.post("/ask", response_model=AskResponse)
 async def ask(req: AskRequest) -> AskResponse:
-    """추론 파이프라인: 내부 LLM → 검열 → 외부 LLM → 팩트 검증 → 시니어 친화 가공 → 전송."""
+    """추론 파이프라인: 계약형 엔진 오케스트레이션 결과를 반환."""
     await memory_engine.initialize()
 
     # 최근 파이프라인 기록에서 llm_doc 및 dur 복원
     latest = await md_store.read_latest("medication_log", n=5)
     llm_doc = ""
-    dur_response = DurResponse(items=[])
 
     for entry in latest:
         content = entry.get("content", "")
@@ -96,38 +102,25 @@ async def ask(req: AskRequest) -> AskResponse:
                     # LLM 문서 섹션 추출
                     if "## LLM 문서" in content:
                         llm_doc = content.split("## LLM 문서\n")[-1].strip()
-                    # DUR 결과 섹션 추출
-                    if "## DUR 결과" in content:
-                        import json as _json
-                        try:
-                            dur_block = content.split("## DUR 결과\n```json\n")[1].split("\n```")[0]
-                            dur_dict = _json.loads(dur_block)
-                            items = dur_dict.get("items", [])
-                            dur_response = DurResponse(
-                                items=[DurItem(**x) if isinstance(x, dict) else x for x in items]
-                            )
-                        except (IndexError, _json.JSONDecodeError, KeyError):
-                            pass
                     break
 
     query_text = req.query_text or ""
     if not query_text and not llm_doc:
         raise HTTPException(status_code=404, detail="Session not found or no data available")
+    if not query_text and llm_doc:
+        query_text = "이전 세션의 복약 정보를 다시 쉽게 설명해줘."
 
-    memory_prompt = await memory_engine.build_query_memory_context(query_text)
-    llm_doc_with_memory = llm_doc
-    if memory_prompt:
-        llm_doc_with_memory = (
-            f"{llm_doc}\n\n[구조화 메모리]\n{memory_prompt}"
-            if llm_doc
-            else f"[구조화 메모리]\n{memory_prompt}"
-        )
-
-    answer_internal = await call_internal_llm(query_text, llm_doc_with_memory)
-    censored = extract_censored_for_external(query_text, llm_doc, answer_internal)
-    answer_external = await call_external_llm(censored)
-    answer_verified, _ = verify_answer_against_dur(answer_external, dur_response)
-    answer_final = ensure_disclaimer(to_senior_friendly_text(answer_verified))
+    turn = await engine_orchestrator.run_turn(
+        text=query_text,
+        speaker_id=None,
+        include_judge=True,
+        include_delivery_llm=True,
+        allow_frontier_memory_fallback=True,
+    )
+    answer_internal = turn.core_message
+    answer_external = turn.evidence.frontier_answer_preview or None
+    answer_verified = turn.reviewed_message or turn.core_message
+    answer_final = turn.conversation.response_text
 
     sent_to_mcp = await send_verified_to_mcp(
         answer_final, req.session_id, {"query_text": query_text}
@@ -142,7 +135,10 @@ async def ask(req: AskRequest) -> AskResponse:
     await memory_engine.update_and_compress({
         "query": query_text,
         "answer": answer_final,
-        "type": "ask_pipeline",
+        "type": turn.decision.intent or "ask_pipeline",
+        "dur_results": turn.execution_results.get("task_results", {}).get("dur"),
+        "core_message": turn.core_message,
+        "judge_review": turn.judge_review,
     })
 
     return AskResponse(
