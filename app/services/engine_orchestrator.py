@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import logging
+from time import perf_counter
 from typing import Any, Optional
 
 from app.engines.conversation import ConversationEngine
@@ -16,6 +18,8 @@ from app.schemas.engine_contracts import (
     ReasoningRouteInput,
 )
 from app.services.llm import call_local_delivery_llm
+
+logger = logging.getLogger(__name__)
 
 
 class EngineOrchestrator:
@@ -43,12 +47,44 @@ class EngineOrchestrator:
         include_delivery_llm: bool = True,
         allow_frontier_memory_fallback: bool = True,
     ) -> EnginePipelineResult:
-        await self.memory.initialize()
+        turn_started = perf_counter()
+        logger.info(
+            "[EnginePipeline] turn_start speaker_id=%s text_chars=%d include_judge=%s include_delivery_llm=%s",
+            speaker_id or "-",
+            len(text or ""),
+            include_judge,
+            include_delivery_llm,
+        )
 
+        stage_started = perf_counter()
+        await self.memory.initialize()
+        logger.info(
+            "[MemoryEngine] initialized elapsed_ms=%.1f",
+            (perf_counter() - stage_started) * 1000,
+        )
+
+        stage_started = perf_counter()
         input_data = self.conversation.receive_input(text, speaker_id)
         filler_text = self.conversation.generate_filler(input_data) or ""
-        context = await self.memory.load_context(speaker_id)
+        logger.info(
+            "[ConversationEngine] input_received smalltalk=%s smalltalk_type=%s filler=%s elapsed_ms=%.1f",
+            input_data.get("is_smalltalk"),
+            input_data.get("smalltalk_type") or "-",
+            bool(filler_text),
+            (perf_counter() - stage_started) * 1000,
+        )
 
+        stage_started = perf_counter()
+        context = await self.memory.load_context(speaker_id)
+        logger.info(
+            "[MemoryEngine] context_loaded speaker_id=%s new_user=%s memory_items=%d elapsed_ms=%.1f",
+            speaker_id or "-",
+            context.get("is_new_user", False),
+            len(context.get("relevant_memories") or []),
+            (perf_counter() - stage_started) * 1000,
+        )
+
+        stage_started = perf_counter()
         decision = self.reasoning.route_execution(
             ReasoningRouteInput(
                 text=text,
@@ -57,7 +93,16 @@ class EngineOrchestrator:
                 context=context,
             )
         )
+        logger.info(
+            "[ReasoningEngine] route_decided mode=%s intent=%s tasks=%d rationale=%s elapsed_ms=%.1f",
+            decision.mode,
+            decision.intent,
+            len(decision.tasks),
+            decision.rationale,
+            (perf_counter() - stage_started) * 1000,
+        )
 
+        stage_started = perf_counter()
         evidence = await self.memory.prepare_evidence_bundle(
             MemoryEvidenceRequest(
                 query=text,
@@ -65,6 +110,14 @@ class EngineOrchestrator:
                 ocr_payload=None,
                 allow_frontier_fallback=allow_frontier_memory_fallback,
             )
+        )
+        logger.info(
+            "[MemoryEngine] evidence_prepared meds=%d dur_searchable=%s frontier_fallback=%s artifacts=%d elapsed_ms=%.1f",
+            len(evidence.normalized_medications),
+            evidence.dur_searchable,
+            evidence.used_frontier_fallback,
+            len(evidence.artifact_refs),
+            (perf_counter() - stage_started) * 1000,
         )
 
         execution_results: dict[str, Any] = {
@@ -74,44 +127,78 @@ class EngineOrchestrator:
             "emergency": False,
         }
         if decision.mode == ReasoningMode.TOOL_FIRST:
+            stage_started = perf_counter()
             execution_results = await self.reasoning.execute_tasks(
                 text=text,
                 intent=decision.intent,
                 context=context,
                 tasks=decision.tasks,
             )
+            logger.info(
+                "[ReasoningEngine] tasks_executed result_keys=%s emergency=%s elapsed_ms=%.1f",
+                sorted(execution_results.get("task_results", {}).keys()),
+                execution_results.get("emergency", False),
+                (perf_counter() - stage_started) * 1000,
+            )
         elif decision.mode == ReasoningMode.MEMORY_ONLY:
+            stage_started = perf_counter()
             history = await self.memory.search_history(text, speaker_id=speaker_id)
             execution_results["task_results"]["history"] = history
+            logger.info(
+                "[MemoryEngine] history_loaded categories=%s elapsed_ms=%.1f",
+                sorted(history.keys()),
+                (perf_counter() - stage_started) * 1000,
+            )
         elif decision.mode == ReasoningMode.ASK_USER_CLARIFY:
             execution_results["task_results"]["clarify_required"] = True
 
+        stage_started = perf_counter()
         core_message = await self._build_core_message(
             text=text,
             decision_mode=decision.mode,
             execution_results=execution_results,
             evidence=evidence,
         )
+        logger.info(
+            "[ReasoningEngine] core_message_built chars=%d elapsed_ms=%.1f",
+            len(core_message or ""),
+            (perf_counter() - stage_started) * 1000,
+        )
 
         judge_review: dict[str, Any] = {}
         reviewed_message = core_message
         if include_judge and core_message:
+            stage_started = perf_counter()
             judge_review = await self.llm_judge.review_final_answer(
                 core_message=core_message,
                 original_query=text,
                 additional_context=self._build_review_context(context, execution_results),
             )
             reviewed_message = judge_review.get("reviewed_text") or core_message
+            logger.info(
+                "[LLMJudgeEngine] final_review reviewed=%s model=%s chars=%d elapsed_ms=%.1f",
+                judge_review.get("reviewed", False),
+                judge_review.get("model", "-"),
+                len(reviewed_message or ""),
+                (perf_counter() - stage_started) * 1000,
+            )
 
         delivery_message = reviewed_message
         if include_delivery_llm and reviewed_message:
+            stage_started = perf_counter()
             delivery_message = await call_local_delivery_llm(
                 original_query=text,
                 reviewed_message=reviewed_message,
                 user_profile=context.get("user_profile"),
                 conversation_context=context.get("context_memory", ""),
             )
+            logger.info(
+                "[DeliveryLLM] message_rewritten chars=%d elapsed_ms=%.1f",
+                len(delivery_message or ""),
+                (perf_counter() - stage_started) * 1000,
+            )
 
+        stage_started = perf_counter()
         conversation = self.conversation.compose_from_contract(
             ConversationComposeRequest(
                 input_text=text,
@@ -122,6 +209,13 @@ class EngineOrchestrator:
                 reviewed_message=reviewed_message,
                 delivery_message=delivery_message,
             )
+        )
+        logger.info(
+            "[ConversationEngine] response_composed type=%s chars=%d elapsed_ms=%.1f total_elapsed_ms=%.1f",
+            conversation.response_type,
+            len(conversation.response_text or ""),
+            (perf_counter() - stage_started) * 1000,
+            (perf_counter() - turn_started) * 1000,
         )
 
         return EnginePipelineResult(

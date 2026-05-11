@@ -2,14 +2,17 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
+from time import perf_counter
 from typing import TypeVar
 from weakref import WeakKeyDictionary
 
 from app.core.config import settings
 
 T = TypeVar("T")
+logger = logging.getLogger(__name__)
 
 _ENGINE_LIMIT_FIELDS = {
     "internal": "llm_engine_max_concurrency_internal",
@@ -53,5 +56,21 @@ async def run_with_engine_queue(
     operation: Callable[[], Awaitable[T]],
 ) -> T:
     """Run an awaitable factory while holding the engine queue slot."""
+    queued_at = perf_counter()
     async with engine_slot(engine):
-        return await operation()
+        wait_ms = (perf_counter() - queued_at) * 1000
+        logger.info(
+            "[LLMQueue] slot_acquired engine=%s limit=%d wait_ms=%.1f",
+            engine,
+            get_engine_limit(engine),
+            wait_ms,
+        )
+        started = perf_counter()
+        try:
+            return await operation()
+        finally:
+            logger.info(
+                "[LLMQueue] operation_done engine=%s elapsed_ms=%.1f",
+                engine,
+                (perf_counter() - started) * 1000,
+            )

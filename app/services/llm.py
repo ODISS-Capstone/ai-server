@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+from time import perf_counter
 from typing import Any, Optional
 
 import httpx
@@ -27,6 +28,101 @@ def build_user_prompt(query_text: str, llm_doc: str) -> str:
     )
 
 
+async def check_internal_llm_health(
+    *,
+    api_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    model: Optional[str] = None,
+    timeout_seconds: float = 10.0,
+) -> dict[str, Any]:
+    """Check whether the configured OpenAI-compatible internal LLM is reachable."""
+    url = api_url or settings.internal_llm_api_url
+    selected_model = model or settings.internal_llm_model
+    if not url:
+        logger.warning("[InternalLLMHealth] not_configured")
+        return {
+            "status": "not_configured",
+            "configured": False,
+            "model": selected_model,
+            "url": None,
+            "message": "INTERNAL_LLM_API_URL is not set",
+        }
+
+    key = api_key if api_key is not None else settings.internal_llm_api_key
+    headers = {"Content-Type": "application/json"}
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+
+    started = perf_counter()
+    logger.info("[InternalLLMHealth] check_start model=%s url=%s", selected_model, url)
+    try:
+        async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+            response = await client.post(
+                url,
+                headers=headers,
+                json={
+                    "model": selected_model,
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "max_tokens": 8,
+                    "temperature": 0,
+                },
+            )
+            response.raise_for_status()
+            data = response.json()
+
+        answer = data.get("choices", [{}])[0].get("message", {}).get("content", "") or ""
+        elapsed_ms = (perf_counter() - started) * 1000
+        logger.info(
+            "[InternalLLMHealth] check_ok model=%s status_code=%d answer_chars=%d elapsed_ms=%.1f",
+            selected_model,
+            response.status_code,
+            len(answer),
+            elapsed_ms,
+        )
+        return {
+            "status": "ok",
+            "configured": True,
+            "model": selected_model,
+            "url": url,
+            "status_code": response.status_code,
+            "elapsed_ms": round(elapsed_ms, 1),
+            "answer_preview": answer[:80],
+        }
+    except httpx.HTTPStatusError as exc:
+        elapsed_ms = (perf_counter() - started) * 1000
+        logger.error(
+            "[InternalLLMHealth] check_http_error model=%s status_code=%d elapsed_ms=%.1f",
+            selected_model,
+            exc.response.status_code,
+            elapsed_ms,
+        )
+        return {
+            "status": "error",
+            "configured": True,
+            "model": selected_model,
+            "url": url,
+            "status_code": exc.response.status_code,
+            "elapsed_ms": round(elapsed_ms, 1),
+            "message": exc.response.text[:300],
+        }
+    except Exception as exc:
+        elapsed_ms = (perf_counter() - started) * 1000
+        logger.error(
+            "[InternalLLMHealth] check_failed model=%s error=%s elapsed_ms=%.1f",
+            selected_model,
+            exc,
+            elapsed_ms,
+        )
+        return {
+            "status": "error",
+            "configured": True,
+            "model": selected_model,
+            "url": url,
+            "elapsed_ms": round(elapsed_ms, 1),
+            "message": str(exc),
+        }
+
+
 async def call_internal_llm(
     query_text: str,
     llm_doc: str,
@@ -44,8 +140,9 @@ async def call_internal_llm(
     12개 공공데이터 tool을 LLM이 호출하게 한다.
     """
     url = api_url or settings.internal_llm_api_url
-    key = api_key or settings.internal_llm_api_key
-    if not url or not key:
+    key = api_key if api_key is not None else settings.internal_llm_api_key
+    if not url:
+        logger.warning("[InternalLLM] not_configured fallback=true query_chars=%d", len(query_text or ""))
         return _safe_internal_fallback(query_text, llm_doc)
 
     messages = get_prompt_registry().render_messages(
@@ -100,8 +197,9 @@ async def call_local_delivery_llm(
         )
 
     url = api_url or settings.internal_llm_api_url
-    key = api_key or settings.internal_llm_api_key
-    if not url or not key:
+    key = api_key if api_key is not None else settings.internal_llm_api_key
+    if not url:
+        logger.warning("[DeliveryLLM] not_configured fallback=true original_query_chars=%d", len(original_query or ""))
         return ensure_disclaimer(source)
 
     messages = get_prompt_registry().render_messages(
@@ -158,7 +256,7 @@ async def run_chat_with_tools(
     *,
     messages: list[dict[str, Any]],
     api_url: str,
-    api_key: str,
+    api_key: Optional[str],
     tool_registry: ToolRegistry,
     model: str = "qwen",
     max_tokens: int = 512,
@@ -179,10 +277,7 @@ async def run_chat_with_tools(
             async with httpx.AsyncClient(timeout=60.0) as client:
                 r = await client.post(
                     api_url,
-                    headers={
-                        "Authorization": f"Bearer {api_key}",
-                        "Content-Type": "application/json",
-                    },
+                    headers=_json_headers(api_key),
                     json={
                         "model": model,
                         "messages": current_messages,
@@ -199,7 +294,7 @@ async def run_chat_with_tools(
         tool_calls = message.get("tool_calls") or []
 
         if not tool_calls:
-            return message.get("content") or ""
+            return _strip_reasoning_tags(message.get("content") or "")
 
         assistant_entry: dict[str, Any] = {
             "role": "assistant",
@@ -260,19 +355,43 @@ def _safe_internal_fallback(query_text: str, llm_doc: str) -> str:
     )
 
 
+def _json_headers(api_key: Optional[str]) -> dict[str, str]:
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
+
+
+def _strip_reasoning_tags(content: str) -> str:
+    """Remove completed Qwen-style reasoning blocks from user-facing text."""
+    if "<think>" not in content:
+        return content
+    if "</think>" not in content:
+        return content.split("<think>", 1)[0].rstrip()
+    return content.split("</think>", 1)[1].lstrip()
+
+
 async def _post_chat_once(
     url: str,
-    key: str,
+    key: Optional[str],
     messages: list[dict[str, Any]],
     *,
     model: str = "qwen",
     max_tokens: int = 512,
 ) -> str:
     async def post_internal() -> str:
+        started = perf_counter()
+        logger.info(
+            "[InternalLLM] request_start model=%s url=%s messages=%d max_tokens=%d",
+            model,
+            url,
+            len(messages),
+            max_tokens,
+        )
         async with httpx.AsyncClient(timeout=60.0) as client:
             r = await client.post(
                 url,
-                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                headers=_json_headers(key),
                 json={
                     "model": model,
                     "messages": messages,
@@ -281,6 +400,15 @@ async def _post_chat_once(
             )
             r.raise_for_status()
             data = r.json()
-            return data.get("choices", [{}])[0].get("message", {}).get("content", "") or ""
+            answer = _strip_reasoning_tags(
+                data.get("choices", [{}])[0].get("message", {}).get("content", "") or ""
+            )
+            logger.info(
+                "[InternalLLM] request_done model=%s answer_chars=%d elapsed_ms=%.1f",
+                model,
+                len(answer),
+                (perf_counter() - started) * 1000,
+            )
+            return answer
 
     return await run_with_engine_queue("internal", post_internal)

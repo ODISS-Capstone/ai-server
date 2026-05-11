@@ -19,13 +19,11 @@ from fastapi import FastAPI
 from app.api import dur, health, query, upload
 from app.api.routes import agent_ws, ocr_api, stt_api
 from app.core.config import settings
+from app.core.logging_config import configure_logging
 from app.database.md_store import md_store
 from app.services import turboquant_runtime
 
-logging.basicConfig(
-    level=getattr(logging, settings.log_level.upper(), logging.INFO),
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+configure_logging()
 logger = logging.getLogger(__name__)
 
 
@@ -33,6 +31,18 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     """Startup: 디렉토리 생성, MD 파일시스템 데이터베이스 초기화."""
     logger.info("ODISS 서버엔진 시작 중...")
+    logger.info(
+        "로그 설정 완료: level=%s file_enabled=%s file_path=%s",
+        settings.log_level.upper(),
+        settings.log_to_file,
+        settings.log_file_path,
+    )
+    logger.info(
+        "[InternalLLM] config url=%s model=%s api_key_set=%s",
+        settings.internal_llm_api_url or "-",
+        settings.internal_llm_model,
+        bool(settings.internal_llm_api_key),
+    )
 
     os.makedirs("data", exist_ok=True)
     os.makedirs(settings.storage_path, exist_ok=True)

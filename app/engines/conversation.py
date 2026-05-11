@@ -281,4 +281,5 @@ class ConversationEngine:
         if not text:
             return ""
         cleaned = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
+        cleaned = re.sub(r"<think>.*$", "", cleaned, flags=re.DOTALL)
         return cleaned.strip()

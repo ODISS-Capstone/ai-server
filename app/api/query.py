@@ -1,5 +1,7 @@
 """질의·파이프라인 API: 이미지 업로드 → OCR → DUR → MD 저장 및 답변 생성."""
+import logging
 import uuid
+from time import perf_counter
 from typing import Optional
 
 from fastapi import APIRouter, File, Form, UploadFile, HTTPException
@@ -20,6 +22,7 @@ from app.services.engine_orchestrator import EngineOrchestrator
 from app.services.mcp_client import send_verified_to_mcp
 
 router = APIRouter(prefix="/query", tags=["query"])
+logger = logging.getLogger(__name__)
 memory_engine = MemoryEngine()
 llm_judge = LLMJudgeEngine()
 reasoning_engine = ReasoningEngine(memory_engine, llm_judge)
@@ -38,6 +41,13 @@ async def pipeline(
     query_text: Optional[str] = Form(None),
 ) -> PipelineResponse:
     """이미지 업로드 → OCR → DUR → LLM용 문서 생성 후 MD 파일로 저장."""
+    started = perf_counter()
+    logger.info(
+        "[QueryPipeline] start filename=%s content_type=%s query_chars=%d",
+        file.filename or "-",
+        file.content_type or "-",
+        len(query_text or ""),
+    )
     if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Image file required")
     contents = await file.read()
@@ -46,10 +56,22 @@ async def pipeline(
 
     await memory_engine.initialize()
 
+    stage_started = perf_counter()
     ocr_result = await ocr_service.run_ocr_image(
         contents, content_type=file.content_type or "image/jpeg"
     )
+    logger.info(
+        "[QueryPipeline] ocr_done medications=%d elapsed_ms=%.1f",
+        len(ocr_result.medications),
+        (perf_counter() - stage_started) * 1000,
+    )
+    stage_started = perf_counter()
     dur_result = await dur_service.check_dur(ocr_result.medications)
+    logger.info(
+        "[QueryPipeline] dur_done items=%d elapsed_ms=%.1f",
+        len(dur_result.items),
+        (perf_counter() - stage_started) * 1000,
+    )
     llm_doc = build_llm_doc(ocr_result, dur_result)
 
     session_id = str(uuid.uuid4())
@@ -75,6 +97,11 @@ async def pipeline(
         f"## LLM 문서\n{llm_doc}\n"
     )
     await md_store.save("medication_log", session_content)
+    logger.info(
+        "[QueryPipeline] stored session_id=%s total_elapsed_ms=%.1f",
+        session_id,
+        (perf_counter() - started) * 1000,
+    )
 
     return PipelineResponse(
         session_id=session_id,
@@ -88,6 +115,13 @@ async def pipeline(
 @router.post("/ask", response_model=AskResponse)
 async def ask(req: AskRequest) -> AskResponse:
     """추론 파이프라인: 계약형 엔진 오케스트레이션 결과를 반환."""
+    started = perf_counter()
+    logger.info(
+        "[QueryAsk] start session_id=%s query_chars=%d device_id=%s",
+        req.session_id,
+        len(req.query_text or ""),
+        req.device_id or "-",
+    )
     await memory_engine.initialize()
 
     # 최근 파이프라인 기록에서 llm_doc 및 dur 복원
@@ -140,6 +174,14 @@ async def ask(req: AskRequest) -> AskResponse:
         "core_message": turn.core_message,
         "judge_review": turn.judge_review,
     })
+    logger.info(
+        "[QueryAsk] done session_id=%s intent=%s sent_to_mcp=%s sent_to_device=%s elapsed_ms=%.1f",
+        req.session_id,
+        turn.decision.intent,
+        sent_to_mcp,
+        sent_to_device,
+        (perf_counter() - started) * 1000,
+    )
 
     return AskResponse(
         session_id=req.session_id,
