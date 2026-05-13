@@ -35,7 +35,7 @@ async def get_supplement_detail(
         params["prdlstNm"] = product_name
 
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=settings.health_supplement_api_timeout_seconds) as client:
             resp = await client.get(url, params=params)
             resp.raise_for_status()
             data = resp.json()
@@ -86,7 +86,7 @@ async def list_supplements(
         params["prdlstNm"] = product_name
 
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=settings.health_supplement_api_timeout_seconds) as client:
             resp = await client.get(url, params=params)
             resp.raise_for_status()
             data = resp.json()

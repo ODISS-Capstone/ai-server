@@ -45,6 +45,20 @@ def test_prompt_registry_uses_defaults_when_file_is_missing(tmp_path):
     assert "혈압약 복용 중" in user_prompt
 
 
+def test_default_prompts_include_demo_conversation_policy(tmp_path):
+    registry = PromptRegistry(path=tmp_path / "missing.json")
+
+    main_system = registry.render_system("main_answer")
+    delivery_system = registry.render_system("local_delivery")
+
+    assert "가입/프로필 회상" in main_system
+    assert "중년 만성질환자" in main_system
+    assert "비의료 대화에는 상담 문구를 붙이지 않습니다" in main_system
+    assert "김영수님" in delivery_system
+    assert "사용자님" in delivery_system
+    assert "<think>" in delivery_system
+
+
 def test_prompt_registry_requires_template_variables(tmp_path):
     registry = PromptRegistry(
         path=tmp_path / "missing.json",

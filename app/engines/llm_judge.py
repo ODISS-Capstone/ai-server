@@ -54,7 +54,7 @@ class LLMJudgeEngine:
 
         try:
             async def post_judge_verify() -> dict[str, Any]:
-                async with httpx.AsyncClient(timeout=60.0) as client:
+                async with httpx.AsyncClient(timeout=settings.openai_timeout_seconds) as client:
                     resp = await client.post(
                         "https://api.openai.com/v1/chat/completions",
                         headers={
@@ -64,7 +64,7 @@ class LLMJudgeEngine:
                         json={
                             "model": self.model,
                             "messages": messages,
-                            "max_tokens": 512,
+                            "max_tokens": 256,
                             "temperature": 0.1,
                         },
                     )
@@ -132,7 +132,7 @@ class LLMJudgeEngine:
 
         try:
             async def post_final_review() -> dict[str, Any]:
-                async with httpx.AsyncClient(timeout=60.0) as client:
+                async with httpx.AsyncClient(timeout=settings.openai_timeout_seconds) as client:
                     resp = await client.post(
                         "https://api.openai.com/v1/chat/completions",
                         headers={
@@ -142,7 +142,7 @@ class LLMJudgeEngine:
                         json={
                             "model": self.model,
                             "messages": messages,
-                            "max_tokens": 700,
+                            "max_tokens": 400,
                             "temperature": 0.1,
                         },
                     )
@@ -192,7 +192,7 @@ class LLMJudgeEngine:
         default_criteria = [
             "정확성: 의학적으로 올바른 정보인가",
             "안전성: 위험한 조언이 없는가",
-            "이해도: 어르신이 이해하기 쉬운 표현인가",
+            "이해도: 복약 정보가 익숙하지 않은 사용자도 이해하기 쉬운 표현인가",
             "완전성: 중요 정보가 누락되지 않았는가",
         ]
         criteria_text = "\n".join(f"- {c}" for c in (criteria or default_criteria))
@@ -204,7 +204,7 @@ class LLMJudgeEngine:
 
         try:
             async def post_judge_evaluate() -> dict[str, Any]:
-                async with httpx.AsyncClient(timeout=60.0) as client:
+                async with httpx.AsyncClient(timeout=settings.openai_timeout_seconds) as client:
                     resp = await client.post(
                         "https://api.openai.com/v1/chat/completions",
                         headers={
@@ -214,7 +214,7 @@ class LLMJudgeEngine:
                         json={
                             "model": self.model,
                             "messages": messages,
-                            "max_tokens": 256,
+                            "max_tokens": 160,
                             "temperature": 0.1,
                         },
                     )

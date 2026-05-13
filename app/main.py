@@ -58,10 +58,10 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="ODISS 서버엔진 — OCR 기반 멀티모달 시니어 복약지도",
+    title="ODISS 서버엔진 — OCR 기반 멀티모달 복약관리",
     description=(
         "추론 엔진, 메모리 엔진, 대화 엔진, LLM Judge 기반의 "
-        "시니어 복약 상담 AI 서버입니다. "
+        "만성질환자와 복약 관리가 필요한 사용자를 위한 복약 상담 AI 서버입니다. "
         "WebSocket을 통해 로컬 에이전트와 실시간 통신합니다.\n\n"
         "데이터 저장소: MD 파일시스템 (날짜별 디렉토리 + 개별 Markdown 파일)"
     ),
@@ -84,7 +84,7 @@ app.include_router(stt_api.router)
 @app.get("/")
 async def root() -> dict[str, Any]:
     return {
-        "service": "ODISS — 시니어 복약지도 AI 서버엔진",
+        "service": "ODISS — 만성질환 복약관리 AI 서버엔진",
         "version": "1.0.0",
         "database": "MD filesystem (no SQL)",
         "docs": "/docs",

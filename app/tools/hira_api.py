@@ -56,7 +56,7 @@ async def identify_medicine(
         params["color_class1"] = color_class1
 
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=settings.hira_api_timeout_seconds) as client:
             resp = await client.get(url, params=params)
             resp.raise_for_status()
             data = resp.json()

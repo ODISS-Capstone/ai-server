@@ -18,6 +18,6 @@ class AskResponse(BaseModel):
     answer_internal: Optional[str] = None
     answer_external: Optional[str] = None
     answer_verified: str = Field(..., description="팩트 검증 후 답변")
-    answer_final: str = Field(..., description="시니어 친화 최종 답변")
+    answer_final: str = Field(..., description="사용자 친화 최종 답변")
     sent_to_mcp: bool = False
     sent_to_device: bool = False

@@ -1,4 +1,4 @@
-# OCR 기반 멀티모달 시니어 복약지도 서버
+# OCR 기반 멀티모달 복약관리 서버
 
 인식 → 추론 → 전송 파이프라인으로, 처방전/약봉투 이미지 OCR, DUR 검증, 내부·외부 LLM 추론, MCP 연동, 기기 전송까지 구현한 서버입니다.
 
@@ -37,7 +37,7 @@ python -m uvicorn app.main:app --reload --host 0.0.0.0
 - API 문서: http://localhost:8000/docs
 - Health: http://localhost:8000/health
 - 파이프라인: POST /query/pipeline (이미지 업로드 → OCR → DUR → DB/문서화)
-- 답변 생성: POST /query/ask (session_id, query_text 선택) → 내부 LLM → 검열 → 외부 LLM → 검증 → 시니어 친화 → MCP/기기 전송
+- 답변 생성: POST /query/ask (session_id, query_text 선택) → 내부 LLM → 검열 → 외부 LLM → 검증 → 사용자 친화 → MCP/기기 전송
 
 ## Qwen3-4B + TurboQuant 상시 검증
 

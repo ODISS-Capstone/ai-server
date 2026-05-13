@@ -87,18 +87,26 @@ async def run_ocr_image(image_bytes: bytes, content_type: str = "image/jpeg") ->
         }
     ]
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.post(
-            api_url,
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={"model": "deepseek-chat", "messages": messages, "max_tokens": 1024},
+    try:
+        async with httpx.AsyncClient(timeout=settings.ocr_api_timeout_seconds) as client:
+            resp = await client.post(
+                api_url,
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={"model": "deepseek-chat", "messages": messages, "max_tokens": 512},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            choices = data.get("choices", [])
+            if not choices:
+                return OcrResponse(raw_text="", medications=[], success=False, message="No response from OCR API")
+            raw_text = choices[0].get("message", {}).get("content", "") or ""
+    except Exception as exc:  # noqa: BLE001 - callers can ask for recapture/fallback
+        return OcrResponse(
+            raw_text="",
+            medications=[],
+            success=False,
+            message=f"OCR API timeout or error: {exc}",
         )
-        resp.raise_for_status()
-        data = resp.json()
-        choices = data.get("choices", [])
-        if not choices:
-            return OcrResponse(raw_text="", medications=[], success=False, message="No response from OCR API")
-        raw_text = choices[0].get("message", {}).get("content", "") or ""
 
     medications = _parse_medications_from_text(raw_text)
     return OcrResponse(raw_text=raw_text, medications=medications)

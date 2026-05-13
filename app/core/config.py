@@ -33,16 +33,21 @@ class Settings(BaseSettings):
 
     # DUR API (식약처 — T2~T10)
     dur_api_base_url: str = "http://apis.data.go.kr/1471000"
+    dur_api_timeout_seconds: float = 8.0
+    dur_api_max_concurrency: int = 8
 
     # 의약품 낱알식별 API (HIRA — T1)
     hira_api_base_url: str = "http://apis.data.go.kr/1471000/MdcinGrnIdntfcInfoService03"
+    hira_api_timeout_seconds: float = 8.0
 
     # 건강기능식품 API (T11, T12)
     health_supplement_api_base_url: str = "http://apis.data.go.kr/1471000/HtfsSttusIdntfcInfoService01"
+    health_supplement_api_timeout_seconds: float = 8.0
 
     # KPIC DUR
     kpic_dur_api_url: Optional[str] = None
     kpic_dur_api_key: Optional[str] = None
+    kpic_dur_api_timeout_seconds: float = 8.0
 
     # Internal LLM (Qwen / EXAONE)
     internal_llm_api_url: Optional[str] = None
@@ -50,6 +55,8 @@ class Settings(BaseSettings):
     internal_llm_model: str = "qwen"
     llm_prompts_path: str = "./app/prompts/llm_prompts.json"
     llm_tools_path: str = "./app/prompts/llm_tools.json"
+    internal_llm_timeout_seconds: float = 6.0
+    local_delivery_llm_timeout_seconds: float = 4.0
     llm_engine_max_concurrency_internal: int = 1
     llm_engine_max_concurrency_external: int = 1
     llm_engine_max_concurrency_judge: int = 1
@@ -59,8 +66,13 @@ class Settings(BaseSettings):
     openai_api_key: Optional[str] = None
     openai_model: str = "gpt-4o-mini"
     openai_judge_model: Optional[str] = "gpt-5"
+    openai_timeout_seconds: float = 6.0
+    openai_search_timeout_seconds: float = 6.0
     anthropic_api_key: Optional[str] = None
     google_ai_api_key: Optional[str] = None
+
+    # OCR
+    ocr_api_timeout_seconds: float = 8.0
 
     # MCP
     mcp_server_url: Optional[str] = None

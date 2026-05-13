@@ -9,10 +9,17 @@ DISCLAIMER_VARIANTS = [
 ]
 
 
-def ensure_disclaimer(text: str) -> str:
-    """답변 끝에 면책 문구가 없으면 추가."""
+def ensure_disclaimer(text: str, *, required: bool = True) -> str:
+    """답변 끝에 면책 문구가 없으면 추가.
+
+    ``required=False`` is used for non-medical conversation turns such as
+    identity registration, reminder setup, OCR capture guidance, and memory
+    acknowledgements.
+    """
     if not text or not text.strip():
         return DISCLAIMER
+    if not required:
+        return text
     t = text.strip()
     if any(v in t for v in DISCLAIMER_VARIANTS):
         return text

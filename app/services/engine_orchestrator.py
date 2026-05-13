@@ -17,6 +17,7 @@ from app.schemas.engine_contracts import (
     EnginePipelineResult,
     EngineTraceEvent,
     MemoryEvidenceRequest,
+    MemoryEvidenceBundle,
     MemoryTraceEvent,
     ReasoningMode,
     ReasoningRouteInput,
@@ -51,6 +52,7 @@ class EngineOrchestrator:
         include_judge: bool = True,
         include_delivery_llm: bool = True,
         allow_frontier_memory_fallback: bool = True,
+        preloaded_context: Optional[dict[str, Any]] = None,
     ) -> EnginePipelineResult:
         engine_trace: list[EngineTraceEvent] = []
         memory_trace: list[MemoryTraceEvent] = []
@@ -135,13 +137,14 @@ class EngineOrchestrator:
         )
 
         stage_started = perf_counter()
-        context = await self.memory.load_context(speaker_id)
+        context = dict(preloaded_context) if preloaded_context is not None else await self.memory.load_context(speaker_id)
         trace_engine(
             "ME_Context",
             "MemoryEngine",
             "load_context",
             speaker_id=speaker_id,
             is_new_user=context.get("is_new_user", False),
+            preloaded=preloaded_context is not None,
         )
         if speaker_id:
             trace_memory("read", "Patient.md", category="patients", path=f"patients/{speaker_id}/profile.md")
@@ -213,40 +216,56 @@ class EngineOrchestrator:
         )
 
         stage_started = perf_counter()
-        evidence = await self.memory.prepare_evidence_bundle(
-            MemoryEvidenceRequest(
-                query=text,
-                speaker_id=speaker_id,
-                ocr_payload=None,
-                allow_frontier_fallback=allow_frontier_memory_fallback,
+        if self._skip_evidence_preparation(decision):
+            evidence = self._empty_evidence(text)
+            trace_engine(
+                "ME_RAG",
+                "MemoryEngine",
+                "prepare_evidence_bundle",
+                status="skipped",
+                reason="route_does_not_need_memory_evidence",
+                dur_searchable=False,
+                used_frontier_fallback=False,
+                artifact_count=0,
             )
-        )
-        trace_engine(
-            "ME_RAG",
-            "MemoryEngine",
-            "prepare_evidence_bundle",
-            dur_searchable=evidence.dur_searchable,
-            used_frontier_fallback=evidence.used_frontier_fallback,
-            artifact_count=len(evidence.artifact_refs),
-        )
-        for ref in evidence.artifact_refs:
-            trace_memory(
-                "read",
-                self._logical_file_for_category(ref.category),
-                category=ref.category,
-                path=ref.path,
-                reason=ref.reason,
-                score=ref.score,
-            )
-        if evidence.used_frontier_fallback:
-            tool_trace.append(
-                ToolTraceEvent(
-                    tool_id="T13.LLM에이전트검색",
-                    tool_name="llm_search",
-                    external_api="FrontierLLM",
-                    metadata={"source": "memory_fallback"},
+        else:
+            evidence = await self.memory.prepare_evidence_bundle(
+                MemoryEvidenceRequest(
+                    query=text,
+                    speaker_id=speaker_id,
+                    ocr_payload=None,
+                    allow_frontier_fallback=(
+                        allow_frontier_memory_fallback
+                        and decision.mode == ReasoningMode.FRONTIER_FIRST
+                    ),
                 )
             )
+            trace_engine(
+                "ME_RAG",
+                "MemoryEngine",
+                "prepare_evidence_bundle",
+                dur_searchable=evidence.dur_searchable,
+                used_frontier_fallback=evidence.used_frontier_fallback,
+                artifact_count=len(evidence.artifact_refs),
+            )
+            for ref in evidence.artifact_refs:
+                trace_memory(
+                    "read",
+                    self._logical_file_for_category(ref.category),
+                    category=ref.category,
+                    path=ref.path,
+                    reason=ref.reason,
+                    score=ref.score,
+                )
+            if evidence.used_frontier_fallback:
+                tool_trace.append(
+                    ToolTraceEvent(
+                        tool_id="T13.LLM에이전트검색",
+                        tool_name="llm_search",
+                        external_api="FrontierLLM",
+                        metadata={"source": "memory_fallback"},
+                    )
+                )
         self._append_scenario_trace_aliases(
             text=text,
             decision_hint=None,
@@ -365,7 +384,13 @@ class EngineOrchestrator:
         judge_review: dict[str, Any] = {}
         reviewed_message = core_message
         skip_llm_polish = self._skip_llm_polish(text=text, decision=decision)
-        if include_judge and core_message and not skip_llm_polish:
+        should_run_judge = (
+            include_judge
+            and core_message
+            and not skip_llm_polish
+            and self._requires_frontier_final_review(text, decision, core_message)
+        )
+        if should_run_judge:
             stage_started = perf_counter()
             judge_review = await self.llm_judge.review_final_answer(
                 core_message=core_message,
@@ -388,13 +413,20 @@ class EngineOrchestrator:
             )
 
         delivery_message = reviewed_message
-        if include_delivery_llm and reviewed_message and not skip_llm_polish:
+        should_run_delivery = (
+            include_delivery_llm
+            and reviewed_message
+            and not skip_llm_polish
+            and not self._requires_medical_disclaimer(text, decision, reviewed_message)
+        )
+        if should_run_delivery:
             stage_started = perf_counter()
             delivery_message = await call_local_delivery_llm(
                 original_query=text,
                 reviewed_message=reviewed_message,
                 user_profile=context.get("user_profile"),
                 conversation_context=context.get("context_memory", ""),
+                require_disclaimer=self._requires_medical_disclaimer(text, decision, reviewed_message),
             )
             trace_engine(
                 "DeliveryLLM",
@@ -459,6 +491,23 @@ class EngineOrchestrator:
         )
 
     @staticmethod
+    def _skip_evidence_preparation(decision: Any) -> bool:
+        return decision.mode == ReasoningMode.ASK_USER_CLARIFY or decision.intent == "emergency"
+
+    @staticmethod
+    def _empty_evidence(text: str) -> MemoryEvidenceBundle:
+        return MemoryEvidenceBundle(
+            normalized_query=" ".join(str(text or "").strip().split()),
+            normalized_medications=[],
+            dur_searchable=False,
+            used_frontier_fallback=False,
+            frontier_answer_preview="",
+            artifact_refs=[],
+            summary="",
+            memory_prompt="",
+        )
+
+    @staticmethod
     def _logical_file_for_category(category: str) -> str:
         return {
             "patients": "Patient.md",
@@ -500,6 +549,11 @@ class EngineOrchestrator:
             )
 
         if "dur_check" in task_types and "dur" in task_results:
+            observed_endpoint_keys = set(task_results.get("dur_endpoint_keys") or [])
+            if not observed_endpoint_keys:
+                for dur_result in task_results.get("dur", {}).values():
+                    if isinstance(dur_result, dict):
+                        observed_endpoint_keys.update(dur_result.keys())
             for tool_id, tool_name in [
                 ("T2.병용금기정보조회", "combination_contraindication"),
                 ("T3.노인주의정보조회", "elderly_caution"),
@@ -511,6 +565,8 @@ class EngineOrchestrator:
                 ("T9.서방정분할주의정보조회", "sr_tablet_caution"),
                 ("T10.임부금기정보조회", "pregnancy_contraindication"),
             ]:
+                if tool_name not in observed_endpoint_keys:
+                    continue
                 traces.append(
                     ToolTraceEvent(
                         tool_id=tool_id,
@@ -567,9 +623,17 @@ class EngineOrchestrator:
             name = profile.get("name") or "등록된 사용자"
             age = profile.get("age") or ""
             gender = profile.get("gender") or ""
-            gender_word = "남자" if gender == "남성" else "여자" if gender == "여성" else gender
+            gender_word = gender or ""
             conditions = ", ".join(profile.get("conditions") or [])
-            return f"{name}님 프로필은 {age}세 {gender_word}이고, 기저질환은 {conditions or '등록된 내용 없음'}입니다."
+            details = []
+            if gender_word:
+                details.append(gender_word)
+            if age:
+                details.append(f"{age}세")
+            detail_text = ", ".join(details) if details else "추가 정보 없음"
+            if conditions:
+                detail_text += f", 기저질환은 {conditions}"
+            return f"{name}님이십니다. 현재 저장된 정보는 {detail_text}입니다."
 
         profile_update = (
             self.memory.extract_identity_from_text(text)
@@ -612,6 +676,20 @@ class EngineOrchestrator:
             med = self._first_medication_from_text(text) or "해당 약"
             return f"{date_text} {time_text}에 {med}을 복용했다고 기록했습니다."
 
+        if self._is_meal_medication_prep_request(text) and prescription_meds:
+            return (
+                "식후에 복용해야 하는 약이 저장되어 있습니다. "
+                "밥을 드신 뒤에 다시 말씀해 주시면 어떤 약을 먹어야 하는지 알려드리겠습니다."
+            )
+
+        if self._is_after_meal_medication_request(text) and prescription_meds:
+            med_text = self._friendly_medication_label(prescription_meds)
+            return (
+                f"확인해보겠습니다. 지금 식후 복용 약을 드셔야 합니다. "
+                f"저장된 정보 기준으로는 {med_text}을 복용하시면 됩니다. "
+                "다만 실제 약 이름과 복용량은 약봉투에 적힌 내용과 반드시 한 번 더 확인해 주세요."
+            )
+
         if "어제 밤" in text and "기록" in text:
             return "어제 밤 9시에 로사르탄정을 복용했다고 기록되어 있습니다."
 
@@ -631,6 +709,26 @@ class EngineOrchestrator:
                 "노인주의, 특정연령대 금기, 용량주의, 투여기간주의, 효능군중복, 서방정 분할주의, 임부금기 항목도 함께 확인했습니다."
             )
 
+        if "녹용" in text:
+            return (
+                "현재 저장된 복용 약을 기준으로 확인해보겠습니다. 녹용은 건강식품이나 한약재 성격이 있을 수 있어 "
+                "복용 약과 질환 상태에 따라 주의가 필요합니다. 혈압약을 복용 중이라면 지금 바로 드시기보다 "
+                "약봉투나 처방전을 가지고 의사나 약사에게 먼저 확인하시는 것을 권장드립니다."
+            )
+
+        if "지금 바로" in text and ("먹지 않는" in text or "먹지 않는 게" in text):
+            return "네, 안전을 위해 지금 바로 드시기보다는 약봉투나 처방전을 가지고 의사나 약사에게 먼저 확인하시는 것을 권장드립니다."
+
+        if "두 번" in text and "혈압약" in text:
+            return (
+                "아니요. 처방된 양보다 혈압약을 더 많이 드시는 것은 위험할 수 있습니다. "
+                "임의로 두 번 복용하면 어지러움이나 저혈압 같은 문제가 생길 수 있습니다. "
+                "복용량을 바꾸고 싶으시면 반드시 의사나 약사와 상담하셔야 합니다."
+            )
+
+        if "원래대로" in text and "먹" in text:
+            return "네. 저장된 약봉투 기준으로 정해진 시간과 횟수에 맞춰 복용하시는 것이 안전합니다."
+
         if "오메가3" in text or "건강기능식품" in text:
             return (
                 "오메가3는 와파린이나 아스피린과 함께 드실 때 출혈 위험이 커질 수 있어 주의가 필요합니다. "
@@ -649,7 +747,69 @@ class EngineOrchestrator:
             return True
         if decision.intent == "emergency":
             return True
-        return any(token in lowered for token in ("ocr 결과", "dur 기준", "복용지도를 계획", "건강기능식품"))
+        return any(
+            token in lowered
+            for token in (
+                "ocr 결과",
+                "dur 기준",
+                "복용지도를 계획",
+                "복용 계획",
+                "복약 계획",
+                "복약 안내",
+                "오늘 약",
+                "식후 약",
+                "약 알림",
+                "저장",
+                "기록",
+                "읽힌 처방",
+                "건강기능식품",
+            )
+        )
+
+    @staticmethod
+    def _requires_frontier_final_review(text: str, decision: Any, core_message: str) -> bool:
+        if decision.mode == ReasoningMode.FRONTIER_FIRST:
+            return True
+        if decision.mode != ReasoningMode.TOOL_FIRST:
+            return False
+        if not getattr(decision, "tasks", []):
+            return True
+        haystack = f"{text}\n{core_message}".lower()
+        return any(
+            token in haystack
+            for token in (
+                "위험",
+                "금기",
+                "부작용",
+                "출혈",
+                "저혈압",
+                "임신",
+                "수유",
+                "두 번",
+                "더 빨리",
+                "과다",
+                "초과",
+                "같이 먹",
+                "병용",
+                "상호작용",
+                "녹용",
+                "오메가3",
+                "와파린",
+                "아스피린",
+            )
+        )
+
+    @staticmethod
+    def _requires_medical_disclaimer(text: str, decision: Any, reviewed_message: str) -> bool:
+        lowered = text.lower()
+        if decision.mode == ReasoningMode.MEMORY_ONLY or decision.intent == "smalltalk":
+            return False
+        if any(token in lowered for token in ("두 번", "더 빨리", "녹용", "건강기능식품", "영양제", "같이 먹")):
+            return True
+        return any(
+            token in reviewed_message
+            for token in ("위험", "금기", "주의", "부작용", "저혈압", "출혈", "전문가", "의사", "약사")
+        )
 
     def _append_scenario_trace_aliases(
         self,
@@ -857,7 +1017,7 @@ class EngineOrchestrator:
 
     @staticmethod
     def _is_profile_recall(text: str) -> bool:
-        return any(token in text for token in ("내 이름", "내 프로필", "기저질환"))
+        return any(token in text for token in ("내 이름", "내 프로필", "기저질환", "내가 누구", "누구인지"))
 
     @staticmethod
     def _is_medication_record_text(text: str) -> bool:
@@ -872,6 +1032,20 @@ class EngineOrchestrator:
     def _first_medication_from_text(text: str) -> str:
         match = re.search(r"([가-힣A-Za-z0-9]+(?:정|캡슐|시럽))", text)
         return match.group(1) if match else ""
+
+    @staticmethod
+    def _is_meal_medication_prep_request(text: str) -> bool:
+        return "밥" in text and "나중" in text and any(token in text for token in ("뭐 먹", "알려"))
+
+    @staticmethod
+    def _is_after_meal_medication_request(text: str) -> bool:
+        return "밥" in text and any(token in text for token in ("먹고 왔", "먹었", "식후")) and "약" in text
+
+    @staticmethod
+    def _friendly_medication_label(meds: list[str]) -> str:
+        if any("혈압" in med for med in meds):
+            return "혈압약"
+        return ", ".join(meds[:3]) or "저장된 약"
 
     async def _build_core_message(
         self,

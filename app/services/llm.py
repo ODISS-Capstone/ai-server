@@ -188,19 +188,21 @@ async def call_local_delivery_llm(
     api_url: Optional[str] = None,
     api_key: Optional[str] = None,
     model: Optional[str] = None,
+    require_disclaimer: bool = True,
 ) -> str:
     """로컬 모델이 GPT Judge 검토문을 최종 사용자 발화로 변환."""
     source = reviewed_message.strip()
     if not source:
         return ensure_disclaimer(
-            "확인된 정보가 부족해 바로 답변드리기 어렵습니다."
+            "확인된 정보가 부족해 바로 답변드리기 어렵습니다.",
+            required=require_disclaimer,
         )
 
     url = api_url or settings.internal_llm_api_url
     key = api_key if api_key is not None else settings.internal_llm_api_key
     if not url:
         logger.warning("[DeliveryLLM] not_configured fallback=true original_query_chars=%d", len(original_query or ""))
-        return ensure_disclaimer(source)
+        return ensure_disclaimer(source, required=require_disclaimer)
 
     messages = get_prompt_registry().render_messages(
         "local_delivery",
@@ -209,14 +211,20 @@ async def call_local_delivery_llm(
         user_profile=json.dumps(user_profile or {}, ensure_ascii=False),
         conversation_context=conversation_context or "(없음)",
     )
-    answer = await _post_chat_once(
-        url,
-        key,
-        messages,
-        model=model or settings.internal_llm_model,
-        chat_template_kwargs={"enable_thinking": False},
-    )
-    return ensure_disclaimer(answer or source)
+    try:
+        answer = await _post_chat_once(
+            url,
+            key,
+            messages,
+            model=model or settings.internal_llm_model,
+            max_tokens=256,
+            timeout_seconds=settings.local_delivery_llm_timeout_seconds,
+            chat_template_kwargs={"enable_thinking": False},
+        )
+    except Exception as exc:  # noqa: BLE001 - delivery polish must never block final answer
+        logger.warning("[DeliveryLLM] failed_fast fallback=true error=%s", exc)
+        return ensure_disclaimer(source, required=require_disclaimer)
+    return ensure_disclaimer(answer or source, required=require_disclaimer)
 
 
 async def judge_identity_conflict(
@@ -338,7 +346,7 @@ async def call_external_llm(
         )
 
         async def post_external() -> str:
-            async with httpx.AsyncClient(timeout=60.0) as client:
+            async with httpx.AsyncClient(timeout=settings.openai_timeout_seconds) as client:
                 r = await client.post(
                     url,
                     headers={"Authorization": f"Bearer {settings.openai_api_key}", "Content-Type": "application/json"},
@@ -379,7 +387,7 @@ async def run_chat_with_tools(
 
     for _round in range(max_tool_rounds + 1):
         async def post_round(current_messages=list(conversation)) -> dict[str, Any]:
-            async with httpx.AsyncClient(timeout=60.0) as client:
+            async with httpx.AsyncClient(timeout=settings.internal_llm_timeout_seconds) as client:
                 r = await client.post(
                     api_url,
                     headers=_json_headers(api_key),
@@ -522,6 +530,12 @@ def _heuristic_identity_extract(text: str) -> dict[str, Any]:
     name_match = re.search(
         r"(?:제\s*이름은|저는|나는)\s*([가-힣]{2,5}?)(?:이고|고|입니다|이에요|예요|,|\s|$)",
         text,
+    ) or re.search(
+        r"^\s*([가-힣]{2,5})\s*(?:남자|남성|여자|여성)",
+        text,
+    ) or re.search(
+        r"^\s*([가-힣]{2,5})\s*,?\s*\d{1,3}\s*(?:살|세)",
+        text,
     )
     if name_match:
         profile["name"] = name_match.group(1)
@@ -590,6 +604,7 @@ async def _post_chat_once(
     *,
     model: str = "qwen",
     max_tokens: int = 512,
+    timeout_seconds: Optional[float] = None,
     chat_template_kwargs: Optional[dict[str, Any]] = None,
 ) -> str:
     async def post_internal() -> str:
@@ -601,7 +616,7 @@ async def _post_chat_once(
             len(messages),
             max_tokens,
         )
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(timeout=timeout_seconds or settings.internal_llm_timeout_seconds) as client:
             payload: dict[str, Any] = {
                 "model": model,
                 "messages": messages,

@@ -481,10 +481,16 @@ class MemoryEngine:
         ) or re.search(
             r"(?:저는|나는)\s*([가-힣]{2,5}?)(?:이고|고|입니다|이에요|예요|,|\s|$)",
             text,
+        ) or re.search(
+            r"^\s*([가-힣]{2,5})\s*(?:남자|남성|여자|여성)",
+            text,
+        ) or re.search(
+            r"^\s*([가-힣]{2,5})\s*,?\s*\d{1,3}\s*(?:살|세)",
+            text,
         )
         if name_match:
             profile["name"] = name_match.group(1)
-        age_match = re.search(r"(\d{1,3})\s*살", text)
+        age_match = re.search(r"(\d{1,3})\s*(?:살|세)", text)
         if age_match:
             profile["age"] = age_match.group(1)
         if "남자" in text or "남성" in text:

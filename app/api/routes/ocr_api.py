@@ -1,7 +1,7 @@
 """처방전 OCR 결과 수신 HTTP 엔드포인트.
 
 로컬 에이전트가 처방전 이미지를 OCR 처리한 결과를 서버로 전송할 때 사용.
-OCR_Logging → DB_OCR_History, OCR_DUR_Interaction → T2~T10 → DB_Prescription_Raw_History
+OCR_Logging → DB_OCR_History, OCR_DUR_Interaction → 필요한 DUR만 조회 → DB_Prescription_Raw_History
 """
 import logging
 from typing import Any, Optional
@@ -56,7 +56,7 @@ async def receive_ocr_result(payload: OCRResultInput) -> OCRProcessedResponse:
     # OCR_Logging → DB_OCR_History
     await memory_engine.log_ocr_result(ocr_data, payload.confidence)
 
-    # OCR_DUR_Interaction → T2~T10 → DB_Prescription_Raw_History
+    # OCR_DUR_Interaction → 기본 T4 품목 정보만 우선 조회
     dur_results: list[dict[str, Any]] = []
     if payload.medications:
         med_dicts = [m.model_dump() for m in payload.medications]
