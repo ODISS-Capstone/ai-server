@@ -25,18 +25,18 @@ def test_engine_orchestrator_runs_in_contract_order(monkeypatch):
 
         async def load_context(self, speaker_id=None):
             calls.append("memory.load_context")
-            return {"speaker_id": speaker_id, "user_profile": {"name": "테스터"}}
+            return {"speaker_id": speaker_id, "user_profile": {"name": "Tester"}}
 
         async def prepare_evidence_bundle(self, request):
             calls.append("memory.prepare_evidence_bundle")
             return MemoryEvidenceBundle(
                 normalized_query=request.query,
-                normalized_medications=["아스피린정"],
+                normalized_medications=["aspirin"],
                 dur_searchable=True,
                 used_frontier_fallback=False,
                 frontier_answer_preview="",
                 artifact_refs=[],
-                summary="메모리 요약",
+                summary="memory summary",
                 memory_prompt="prompt",
             )
 
@@ -61,7 +61,7 @@ def test_engine_orchestrator_runs_in_contract_order(monkeypatch):
 
         async def synthesize_core_message(self, execution_results, verify_with_judge=False):
             calls.append("reasoning.synthesize_core_message")
-            return "핵심 메시지"
+            return "core message"
 
     class FakeConversation:
         def receive_input(self, text, speaker_id=None):
@@ -70,7 +70,7 @@ def test_engine_orchestrator_runs_in_contract_order(monkeypatch):
 
         def generate_filler(self, input_data):
             calls.append("conversation.generate_filler")
-            return "잠시만요"
+            return "checking"
 
         def compose_from_contract(self, contract):
             calls.append("conversation.compose_from_contract")
@@ -100,9 +100,9 @@ def test_engine_orchestrator_runs_in_contract_order(monkeypatch):
         conversation_engine=FakeConversation(),
         llm_judge=FakeJudge(),
     )
-    result = run(orchestrator.run_turn(text="질문", speaker_id="spk-1"))
+    result = run(orchestrator.run_turn(text="question", speaker_id="spk-1"))
 
-    assert result.conversation.response_text.startswith("[delivery][judge]핵심")
+    assert result.conversation.response_text.startswith("[delivery][judge]core")
     assert [event.stage for event in result.engine_trace[:6]] == [
         "ME_Initialize",
         "CE_Input",

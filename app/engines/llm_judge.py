@@ -18,11 +18,33 @@ logger = logging.getLogger(__name__)
 JUDGE_SYSTEM_PROMPT = DEFAULT_PROMPTS["judge_verify"]["system"]
 
 
+def _supports_temperature(model: str) -> bool:
+    """Return whether Chat Completions should include temperature."""
+    normalized = (model or "").lower().strip()
+    return not normalized.startswith("gpt-5")
+
+
 class LLMJudgeEngine:
     """LLM as a Judge: 팩트 체킹 및 판단 검토."""
 
     def __init__(self):
         self.model = settings.openai_judge_model or settings.openai_model
+
+    def _chat_payload(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        max_tokens: int,
+        temperature: float = 0.1,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+        }
+        if _supports_temperature(self.model):
+            payload["temperature"] = temperature
+        return payload
 
     async def verify_fact(
         self,
@@ -54,19 +76,14 @@ class LLMJudgeEngine:
 
         try:
             async def post_judge_verify() -> dict[str, Any]:
-                async with httpx.AsyncClient(timeout=60.0) as client:
+                async with httpx.AsyncClient(timeout=settings.openai_timeout_seconds) as client:
                     resp = await client.post(
                         "https://api.openai.com/v1/chat/completions",
                         headers={
                             "Authorization": f"Bearer {api_key}",
                             "Content-Type": "application/json",
                         },
-                        json={
-                            "model": self.model,
-                            "messages": messages,
-                            "max_tokens": 512,
-                            "temperature": 0.1,
-                        },
+                        json=self._chat_payload(messages, max_tokens=256),
                     )
                     resp.raise_for_status()
                     return resp.json()
@@ -132,19 +149,14 @@ class LLMJudgeEngine:
 
         try:
             async def post_final_review() -> dict[str, Any]:
-                async with httpx.AsyncClient(timeout=60.0) as client:
+                async with httpx.AsyncClient(timeout=settings.openai_timeout_seconds) as client:
                     resp = await client.post(
                         "https://api.openai.com/v1/chat/completions",
                         headers={
                             "Authorization": f"Bearer {api_key}",
                             "Content-Type": "application/json",
                         },
-                        json={
-                            "model": self.model,
-                            "messages": messages,
-                            "max_tokens": 700,
-                            "temperature": 0.1,
-                        },
+                        json=self._chat_payload(messages, max_tokens=400),
                     )
                     resp.raise_for_status()
                     return resp.json()
@@ -192,7 +204,7 @@ class LLMJudgeEngine:
         default_criteria = [
             "정확성: 의학적으로 올바른 정보인가",
             "안전성: 위험한 조언이 없는가",
-            "이해도: 어르신이 이해하기 쉬운 표현인가",
+            "이해도: 복약 정보가 익숙하지 않은 사용자도 이해하기 쉬운 표현인가",
             "완전성: 중요 정보가 누락되지 않았는가",
         ]
         criteria_text = "\n".join(f"- {c}" for c in (criteria or default_criteria))
@@ -204,19 +216,14 @@ class LLMJudgeEngine:
 
         try:
             async def post_judge_evaluate() -> dict[str, Any]:
-                async with httpx.AsyncClient(timeout=60.0) as client:
+                async with httpx.AsyncClient(timeout=settings.openai_timeout_seconds) as client:
                     resp = await client.post(
                         "https://api.openai.com/v1/chat/completions",
                         headers={
                             "Authorization": f"Bearer {api_key}",
                             "Content-Type": "application/json",
                         },
-                        json={
-                            "model": self.model,
-                            "messages": messages,
-                            "max_tokens": 256,
-                            "temperature": 0.1,
-                        },
+                        json=self._chat_payload(messages, max_tokens=160),
                     )
                     resp.raise_for_status()
                     return resp.json()

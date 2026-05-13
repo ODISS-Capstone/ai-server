@@ -23,29 +23,57 @@ from app.schemas.engine_contracts import (
 logger = logging.getLogger(__name__)
 
 FILLER_RESPONSES = [
-    "잠시만요, 기록을 확인하고 있어요.",
-    "네, 알겠습니다. 잠깐만 기다려 주세요.",
-    "어르신, 제가 꼼꼼히 살펴보고 있어요~",
-    "확인 중이에요. 금방 알려드릴게요.",
-    "말씀하신 부분 확인하고 있습니다, 조금만 기다려 주세요.",
+    "잠시만요, 필요한 기록을 확인하고 있어요.",
+    "확인 중이에요. 금방 이어서 말씀드릴게요.",
+    "말씀하신 내용을 놓치지 않게 정리하고 있어요.",
+]
+
+MEDICATION_FILLERS = [
+    "복용 중인 약과 관련 기록을 함께 확인하고 있어요.",
+    "안전하게 안내드리려고 약 정보와 기록을 같이 보고 있어요.",
+    "처방을 바꾸라는 뜻은 아니고, 확인된 정보 기준으로 조심스럽게 살펴보고 있어요.",
+]
+
+DUR_FILLERS = [
+    "약끼리 같이 드셔도 되는지 안전 정보를 확인하고 있어요.",
+    "혹시 주의해야 할 조합이 있는지 먼저 살펴보고 있어요.",
+    "복용 안전성은 중요해서, 필요한 항목만 빠르게 확인하고 있어요.",
+]
+
+OCR_FILLERS = [
+    "사진에서 읽힌 약 이름을 확인하고 있어요.",
+    "약봉투 글자가 제대로 읽혔는지 살펴보고 있어요.",
+    "추측해서 저장하지 않도록, 인식된 내용을 먼저 확인하고 있어요.",
+]
+
+REMINDER_FILLERS = [
+    "알림 시간을 확인하고 있어요.",
+    "복약 알림을 헷갈리지 않게 정리하고 있어요.",
+    "아침, 점심, 저녁 알림 시간을 맞춰보고 있어요.",
+]
+
+RECORD_FILLERS = [
+    "복용 기록을 남길 준비를 하고 있어요.",
+    "방금 드셨다는 내용을 기록에 맞게 정리하고 있어요.",
+    "나중에 다시 확인하실 수 있게 복용 기록을 살펴보고 있어요.",
 ]
 
 SMALLTALK_PATTERNS = {
     "greeting": [
-        "어르신, 안녕하세요! 오늘 기분은 어떠세요?",
-        "안녕하세요, 반갑습니다! 무엇을 도와드릴까요?",
+        "안녕하세요. 오늘 복약이나 컨디션 관련해서 도와드릴게요.",
+        "안녕하세요, 반갑습니다. 무엇을 확인해드릴까요?",
     ],
     "feeling_bad": [
-        "아이고, 오늘 컨디션이 안 좋으시군요. 많이 불편하셨겠어요.",
-        "걱정되시겠네요. 제가 도울 수 있는 게 있으면 말씀해 주세요.",
+        "오늘 컨디션이 좋지 않으시군요. 많이 불편하셨겠어요.",
+        "걱정되시겠어요. 증상이나 복용 중인 약을 말씀해 주시면 같이 확인해볼게요.",
     ],
     "feeling_good": [
-        "그렇게 좋으시다니 정말 다행이에요!",
-        "건강하게 지내고 계시니 정말 기쁘네요!",
+        "좋으시다니 다행이에요. 오늘 복약도 무리 없이 챙겨볼게요.",
+        "컨디션이 괜찮으시다니 좋네요. 필요한 것이 있으면 편하게 말씀해 주세요.",
     ],
     "thanks": [
-        "별말씀을요, 언제든 편하게 물어보세요!",
-        "도움이 되셨다니 다행이에요!",
+        "별말씀을요. 언제든 편하게 물어보세요.",
+        "도움이 되셨다니 다행이에요.",
     ],
 }
 
@@ -60,11 +88,14 @@ class ConversationEngine:
 
     def __init__(self):
         self.system_prompt = (
-            "당신은 어르신에게 복약 안내를 전달하는 따뜻한 AI 도우미입니다.\n"
+            "당신은 나이와 무관하게 복약 관리가 필요한 사용자를 돕는 따뜻한 AI 도우미입니다.\n"
             "- 존댓말을 사용하고, 짧고 쉬운 문장으로 말합니다.\n"
-            "- '어르신', '할머니', '할아버지' 등 친근한 호칭을 씁니다.\n"
+            "- 이름이 있으면 이름을 사용하고, 없으면 '사용자님'이라고 부릅니다.\n"
+            "- 사용자가 직접 말했거나 프로필에 저장된 경우가 아니면 나이, 질환, 호칭을 추측하지 않습니다.\n"
+            "- 보호자가 대신 말하면 사용자 본인 정보와 복약 관리 대상자 정보를 섞지 않습니다.\n"
+            "- 만성질환자나 복약 사용자라는 이유만으로 '어르신'이라고 부르지 않습니다.\n"
             "- 의학 전문 용어를 쉬운 말로 바꿉니다.\n"
-            "- 답변 끝에 항상 '정확한 판단은 의사·약사 상담이 필요합니다'를 포함합니다."
+            "- 의료 안전 판단이 필요한 경우에만 '정확한 판단은 의사·약사 상담이 필요합니다'를 포함합니다."
         )
 
     # ── CE_Input: STT 해석 데이터 수신 ──
@@ -83,9 +114,20 @@ class ConversationEngine:
 
     def generate_filler(self, input_data: dict) -> Optional[str]:
         """Latency Hiding: 처리 시간이 필요할 때 즉시 내보낼 filler 메시지 생성."""
-        smalltalk_type = input_data.get("smalltalk_type")
-        if smalltalk_type and smalltalk_type in SMALLTALK_PATTERNS:
-            return random.choice(SMALLTALK_PATTERNS[smalltalk_type])
+        if input_data.get("is_smalltalk"):
+            return None
+        text = str(input_data.get("text") or "")
+        category = self._filler_category(text)
+        if category == "ocr":
+            return random.choice(OCR_FILLERS)
+        if category == "dur":
+            return random.choice(DUR_FILLERS)
+        if category == "reminder":
+            return random.choice(REMINDER_FILLERS)
+        if category == "record":
+            return random.choice(RECORD_FILLERS)
+        if category == "medication":
+            return random.choice(MEDICATION_FILLERS)
         return random.choice(FILLER_RESPONSES)
 
     def generate_smalltalk(self, input_data: dict) -> Optional[str]:
@@ -95,45 +137,49 @@ class ConversationEngine:
             return random.choice(SMALLTALK_PATTERNS[smalltalk_type])
         return None
 
-    # ── CE_Tone: 환자 맞춤형 언어 순화 및 최적화 ──
+    # ── CE_Tone: 사용자 맞춤형 언어 순화 및 최적화 ──
 
     def apply_tone(
         self,
         fact_data: str,
         user_profile: Optional[dict] = None,
         flash_context: Optional[str] = None,
+        require_disclaimer: Optional[bool] = None,
     ) -> str:
-        """추론 엔진이 전달한 팩트 데이터를 어르신 친화적 언어로 변환."""
+        """추론 엔진이 전달한 팩트 데이터를 사용자 친화적 언어로 변환."""
         if not fact_data or not fact_data.strip():
-            return "어르신, 죄송해요. 지금은 답변을 드리기 어렵습니다. 잠시 후 다시 말씀해 주세요."
+            return "사용자님, 죄송해요. 지금은 답변을 드리기 어렵습니다. 잠시 후 다시 말씀해 주세요."
 
         text = fact_data.strip()
+        safety_source = text
+        del flash_context
 
-        honorific = "어르신"
-        if user_profile:
-            name = user_profile.get("name", "")
-            if name:
-                honorific = f"{name} 어르신"
+        honorific = self._honorific(user_profile)
+        text = self._replace_unconfirmed_elder_honorific(text, honorific)
 
         replacements = {
             "병용 금기": "같이 드시면 안 되는 약",
             "병용금기": "같이 드시면 안 되는 약",
             "상호작용": "서로 영향을 줄 수 있는 약",
             "부작용": "몸에 안 좋은 반응",
-            "금기": "주의하셔야 하는",
-            "복용": "드시는 것",
-            "투여": "드시는 것",
-            "처방": "의사 선생님이 정해주신",
+            "용량주의": "드시는 양 주의",
+            "투여기간주의": "복용 기간 주의",
+            "복용량": "드시는 양",
             "용량": "드시는 양",
             "효능": "약의 효과",
         }
         for medical_term, friendly_term in replacements.items():
             text = text.replace(medical_term, friendly_term)
 
-        if not any(text.startswith(prefix) for prefix in ["네,", "어르신", honorific]):
-            text = f"{honorific}, {text[0].lower() + text[1:]}" if len(text) > 1 else text
+        if not any(text.startswith(prefix) for prefix in ["네,", "어르신", "사용자님", honorific]):
+            text = f"{honorific}, {text}" if text else text
 
-        if "의사·약사 상담" not in text and "전문가" not in text:
+        should_disclaim = (
+            self._looks_like_medical_safety_answer(f"{safety_source}\n{text}")
+            if require_disclaimer is None
+            else require_disclaimer
+        )
+        if should_disclaim and "의사·약사 상담" not in text and "전문가" not in text:
             if not text.rstrip().endswith("."):
                 text += "."
             text += " 정확한 판단은 의사·약사 상담이 필요합니다."
@@ -193,7 +239,7 @@ class ConversationEngine:
         self,
         contract: ConversationComposeRequest,
     ) -> ConversationComposeResponse:
-        """Compose elder-facing output from typed engine contracts.
+        """Compose user-facing output from typed engine contracts.
 
         Runtime policy:
         - Never expose ``<think>`` blocks.
@@ -201,11 +247,16 @@ class ConversationEngine:
           + reviewed/delivery text candidates.
         """
         if contract.decision.mode == ReasoningMode.ASK_USER_CLARIFY:
-            if "처방전" in contract.input_text and "사진" in contract.input_text:
-                text = "어르신, 처방전 사진을 먼저 올리거나 촬영해 주세요. 사진이 있어야 약 이름과 주의사항을 확인할 수 있어요."
+            if self._is_ocr_capture_request(contract.input_text):
+                text = (
+                    f"{self._honorific(contract.user_profile)}, 알겠습니다. "
+                    "카메라 앞으로 약봉투나 처방전을 잘 보이게 보여주세요. "
+                    "글자가 흔들리지 않도록 잠시만 멈춰주세요. "
+                    "5, 4, 3, 2, 1. 촬영하겠습니다."
+                )
             else:
                 text = (
-                    "어르신, 확인이 필요한 약 이름이나 증상을 조금 더 자세히 말씀해 주세요. "
+                    f"{self._honorific(contract.user_profile)}, 확인이 필요한 약 이름이나 증상을 조금 더 자세히 말씀해 주세요. "
                     "예: 약 이름, 하루 몇 번 드시는지, 언제부터 불편하셨는지."
                 )
             return ConversationComposeResponse(
@@ -222,10 +273,10 @@ class ConversationEngine:
         source = self._strip_think_tags(source)
 
         if not source:
-            fallback = "어르신, 현재 기록만으로는 정확한 판단이 어렵습니다."
+            fallback = "사용자님, 현재 기록만으로는 정확한 판단이 어렵습니다."
             if contract.decision.mode == ReasoningMode.MEMORY_ONLY:
                 fallback = (
-                    "어르신, 지금은 가벼운 안내만 가능한 상태예요. "
+                    "사용자님, 지금은 가벼운 안내만 가능한 상태예요. "
                     "복용 중인 약 이름이나 처방전을 알려주시면 더 정확히 도와드릴 수 있어요."
                 )
             return ConversationComposeResponse(
@@ -233,6 +284,7 @@ class ConversationEngine:
                     fallback,
                     user_profile=contract.user_profile,
                     flash_context=contract.evidence.summary if contract.evidence else None,
+                    require_disclaimer=contract.decision.mode != ReasoningMode.MEMORY_ONLY,
                 ),
                 response_type="fallback",
                 requires_tts=True,
@@ -246,7 +298,7 @@ class ConversationEngine:
         )
         if response_type == "smalltalk":
             return ConversationComposeResponse(
-                response_text=self._ensure_elder_prefix(source),
+                response_text=self._ensure_user_prefix(source, contract.user_profile),
                 response_type=response_type,
                 requires_tts=True,
             )
@@ -255,7 +307,7 @@ class ConversationEngine:
             and self._is_memory_ack_or_recall(contract.input_text)
         ):
             return ConversationComposeResponse(
-                response_text=self._ensure_elder_prefix(source),
+                response_text=self._ensure_user_prefix(source, contract.user_profile),
                 response_type=response_type,
                 requires_tts=True,
             )
@@ -263,6 +315,7 @@ class ConversationEngine:
             source,
             user_profile=contract.user_profile,
             flash_context=contract.evidence.summary if contract.evidence else None,
+            require_disclaimer=self._requires_disclaimer_for_contract(contract, source),
         )
         return ConversationComposeResponse(
             response_text=text,
@@ -274,6 +327,8 @@ class ConversationEngine:
 
     def _detect_smalltalk(self, text: str) -> bool:
         text_lower = text.lower().strip()
+        if self._has_medication_or_task_signal(text_lower):
+            return False
         all_keywords = (
             GREETING_KEYWORDS
             + FEELING_BAD_KEYWORDS
@@ -284,6 +339,8 @@ class ConversationEngine:
 
     def _classify_smalltalk(self, text: str) -> Optional[str]:
         text_lower = text.lower().strip()
+        if self._has_medication_or_task_signal(text_lower):
+            return None
         if any(kw in text_lower for kw in GREETING_KEYWORDS):
             return "greeting"
         if any(kw in text_lower for kw in FEELING_BAD_KEYWORDS):
@@ -294,21 +351,79 @@ class ConversationEngine:
             return "thanks"
         return None
 
+    @staticmethod
+    def _has_medication_or_task_signal(text: str) -> bool:
+        return any(
+            token in text
+            for token in (
+                "약",
+                "복용",
+                "처방",
+                "먹어도",
+                "먹으면",
+                "같이 먹",
+                "드셔도",
+                "부작용",
+                "금기",
+                "주의",
+                "용량",
+                "식후",
+                "식전",
+                "알림",
+                "기록",
+                "ocr",
+                "사진",
+                "약봉투",
+                "처방전",
+                "촬영",
+                "찍",
+                "와파린",
+                "아스피린",
+                "영양제",
+                "건강기능식품",
+            )
+        )
+
+    @staticmethod
+    def _filler_category(text: str) -> str:
+        lowered = text.lower()
+        if any(token in lowered for token in ("사진", "ocr", "약봉투", "처방전", "촬영", "찍")):
+            return "ocr"
+        if any(token in lowered for token in ("알림", "예약", "몇 시", "시간 바꿔", "시간 변경")):
+            return "reminder"
+        if any(token in lowered for token in ("먹었어", "먹었나", "복용했", "기록")):
+            return "record"
+        if any(token in lowered for token in ("같이 먹", "병용", "상호작용", "두 번", "더 빨리", "녹용", "오메가3", "건강기능식품", "영양제", "dur")):
+            return "dur"
+        if any(token in lowered for token in ("약", "복용", "처방", "식후", "식전", "아침", "점심", "저녁")):
+            return "medication"
+        return "general"
+
+    @staticmethod
+    def _is_ocr_capture_request(text: str) -> bool:
+        lowered = text.lower()
+        return (
+            any(token in lowered for token in ("처방전", "약봉투", "약 사진", "약사진", "사진", "ocr"))
+            and any(token in lowered for token in ("찍", "촬영", "읽", "ocr", "보여"))
+        )
+
     def _strip_think_tags(self, text: str) -> str:
         """Remove training-only longCoT blocks from runtime responses."""
         if not text:
             return ""
-        cleaned = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
-        cleaned = re.sub(r"<think>.*$", "", cleaned, flags=re.DOTALL)
+        cleaned = re.sub(r"<think\b[^>]*>.*?</think>\s*", "", text, flags=re.DOTALL | re.IGNORECASE)
+        cleaned = re.sub(r"<think\b[^>]*>.*$", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
         return cleaned.strip()
 
-    def _ensure_elder_prefix(self, text: str) -> str:
+    def _ensure_user_prefix(self, text: str, user_profile: Optional[dict] = None) -> str:
         text = (text or "").strip()
         if not text:
-            return "어르신, 듣고 있어요."
-        if text.startswith(("어르신", "네,")):
+            return f"{self._honorific(user_profile)}, 듣고 있어요."
+        honorific = self._honorific(user_profile)
+        text = self._replace_unconfirmed_elder_honorific(text, honorific)
+        if text.startswith(("어르신", "사용자님", "네,", honorific)):
             return text
-        return f"어르신, {text}"
+        return f"{honorific}, {text}"
 
     def _is_memory_ack_or_recall(self, text: str) -> bool:
         lowered = text.lower()
@@ -321,5 +436,58 @@ class ConversationEngine:
                 "기록한",
                 "뭐였",
                 "다시 말",
+                "누구인지",
+                "내가 누구",
+                "먹었어",
+                "먹었나",
+                "알림",
+                "저장",
             )
         )
+
+    @staticmethod
+    def _honorific(user_profile: Optional[dict] = None) -> str:
+        name = str((user_profile or {}).get("name") or "").strip()
+        return f"{name}님" if name else "사용자님"
+
+    @staticmethod
+    def _replace_unconfirmed_elder_honorific(text: str, honorific: str) -> str:
+        return (text or "").replace("어르신", honorific)
+
+    @staticmethod
+    def _looks_like_medical_safety_answer(text: str) -> bool:
+        lowered = text.lower()
+        return any(
+            token in lowered
+            for token in (
+                "위험",
+                "금기",
+                "주의",
+                "부작용",
+                "저혈압",
+                "출혈",
+                "상담",
+                "전문가",
+                "임의",
+                "중단",
+                "용량",
+                "복용량",
+                "dur",
+            )
+        )
+
+    def _requires_disclaimer_for_contract(
+        self,
+        contract: ConversationComposeRequest,
+        source: str,
+    ) -> bool:
+        lowered = contract.input_text.lower()
+        if contract.decision.intent == "smalltalk":
+            return False
+        if contract.decision.mode == ReasoningMode.MEMORY_ONLY:
+            return False
+        if any(token in lowered for token in ("알림", "찍", "촬영", "사진", "저장", "먹었어")):
+            return False
+        if any(token in lowered for token in ("두 번", "많이", "더 빨리", "녹용", "건강기능식품", "영양제", "같이 먹")):
+            return True
+        return self._looks_like_medical_safety_answer(source)

@@ -6,7 +6,7 @@ This script derives three specialized datasets:
 
 1. router   : route decision (`tool_first` / `frontier_first` / ...)
 2. memory   : OCR normalization + evidence selection summary
-3. delivery : elder-facing response rendering (no ``<think>``)
+3. delivery : user-facing response rendering (no ``<think>``)
 """
 from __future__ import annotations
 
@@ -26,7 +26,18 @@ DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "data" / "fine_tuning"
 
 
 def _strip_think(content: str) -> str:
-    return re.sub(r"<think>.*?</think>\s*", "", content or "", flags=re.DOTALL).strip()
+    cleaned = re.sub(
+        r"<think\b[^>]*>.*?</think>\s*",
+        "",
+        content or "",
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    return re.sub(
+        r"<think\b[^>]*>.*$",
+        "",
+        cleaned,
+        flags=re.DOTALL | re.IGNORECASE,
+    ).strip()
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -181,7 +192,8 @@ def _build_delivery_record(sample: dict[str, Any], sample_id: str) -> dict[str, 
                 "role": "system",
                 "content": (
                     "당신은 ODISS 대화 엔진의 최종 발화 생성기입니다. "
-                    "주어진 사실 요약을 어르신이 이해하기 쉬운 짧은 존댓말로 바꾸세요. "
+                    "주어진 사실 요약을 사용자가 이해하기 쉬운 짧은 존댓말로 바꾸세요. "
+                    "이름이 있으면 '<이름>님', 없으면 '사용자님'으로 부르고 나이·성별은 추측하지 마세요. "
                     "런타임 출력에는 <think> 토큰을 절대 포함하지 마세요."
                 ),
             },

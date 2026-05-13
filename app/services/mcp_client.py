@@ -35,7 +35,7 @@ async def send_verified_to_mcp(
 def get_mcp_data_sources() -> dict[str, str]:
     """MCP로 연결된 데이터 소스 설명 (MySQL, NFS, HTTPS)."""
     return {
-        "mysql": "환자 복용 이력, 상담 로그",
+        "mysql": "사용자 복용 이력, 상담 로그",
         "nfs": "처방전 이미지, 분석 문서",
         "https": "실시간 약학 정보, 의학 가이드라인",
     }

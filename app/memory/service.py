@@ -10,6 +10,7 @@ from app.memory.paths import ENTRYPOINT_NAME, StructuredMemoryPaths
 from app.memory.scan import scan_memory_files
 from app.memory.selector import select_relevant_memories
 from app.memory.types import MAX_ENTRYPOINT_BYTES, MAX_ENTRYPOINT_LINES, build_memory_policy
+from app.services.dur_summary import summarize_dur_result
 
 
 class StructuredMemoryService:
@@ -63,7 +64,7 @@ class StructuredMemoryService:
             )
 
     async def sync_patient_profile(self, speaker_id: str, profile: dict[str, Any]) -> None:
-        """환자 프로필을 화자별 user memory로 동기화한다."""
+        """복약 관리 프로필을 화자별 user memory로 동기화한다."""
         rows = [
             f"- 이름: {profile.get('name') or '-'}",
             f"- ID: {speaker_id}",
@@ -73,10 +74,10 @@ class StructuredMemoryService:
         ]
         await self.upsert_memory(
             filename="patient_profile.md",
-            name="환자 프로필",
-            description=f"{speaker_id} 환자 기본 프로필",
+            name="복약 관리 프로필",
+            description=f"{speaker_id} 사용자/복약 관리 대상자 기본 프로필",
             memory_type="user",
-            body="# 환자 프로필\n\n" + "\n".join(rows),
+            body="# 복약 관리 프로필\n\n" + "\n".join(rows),
             speaker_id=speaker_id,
         )
 
@@ -92,10 +93,11 @@ class StructuredMemoryService:
         med_lines = "\n".join(f"- {name}" for name in med_names) or "- 확인된 약품 없음"
         dur_lines: list[str] = []
         for dur in dur_results:
-            name = dur.get("name", "이름 없음")
-            contras = len(dur.get("contraindications", []))
-            cautions = len(dur.get("precautions", []))
-            dur_lines.append(f"- {name}: 금기 {contras}건 / 주의 {cautions}건")
+            summary = summarize_dur_result(dur)
+            dur_lines.append(
+                f"- {summary['name']}: 정보 {summary['info']}건 / "
+                f"금기 {summary['contraindications']}건 / 주의 {summary['precautions']}건"
+            )
 
         body = (
             "# 최신 복약 및 DUR 요약\n\n"
@@ -116,6 +118,40 @@ class StructuredMemoryService:
             name="최신 복약 및 DUR 요약",
             description=description,
             memory_type="project",
+            body=body,
+            speaker_id=speaker_id,
+        )
+
+    async def sync_medication_events(
+        self,
+        *,
+        speaker_id: str,
+        events: list[dict[str, Any]],
+    ) -> None:
+        """Persist typed medication events as speaker-scoped memory."""
+        rows: list[str] = []
+        for event in events[-10:]:
+            date_text = str(event.get("date") or "-")
+            time_text = str(event.get("time") or "-")
+            medication = str(event.get("medication") or "-")
+            action = str(event.get("action") or "taken")
+            source = str(event.get("source_text") or "").strip()
+            row = f"- {date_text} {time_text}: {medication} ({action})"
+            if source:
+                row += f" | 원문: {source[:120]}"
+            rows.append(row)
+
+        body = (
+            "# 복약 이벤트 기록\n\n"
+            + ("\n".join(rows) if rows else "- 기록된 복약 이벤트 없음")
+        )
+        latest = events[-1] if events else {}
+        latest_med = latest.get("medication") or "복약 이벤트"
+        await self.upsert_memory(
+            filename="medication_events.md",
+            name="복약 이벤트 기록",
+            description=f"최근 복약 이벤트: {latest_med}",
+            memory_type="user",
             body=body,
             speaker_id=speaker_id,
         )

@@ -7,6 +7,7 @@ from pathlib import Path
 from scripts.validate_backend_live import (
     load_scenarios_from_file,
     normalize_scenario,
+    quality_flags,
     validate_trace_expectations,
 )
 
@@ -17,6 +18,12 @@ TRACE_SCENARIOS = PROJECT_ROOT / "scripts" / "odiss_engine_call_trace_scenarios.
 
 def run(coro):
     return asyncio.run(coro)
+
+
+def test_quality_flags_rejects_attributed_think_tags() -> None:
+    flags = quality_flags('<think data-source="qwen">internal</think>\n답변입니다.')
+
+    assert flags["no_think_tags"] is False
 
 
 def test_normalize_scenario_preserves_trace_metadata() -> None:

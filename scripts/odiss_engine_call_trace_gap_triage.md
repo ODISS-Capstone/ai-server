@@ -19,22 +19,24 @@ scenario can pass as a hard gate.
 
 ## Memory Behavior Gaps
 
-- Identity/profile registration: `identity_guard.py` supports registration
-  and confirmation, but `EngineOrchestrator.run_turn()` does not currently run
-  the identity gate before normal CE/ME/RE flow. Live validation can call the
-  identity gate separately with `expect_identity_gate`, but full scenario
-  parity requires an orchestrator option or wrapper.
-- Date-specific medication memory: scenarios expect extraction of date/time
-  medication events such as `2026-05-12 21:00 로사르탄정`. Current memory
-  update stores the turn text and short history, but does not yet create a
-  typed medication event record for robust next-day recall.
+- Identity/profile registration: closed for orchestrator-level validation.
+  `EngineOrchestrator.run_turn(..., run_identity_gate=True)` now runs the
+  identity gate before normal RE/tool flow and returns the gate result in the
+  pipeline contract. `validate_backend_live.py` uses this path for
+  `expect_identity_gate` steps.
+- Date-specific medication memory: closed for explicit taken-dose records.
+  `MemoryEngine.update_and_compress()` now extracts typed medication events
+  such as `2026-05-12 21:00 로사르탄정`, stores them under the speaker patient
+  namespace, syncs structured memory, and allows next-turn recall through
+  `medication_events.md`.
 - Daily-life smalltalk memory: generic history and flash requirement updates
   exist, but `CurrentManual.md` and structured daily-routine extraction are not
   yet first-class outputs.
-- OCR text ingestion: HTTP/WebSocket OCR paths write OCR history and
-  prescription logs, but text-only STT instructions such as "OCR 결과가 A, B로
-  나왔어" are not yet normalized into `OCRHistory.md`, `Prescription.md`, and
-  `PrescriptionLog.md` by the orchestrator.
+- OCR text ingestion: closed for explicit STT OCR result text. `MemoryEngine`
+  now normalizes utterances such as "OCR 결과가 A, B로 나왔어" into
+  `OCRHistory.md`, `Prescription.md`, `PrescriptionLog.md`, and speaker-scoped
+  structured medication memory. The WebSocket OCR image path remains separate
+  and still performs pending-confirmation before saving.
 
 ## Tool Coverage Gaps
 

@@ -94,6 +94,56 @@ def test_dispatch_executes_handler_and_filters_unknown_kwargs(tmp_path):
     assert received == {"value": "hello"}
 
 
+def test_dispatch_normalizes_llm_api_argument_aliases_and_schema_filters(tmp_path):
+    schema_file = tmp_path / "tools.json"
+    schema_file.write_text(
+        json.dumps(
+            {
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "Tool_DUR_Test",
+                            "description": "DUR test tool",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "item_name": {"type": "string"},
+                                    "page_no": {"type": "integer"},
+                                },
+                                "additionalProperties": False,
+                            },
+                        },
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    received: dict[str, object] = {}
+
+    async def dur_like_handler(**kwargs) -> dict[str, object]:
+        received.update(kwargs)
+        return {"success": True, "items": []}
+
+    registry = ToolRegistry(
+        schema_path=schema_file,
+        handlers={"Tool_DUR_Test": dur_like_handler},
+    )
+
+    result = asyncio.run(
+        registry.dispatch(
+            "Tool_DUR_Test",
+            {"itemName": "아스피린", "pageNo": 2, "numOfRows": 100, "unknown": True},
+        )
+    )
+
+    assert result["success"] is True
+    assert received == {"item_name": "아스피린", "page_no": 2}
+
+
 def test_dispatch_unknown_tool_returns_error_envelope():
     registry = ToolRegistry(schema_path=PROJECT_SCHEMA)
     result = asyncio.run(registry.dispatch("Tool_Does_Not_Exist", {}))

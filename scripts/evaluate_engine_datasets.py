@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +40,10 @@ def _has_tool_calls(row: dict[str, Any]) -> bool:
     return False
 
 
+def _has_think_tag(content: str) -> bool:
+    return bool(re.search(r"</?think\b", content or "", flags=re.IGNORECASE))
+
+
 def evaluate_router(rows: list[dict[str, Any]]) -> dict[str, Any]:
     violations: list[str] = []
     for idx, row in enumerate(rows):
@@ -53,7 +58,7 @@ def evaluate_router(rows: list[dict[str, Any]]) -> dict[str, Any]:
             violations.append(f"row {idx}: unknown route_mode={route_mode}")
         if _has_tool_calls(row):
             violations.append(f"row {idx}: router sample must not contain tool_calls")
-        if "<think>" in content:
+        if _has_think_tag(content):
             violations.append(f"row {idx}: router sample must not contain <think>")
     return {
         "task_family": "router",
@@ -80,7 +85,7 @@ def evaluate_memory(rows: list[dict[str, Any]]) -> dict[str, Any]:
             violations.append(f"row {idx}: summary must be non-empty")
         if _has_tool_calls(row):
             violations.append(f"row {idx}: memory sample must not contain tool_calls")
-        if "<think>" in content:
+        if _has_think_tag(content):
             violations.append(f"row {idx}: memory sample must not contain <think>")
     return {
         "task_family": "memory",
@@ -97,7 +102,7 @@ def evaluate_delivery(rows: list[dict[str, Any]]) -> dict[str, Any]:
         if not content.strip():
             violations.append(f"row {idx}: empty assistant content")
             continue
-        if "<think>" in content or "</think>" in content:
+        if _has_think_tag(content):
             violations.append(f"row {idx}: delivery sample must not contain <think>")
         if "정확한 판단은 의사·약사 상담이 필요합니다" not in content:
             violations.append(f"row {idx}: missing safety disclaimer")
@@ -120,7 +125,7 @@ def evaluate_reasoning_alignment(rows: list[dict[str, Any]]) -> dict[str, Any]:
             m for m in row.get("messages", []) if m.get("role") == "assistant"
         ]
         row_mismatch = False
-        if any("<think>" in str(m.get("content", "")) for m in assistant_messages):
+        if any(_has_think_tag(str(m.get("content", ""))) for m in assistant_messages):
             mismatches.append(f"row {idx}: contains <think> (training-only artifact)")
             row_mismatch = True
         if _has_tool_calls(row):

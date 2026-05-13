@@ -1,5 +1,6 @@
 """LLM 에이전트 검색 (T13) — OpenAI API 기반 웹 검색/추론."""
 import logging
+import re
 from typing import Any, Optional
 
 import httpx
@@ -11,6 +12,14 @@ from app.services.prompt_registry import DEFAULT_PROMPTS, get_prompt_registry
 logger = logging.getLogger(__name__)
 
 SEARCH_SYSTEM_PROMPT = DEFAULT_PROMPTS["search"]["system"]
+
+
+def _strip_reasoning_tags(content: str) -> str:
+    if "<think" not in (content or "").lower():
+        return content or ""
+    cleaned = re.sub(r"<think\b[^>]*>.*?</think>\s*", "", content, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r"<think\b[^>]*>.*$", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+    return cleaned.strip()
 
 
 async def llm_search(
@@ -37,7 +46,7 @@ async def llm_search(
 
     try:
         async def post_search() -> dict[str, Any]:
-            async with httpx.AsyncClient(timeout=60.0) as client:
+            async with httpx.AsyncClient(timeout=settings.openai_search_timeout_seconds) as client:
                 resp = await client.post(
                     "https://api.openai.com/v1/chat/completions",
                     headers={
@@ -47,7 +56,7 @@ async def llm_search(
                     json={
                         "model": settings.openai_model,
                         "messages": messages,
-                        "max_tokens": 1024,
+                        "max_tokens": 512,
                     },
                 )
                 resp.raise_for_status()
@@ -60,6 +69,7 @@ async def llm_search(
             .get("message", {})
             .get("content", "")
         )
+        answer = _strip_reasoning_tags(answer)
         return {"success": True, "answer": answer}
     except httpx.HTTPStatusError as e:
         logger.error("LLM Search API error: %s", e.response.status_code)

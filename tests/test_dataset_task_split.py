@@ -11,7 +11,7 @@ from scripts.evaluate_engine_datasets import (
     evaluate_router,
     load_jsonl,
 )
-from scripts.split_reasoning_dataset import split_dataset
+from scripts.split_reasoning_dataset import _strip_think, split_dataset
 
 
 def _write_jsonl(path: Path, rows: list[dict]) -> None:
@@ -77,3 +77,24 @@ def test_split_dataset_creates_router_memory_delivery_contract_sets(tmp_path):
     # Original monolithic sample should be flagged as runtime-mismatch training data.
     mismatch = evaluate_reasoning_alignment([sample])
     assert mismatch["runtime_mismatches"]
+
+
+def test_split_dataset_strips_attributed_and_trailing_think_blocks():
+    content = 'Answer. <think data-source="qwen">internal</think>\nNext.<THINK>unfinished'
+
+    assert _strip_think(content) == "Answer. Next."
+
+
+def test_dataset_evaluator_rejects_attributed_think_tags():
+    rows = [
+        {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": '<think data-source="qwen">internal</think>\nfinal',
+                }
+            ]
+        }
+    ]
+
+    assert evaluate_delivery(rows)["violations"]

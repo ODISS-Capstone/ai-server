@@ -1,7 +1,7 @@
 """처방전 OCR 결과 수신 HTTP 엔드포인트.
 
 로컬 에이전트가 처방전 이미지를 OCR 처리한 결과를 서버로 전송할 때 사용.
-OCR_Logging → DB_OCR_History, OCR_DUR_Interaction → T2~T10 → DB_Prescription_Raw_History
+OCR_Logging → DB_OCR_History, OCR_DUR_Interaction → 필요한 DUR만 조회 → DB_Prescription_Raw_History
 """
 import logging
 from typing import Any, Optional
@@ -32,7 +32,7 @@ class OCRResultInput(BaseModel):
         default_factory=list, description="구조화된 약품 목록"
     )
     confidence: float = Field(0.0, description="OCR 신뢰도 (0~1)")
-    speaker_id: Optional[str] = Field(None, description="환자/화자 ID")
+    speaker_id: Optional[str] = Field(None, description="화자/복약 관리 대상자 ID")
 
 
 class OCRProcessedResponse(BaseModel):
@@ -56,16 +56,15 @@ async def receive_ocr_result(payload: OCRResultInput) -> OCRProcessedResponse:
     # OCR_Logging → DB_OCR_History
     await memory_engine.log_ocr_result(ocr_data, payload.confidence)
 
-    # OCR_DUR_Interaction → T2~T10 → DB_Prescription_Raw_History
+    # OCR_DUR_Interaction → 기본 T4 품목 정보만 우선 조회
     dur_results: list[dict[str, Any]] = []
     if payload.medications:
         med_dicts = [m.model_dump() for m in payload.medications]
         dur_results = await check_dur_for_prescription(med_dicts)
 
-        dur_dicts = [r.get("dur", {}) for r in dur_results]
         await memory_engine.sync_ocr_dur(
             ocr_data,
-            dur_dicts,
+            dur_results,
             speaker_id=payload.speaker_id,
         )
 

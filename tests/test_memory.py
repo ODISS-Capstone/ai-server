@@ -10,6 +10,8 @@ if str(PROJECT_ROOT) not in sys.path:
 from app.database.md_store import MDStore
 from app.engines.memory import MemoryEngine
 from app.memory.service import StructuredMemoryService
+from app.schemas.engine_contracts import MemoryEvidenceRequest
+from app.core.config import settings
 
 
 def run(coro):
@@ -143,6 +145,95 @@ def test_memory_engine_syncs_ocr_dur_into_structured_memory(tmp_path):
     assert "structured_memory" in history
     assert history["structured_memory"]["items"]
     assert any("혈압약A" in brief for brief in history["structured_memory"]["briefs"])
+
+
+def test_memory_engine_syncs_ocr_dur_endpoint_rows_without_losing_names(tmp_path):
+    engine = MemoryEngine()
+    engine.store = MDStore(base_path=str(tmp_path / "md_database"))
+    engine.structured_memory = StructuredMemoryService(base_path=str(tmp_path / "structured_memory"))
+
+    run(engine.initialize())
+    run(
+        engine.sync_ocr_dur(
+            {"medications": [{"name": "DrugA"}]},
+            [
+                {
+                    "medication": "DrugA",
+                    "dur": {
+                        "dur_product_info": {"success": True, "items": [{"name": "DrugA"}]},
+                        "combination_contraindication": {"success": True, "items": [{"pair": "DrugB"}]},
+                        "dosage_caution": {"success": True, "items": [{"dose": "high"}]},
+                    },
+                }
+            ],
+            speaker_id="speaker-row",
+        )
+    )
+
+    latest = run(engine.store.read_latest("prescriptions", 1))[0]["content"]
+    structured = (
+        tmp_path
+        / "structured_memory"
+        / "speakers"
+        / "speaker-row"
+        / "current_medication.md"
+    ).read_text(encoding="utf-8")
+
+    assert "DrugA" in latest
+    assert "이름 없음" not in latest
+    assert "DrugA" in structured
+    assert "정보 1건" in structured
+    assert "금기 1건" in structured
+    assert "주의 1건" in structured
+
+
+def test_memory_engine_syncs_legacy_dur_interactions_as_precautions(tmp_path):
+    engine = MemoryEngine()
+    engine.store = MDStore(base_path=str(tmp_path / "md_database"))
+    engine.structured_memory = StructuredMemoryService(base_path=str(tmp_path / "structured_memory"))
+
+    run(engine.initialize())
+    run(
+        engine.sync_ocr_dur(
+            {"medications": [{"name": "DrugA"}]},
+            [
+                {
+                    "name": "DrugA",
+                    "contraindications": ["금기"],
+                    "interactions": ["상호작용"],
+                    "precautions": ["주의"],
+                }
+            ],
+            speaker_id="speaker-legacy-row",
+        )
+    )
+
+    latest = run(engine.store.read_latest("prescriptions", 1))[0]["content"]
+
+    assert "DrugA" in latest
+    assert "금기 1건" in latest
+    assert "주의 2건" in latest
+
+
+def test_memory_evidence_extracts_common_medication_names_without_suffix(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "data_go_kr_service_key", "test-key")
+    engine = MemoryEngine()
+    engine.store = MDStore(base_path=str(tmp_path / "md_database"))
+    engine.structured_memory = StructuredMemoryService(base_path=str(tmp_path / "structured_memory"))
+
+    run(engine.initialize())
+    bundle = run(
+        engine.prepare_evidence_bundle(
+            MemoryEvidenceRequest(
+                query="와파린이랑 아스피린 같이 먹으면 출혈 위험이 있는지 알려줘",
+                speaker_id=None,
+                ocr_payload=None,
+            )
+        )
+    )
+
+    assert set(bundle.normalized_medications) == {"와파린", "아스피린"}
+    assert bundle.dur_searchable is True
 
 
 def test_memory_engine_syncs_flash_profile_into_structured_memory(tmp_path):

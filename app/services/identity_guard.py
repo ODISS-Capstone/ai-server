@@ -39,25 +39,38 @@ async def evaluate_identity_gate(
     current_time = now or datetime.now()
     state = await memory_engine.load_identity_state(speaker_id)
     profile = state.get("profile") or {}
-    identity_extract = await extract_identity_profile_with_llm(current_text=text)
-    identity_update = identity_extract.get("profile") or memory_engine.extract_identity_from_text(text)
+    heuristic_identity = memory_engine.extract_identity_from_text(text)
     pending_action = state.get("pending_identity_action") or ""
+    identity_extract: dict[str, Any] = {
+        "profile": {},
+        "source": "heuristic_fast_path",
+        "raw": "",
+    }
+    if _should_call_identity_extract_llm(
+        text=text,
+        state=state,
+        heuristic_identity=heuristic_identity,
+        pending_action=pending_action,
+    ):
+        identity_extract = await extract_identity_profile_with_llm(current_text=text)
+    llm_identity = identity_extract.get("profile") or {}
+    identity_update = _merge_identity_updates(heuristic_identity, llm_identity)
 
     if not state.get("exists"):
         if _has_identity_core(identity_update):
-            saved = await memory_engine.mark_identity_candidate(
+            saved = await memory_engine.save_identity_profile(
                 speaker_id,
                 identity_update,
-                action="confirm_new_identity",
+                mark_verified=True,
             )
+            await memory_engine.update_flash_profile(speaker_id, saved)
             return IdentityGateResult(
                 allowed=False,
-                reason="confirm_new_identity",
-                response_text=_confirm_new_identity_question(identity_update),
+                reason="identity_registered",
+                response_text=_registration_completed(saved),
                 metadata={
                     "speaker_id": speaker_id,
-                    "profile": profile,
-                    "identity_candidate": identity_update,
+                    "profile": saved,
                     "identity_extract": identity_extract,
                     "saved_state": saved,
                 },
@@ -117,19 +130,19 @@ async def evaluate_identity_gate(
 
     if pending_action == "registration":
         if _has_identity_core(identity_update):
-            saved = await memory_engine.mark_identity_candidate(
+            saved = await memory_engine.save_identity_profile(
                 speaker_id,
                 identity_update,
-                action="confirm_new_identity",
+                mark_verified=True,
             )
+            await memory_engine.update_flash_profile(speaker_id, saved)
             return IdentityGateResult(
                 allowed=False,
-                reason="confirm_new_identity",
-                response_text=_confirm_new_identity_question(identity_update),
+                reason="identity_registered",
+                response_text=_registration_completed(saved),
                 metadata={
                     "speaker_id": speaker_id,
-                    "profile": profile,
-                    "identity_candidate": identity_update,
+                    "profile": saved,
                     "identity_extract": identity_extract,
                     "saved_state": saved,
                 },
@@ -184,19 +197,19 @@ async def evaluate_identity_gate(
 
     if not _has_profile_identity(profile):
         if _has_identity_core(identity_update):
-            saved = await memory_engine.mark_identity_candidate(
+            saved = await memory_engine.save_identity_profile(
                 speaker_id,
                 identity_update,
-                action="confirm_new_identity",
+                mark_verified=True,
             )
+            await memory_engine.update_flash_profile(speaker_id, saved)
             return IdentityGateResult(
                 allowed=False,
-                reason="confirm_new_identity",
-                response_text=_confirm_new_identity_question(identity_update),
+                reason="identity_registered",
+                response_text=_registration_completed(saved),
                 metadata={
                     "speaker_id": speaker_id,
-                    "profile": profile,
-                    "identity_candidate": identity_update,
+                    "profile": saved,
                     "identity_extract": identity_extract,
                     "saved_state": saved,
                 },
@@ -224,13 +237,18 @@ async def evaluate_identity_gate(
             },
         )
 
-    history = await memory_engine.store.read_user_file(speaker_id, "history.md")
-    judge = await judge_identity_conflict(
-        current_text=text,
-        patient_profile=profile,
-        recent_history=history[:1200],
-        current_time=current_time.isoformat(timespec="seconds"),
-    )
+    judge: dict[str, Any] = {
+        "conflict": _heuristic_profile_conflict(identity_update, profile),
+        "source": "heuristic_fast_path",
+    }
+    if not judge["conflict"] and _should_call_identity_conflict_llm(text, identity_update):
+        history = await memory_engine.store.read_user_file(speaker_id, "history.md")
+        judge = await judge_identity_conflict(
+            current_text=text,
+            patient_profile=profile,
+            recent_history=history[:1200],
+            current_time=current_time.isoformat(timespec="seconds"),
+        )
     if judge.get("conflict"):
         if _has_identity_core(identity_update):
             saved = await memory_engine.mark_identity_candidate(
@@ -273,6 +291,91 @@ def _has_identity_core(profile: dict[str, Any]) -> bool:
     return bool(profile.get("name") and (profile.get("age") or profile.get("gender")))
 
 
+def _merge_identity_updates(
+    heuristic_identity: dict[str, Any],
+    llm_identity: dict[str, Any],
+) -> dict[str, Any]:
+    merged = {**heuristic_identity, **{key: value for key, value in llm_identity.items() if value}}
+    conditions: list[Any] = []
+    for source in (heuristic_identity, llm_identity):
+        raw_conditions = source.get("conditions") or []
+        if isinstance(raw_conditions, list):
+            for condition in raw_conditions:
+                if condition and condition not in conditions:
+                    conditions.append(condition)
+    if conditions:
+        merged["conditions"] = conditions
+    return merged
+
+
+def _should_call_identity_extract_llm(
+    *,
+    text: str,
+    state: dict[str, Any],
+    heuristic_identity: dict[str, Any],
+    pending_action: str,
+) -> bool:
+    """Avoid LLM identity extraction on ordinary conversation turns."""
+    if _has_identity_core(heuristic_identity):
+        return False
+    if not _has_identity_text_signal(text):
+        return False
+    if pending_action in {"registration", "confirm_new_identity", "identity_conflict"}:
+        return True
+    if not state.get("exists") or not _has_profile_identity(state.get("profile") or {}):
+        return True
+    return bool(heuristic_identity)
+
+
+def _should_call_identity_conflict_llm(
+    text: str,
+    identity_update: dict[str, Any],
+) -> bool:
+    if identity_update:
+        return True
+    return any(token in text for token in ("보호자", "대신", "아버지", "어머니", "다른 사람"))
+
+
+def _has_identity_text_signal(text: str) -> bool:
+    import re
+
+    return bool(
+        re.search(r"\d{1,3}\s*(?:살|세)", text)
+        or any(
+            token in text
+            for token in (
+                "제 이름",
+                "저는",
+                "나는",
+                "남자",
+                "남성",
+                "여자",
+                "여성",
+                "고혈압",
+                "당뇨",
+                "천식",
+                "신장질환",
+                "간질환",
+                "심장질환",
+            )
+        )
+    )
+
+
+def _heuristic_profile_conflict(
+    identity_update: dict[str, Any],
+    profile: dict[str, Any],
+) -> bool:
+    if not identity_update or not profile:
+        return False
+    for key in ("name", "age", "gender"):
+        incoming = str(identity_update.get(key) or "").strip()
+        existing = str(profile.get(key) or "").strip()
+        if incoming and existing and incoming != existing:
+            return True
+    return False
+
+
 def _parse_datetime(value: Any) -> Optional[datetime]:
     if not value:
         return None
@@ -297,8 +400,8 @@ def _is_affirmative(text: str) -> bool:
 
 def _registration_question() -> str:
     return (
-        "처음 등록하는 분이라 신원 확인이 필요해요. "
-        "성함, 나이, 성별, 그리고 주요 기저질환이 있으면 함께 말씀해 주세요."
+        "안녕하세요. 처음 뵙는 분인 것 같아요. "
+        "복약 안내를 도와드리기 위해 이름, 성별, 나이를 말씀해 주세요."
     )
 
 
@@ -307,7 +410,7 @@ def _confirm_new_identity_question(
     *,
     existing_profile: dict[str, Any] | None = None,
 ) -> str:
-    name = candidate.get("name") or "새 환자"
+    name = candidate.get("name") or "새 대상자"
     details = []
     if candidate.get("age"):
         details.append(f"{candidate['age']}세")
@@ -327,7 +430,7 @@ def _confirm_new_identity_question(
 
 
 def _reverify_question(profile: dict[str, Any], *, conflict: bool) -> str:
-    name = profile.get("name") or "등록된 환자"
+    name = profile.get("name") or "등록된 분"
     if conflict:
         return (
             f"지금 말씀하신 내용이 저장된 {name}님 정보와 조금 달라 보여요. "
@@ -340,10 +443,21 @@ def _reverify_question(profile: dict[str, Any], *, conflict: bool) -> str:
 
 
 def _registration_completed(profile: dict[str, Any]) -> str:
-    name = profile.get("name") or "어르신"
-    return f"{name}님 신원 정보를 등록했어요. 이제 복약 상담을 이어가셔도 됩니다."
+    name = profile.get("name") or "사용자"
+    details = []
+    if profile.get("gender"):
+        details.append(str(profile["gender"]))
+    if profile.get("age"):
+        details.append(f"{profile['age']}세")
+    detail_text = ", ".join(details)
+    if detail_text:
+        return (
+            f"알겠습니다. {name}님, {detail_text}로 기억하겠습니다. "
+            f"앞으로 복약 정보와 상담 내용을 {name}님 기준으로 안내드릴게요."
+        )
+    return f"알겠습니다. {name}님으로 기억하겠습니다. 앞으로 {name}님 기준으로 안내드릴게요."
 
 
 def _reverified_message(profile: dict[str, Any]) -> str:
-    name = profile.get("name") or "어르신"
+    name = profile.get("name") or "사용자"
     return f"{name}님으로 확인했습니다. 이어서 말씀해 주세요."

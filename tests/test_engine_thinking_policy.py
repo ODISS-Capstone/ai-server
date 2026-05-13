@@ -9,6 +9,7 @@ import pytest
 from app.core.config import settings
 from app.engines.llm_judge import LLMJudgeEngine
 from app.services import llm as llm_service
+from app.tools import llm_search
 
 
 class _FakeResponse:
@@ -100,6 +101,16 @@ def test_internal_reasoning_llm_does_not_force_no_think(monkeypatch):
     assert answer == "핵심"
 
 
+def test_reasoning_tag_stripper_removes_embedded_and_trailing_think_blocks():
+    content = 'Visible answer. <think data-source="qwen">late reasoning</think>\nNext sentence.<THINK>unfinished'
+
+    stripped = llm_service._strip_reasoning_tags(content)
+
+    assert stripped == "Visible answer. Next sentence."
+    assert "<think" not in stripped.lower()
+    assert "reasoning" not in stripped
+
+
 def test_judge_llm_does_not_force_no_think(monkeypatch):
     captured: list[dict] = []
 
@@ -120,5 +131,40 @@ def test_judge_llm_does_not_force_no_think(monkeypatch):
 
     assert captured
     assert "chat_template_kwargs" not in captured[0]["json"]
+    assert "temperature" not in captured[0]["json"]
     assert not any(message.startswith("/no_think") for message in _user_messages(captured[0]))
     assert result["verified"] is True
+
+
+def test_external_llm_fallback_does_not_echo_payload(monkeypatch):
+    monkeypatch.setattr(settings, "openai_api_key", None)
+
+    answer = asyncio.run(
+        llm_service.call_external_llm(
+            "SECRET_PATIENT_CONTEXT: user takes aspirin and warfarin",
+        )
+    )
+
+    assert "SECRET_PATIENT_CONTEXT" not in answer
+    assert "aspirin" not in answer
+    assert "warfarin" not in answer
+
+
+def test_llm_search_strips_reasoning_tags_from_answer(monkeypatch):
+    captured: list[dict] = []
+
+    def fake_client(**kwargs):
+        return _FakeAsyncClient(
+            captured=captured,
+            content='<think data-source="search">internal search reasoning</think>\nSearch answer.',
+            **kwargs,
+        )
+
+    monkeypatch.setattr(settings, "openai_api_key", "test-key")
+    monkeypatch.setattr("app.tools.llm_search.httpx.AsyncClient", fake_client)
+
+    result = asyncio.run(llm_search.llm_search("search query"))
+
+    assert result["success"] is True
+    assert result["answer"] == "Search answer."
+    assert "think" not in result["answer"].lower()

@@ -26,7 +26,7 @@ def build_memory_policy(memory_dir: Path) -> str:
             "",
             "## 저장 구조",
             "- global/: 전역 메모리. 공통 매뉴얼, 공통 참고 정보, 서버 전체에 적용되는 요구사항을 저장합니다.",
-            "- speakers/{speaker_id}/: 화자별 메모리. 환자 프로필, 복약 맥락, 개인별 DUR 참고사항을 저장합니다.",
+            "- speakers/{speaker_id}/: 화자별 메모리. 사용자/복약 관리 대상자 프로필, 복약 맥락, 개인별 DUR 참고사항을 저장합니다.",
             "- 각 디렉터리는 MEMORY.md 인덱스와 topic .md 파일을 함께 가집니다.",
             "",
             "## topic 파일 형식",
@@ -37,6 +37,6 @@ def build_memory_policy(memory_dir: Path) -> str:
             "## 조회 규칙",
             "- MEMORY.md는 항상 먼저 읽는 인덱스입니다.",
             "- 질의와 명확히 관련 있는 topic 파일만 relevant memory로 본문을 불러옵니다.",
-            "- 오래된 메모리는 당시의 스냅샷으로 보고 최신 OCR, DUR, 환자 확인으로 재검증합니다.",
+            "- 오래된 메모리는 당시의 스냅샷으로 보고 최신 OCR, DUR, 신원 확인으로 재검증합니다.",
         ]
     )

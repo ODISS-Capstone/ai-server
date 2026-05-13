@@ -10,7 +10,7 @@ def test_root():
     r = client.get("/")
     assert r.status_code == 200
     data = r.json()
-    assert data.get("service") == "ODISS — 시니어 복약지도 AI 서버엔진"
+    assert data.get("service") == "ODISS — 만성질환 복약관리 AI 서버엔진"
     assert data.get("docs") == "/docs"
     assert data.get("health") == "/health"
 
@@ -18,4 +18,6 @@ def test_root():
 def test_health():
     r = client.get("/health")
     assert r.status_code == 200
-    assert r.json().get("status") == "ok"
+    data = r.json()
+    assert data.get("status") == "ok"
+    assert data.get("service") == "odiss-medication-guidance"

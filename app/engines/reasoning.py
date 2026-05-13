@@ -6,6 +6,8 @@ server.mermaid 매핑:
   RE_Core_Msg          → synthesize_core_message()
 """
 import logging
+import asyncio
+import re
 from typing import Any, Optional
 
 from app.engines.memory import MemoryEngine
@@ -16,6 +18,7 @@ from app.schemas.engine_contracts import (
     ReasoningRouteInput,
     ReasoningTask,
 )
+from app.services.patient_safety import classify_patient_safety_situation
 from app.tools import dur_api, hira_api, health_supplement, llm_search
 
 logger = logging.getLogger(__name__)
@@ -32,16 +35,32 @@ class IntentType:
 
 
 MEDICATION_KEYWORDS = [
-    "약", "복용", "먹어도", "드셔도", "먹고", "처방", "부작용",
+    "약", "복용", "먹어도", "먹으면", "같이 먹", "드셔도", "먹고", "처방", "부작용",
     "금기", "주의", "효과", "효능", "용량", "언제",
+    "와파린", "아스피린", "혈압약", "당뇨약", "인슐린",
 ]
 SUPPLEMENT_KEYWORDS = [
     "비타민", "영양제", "건기식", "건강식품", "유산균", "오메가",
     "칼슘", "철분", "홍삼", "녹용",
 ]
 EMERGENCY_KEYWORDS = [
-    "쓰러", "의식", "호흡", "출혈", "경련", "응급", "119",
-    "심장", "뇌졸중", "마비",
+    "쓰러",
+    "의식이 없",
+    "의식 저하",
+    "의식을 잃",
+    "호흡곤란",
+    "호흡 곤란",
+    "숨이 차",
+    "숨쉬기 힘",
+    "피가 멈추지",
+    "심한 출혈",
+    "경련",
+    "응급",
+    "119",
+    "가슴 통증",
+    "흉통",
+    "뇌졸중",
+    "마비",
 ]
 DRUG_ID_KEYWORDS = ["알약", "낱알", "이거 뭐", "무슨 약", "약 이름"]
 PROFILE_OR_MEMORY_KEYWORDS = [
@@ -53,6 +72,15 @@ DIRECT_MEDICAL_QUERY_KEYWORDS = [
     "효과", "용량", "dur", "복용지도", "복용 계획",
 ]
 MEMORY_RECALL_KEYWORDS = ["아까", "이전", "어제", "다시 말", "뭐였", "읽힌"]
+COMMON_MEDICATION_NAMES = [
+    "와파린",
+    "아스피린",
+    "로사르탄",
+    "오메프라졸",
+    "인슐린",
+    "메트포르민",
+    "암로디핀",
+]
 
 
 class ReasoningEngine:
@@ -70,6 +98,10 @@ class ReasoningEngine:
 
     def classify_intent(self, text: str) -> str:
         text_lower = text.lower().strip()
+
+        safety = classify_patient_safety_situation(text)
+        if safety:
+            return IntentType.EMERGENCY if safety.severity == "emergency" else IntentType.MEDICATION_QUERY
 
         if any(kw in text_lower for kw in EMERGENCY_KEYWORDS):
             return IntentType.EMERGENCY
@@ -139,7 +171,7 @@ class ReasoningEngine:
             tasks.append({
                 "type": "dur_check",
                 "priority": 2,
-                "description": "DUR 일괄 조회 (T2~T10)",
+                "description": "질문 의도에 맞는 DUR 항목 선택 조회",
             })
             tasks.append({
                 "type": "llm_judge_verify",
@@ -187,6 +219,14 @@ class ReasoningEngine:
             )
 
         intent = self.classify_intent(text)
+        safety = classify_patient_safety_situation(text)
+        if safety and safety.severity != "emergency":
+            return ReasoningRouteDecision(
+                mode=ReasoningMode.MEMORY_ONLY,
+                intent=IntentType.MEDICATION_QUERY,
+                rationale=f"deterministic_patient_safety:{safety.key}",
+                tasks=[],
+            )
         if "ocr" in text.lower() and any(token in text for token in ("결과", "나왔")):
             return ReasoningRouteDecision(
                 mode=ReasoningMode.TOOL_FIRST,
@@ -329,41 +369,52 @@ class ReasoningEngine:
 
                 elif task_type == "dur_check":
                     drug_names = self._extract_drug_names(text, context)
-                    dur_results: dict[str, Any] = {}
-                    for name in drug_names:
-                        dur_results[name] = await dur_api.check_all_dur(name)
+                    endpoint_keys = self._select_dur_endpoint_keys(
+                        text=text,
+                        context=context,
+                        medication_count=len(drug_names),
+                    )
+                    rows = await dur_api.check_dur_for_prescription(
+                        [{"name": name} for name in drug_names],
+                        endpoint_keys=endpoint_keys,
+                    )
+                    dur_results = {
+                        row["medication"]: row.get("dur", {})
+                        for row in rows
+                    }
                     results["task_results"]["dur"] = dur_results
+                    results["task_results"]["dur_endpoint_keys"] = endpoint_keys
 
                 elif task_type == "dur_product_info":
                     drug_names = self._extract_drug_names(text, context)
-                    dur_results = {}
-                    for name in drug_names:
-                        dur_results[name] = {
-                            "dur_product_info": await dur_api.call_dur_api(
-                                "dur_product_info",
-                                item_name=name,
-                            )
-                        }
+                    rows = await dur_api.check_dur_for_prescription(
+                        [{"name": name} for name in drug_names],
+                        endpoint_keys=("dur_product_info",),
+                    )
+                    dur_results = {
+                        row["medication"]: row.get("dur", {})
+                        for row in rows
+                    }
                     results["task_results"]["dur"] = dur_results
+                    results["task_results"]["dur_endpoint_keys"] = ["dur_product_info"]
 
                 elif task_type == "hira_lookup":
                     drug_names = self._extract_drug_names(text, context)
-                    hira_results = {}
-                    for name in drug_names:
-                        hira_results[name] = await hira_api.identify_medicine(
-                            item_name=name
-                        )
+                    hira_rows = await asyncio.gather(
+                        *(hira_api.identify_medicine(item_name=name) for name in drug_names)
+                    )
+                    hira_results = dict(zip(drug_names, hira_rows))
                     results["task_results"]["hira"] = hira_results
 
                 elif task_type == "supplement_lookup":
                     supplement_names = self._extract_supplement_names(text)
-                    supp_results = {}
-                    for name in supplement_names:
-                        supp_results[name] = (
-                            await health_supplement.get_supplement_detail(
-                                product_name=name
-                            )
+                    supplement_rows = await asyncio.gather(
+                        *(
+                            health_supplement.get_supplement_detail(product_name=name)
+                            for name in supplement_names
                         )
+                    )
+                    supp_results = dict(zip(supplement_names, supplement_rows))
                     results["task_results"]["supplements"] = supp_results
 
                 elif task_type == "llm_judge_verify":
@@ -395,7 +446,7 @@ class ReasoningEngine:
             return (
                 "긴급 상황이 감지되었습니다. "
                 "즉시 119에 전화하시거나 가까운 응급실을 방문해 주세요. "
-                "환자의 상태를 주시하면서 도움을 기다려 주세요."
+                "상태를 계속 살피면서 도움을 기다려 주세요."
             )
 
         parts: list[str] = []
@@ -452,7 +503,11 @@ class ReasoningEngine:
         """로컬 에이전트에 처방전 OCR 촬영 요청."""
         return {
             "action": "request_ocr",
-            "message": "처방전 또는 약 사진을 찍어주세요.",
+            "message": (
+                "알겠습니다. 카메라 앞으로 약봉투를 잘 보이게 보여주세요. "
+                "글자가 흔들리지 않도록 잠시만 멈춰주세요. "
+                "5, 4, 3, 2, 1. 촬영하겠습니다."
+            ),
         }
 
     # ── 내부 유틸 ──
@@ -471,15 +526,21 @@ class ReasoningEngine:
                     if name and len(name) > 1:
                         names.append(name)
 
-        words = text.split()
-        for word in words:
-            if (
-                len(word) > 2
-                and ("정" in word or "캡슐" in word or "시럽" in word)
-            ):
-                names.append(word)
+        names.extend(
+            match.group(1)
+            for match in re.finditer(r"([가-힣A-Za-z0-9]+(?:장용정|정|캡슐|시럽))", text)
+        )
+        for known_name in COMMON_MEDICATION_NAMES:
+            if known_name in text:
+                names.append(known_name)
 
-        return names[:5] if names else [text[:20]]
+        unique: list[str] = []
+        for name in names:
+            cleaned = name.strip(".,!?()[]{}")
+            if cleaned and cleaned not in unique:
+                unique.append(cleaned)
+
+        return unique[:5] if unique else [text[:20]]
 
     def _extract_supplement_names(self, text: str) -> list[str]:
         names: list[str] = []
@@ -526,6 +587,30 @@ class ReasoningEngine:
             return f"{drug_name} DUR 확인 결과: " + "; ".join(summaries)
         return ""
 
+    def _select_dur_endpoint_keys(
+        self,
+        *,
+        text: str,
+        context: dict,
+        medication_count: int,
+    ) -> list[str]:
+        profile = context.get("user_profile") if isinstance(context, dict) else {}
+        age = self._profile_age(profile or {})
+        return dur_api.select_dur_endpoint_keys(
+            query_text=text,
+            patient_age=age,
+            medication_count=medication_count,
+            default_to_basic=True,
+        )
+
+    @staticmethod
+    def _profile_age(profile: dict[str, Any]) -> Optional[int]:
+        raw = str(profile.get("age") or "").strip()
+        if not raw:
+            return None
+        match = re.search(r"\d{1,3}", raw)
+        return int(match.group(0)) if match else None
+
     def _contains_medication_signal(self, text_lower: str) -> bool:
         if self._is_nonmedical_smalltalk_request(text_lower):
             return False
@@ -557,15 +642,17 @@ class ReasoningEngine:
         )
 
     def _is_medication_record_request(self, text_lower: str) -> bool:
+        if any(token in text_lower for token in ("먹었어", "먹었어요", "먹었습니다", "복용했어", "복용했어요")):
+            return "약" in text_lower or len(text_lower.strip()) <= 8
         return (
             "기록" in text_lower
             and any(token in text_lower for token in ("복용", "먹었다", "먹었다고", "드셨"))
-            and any(token in text_lower for token in ("정", "캡슐", "시럽"))
+            and any(token in text_lower for token in ("약", "정", "캡슐", "시럽"))
         )
 
     def _is_missing_ocr_image_request(self, text_lower: str) -> bool:
         return (
-            ("처방전" in text_lower or "사진" in text_lower)
-            and any(token in text_lower for token in ("읽어서", "읽어", "ocr"))
+            any(token in text_lower for token in ("처방전", "약봉투", "약 사진", "약사진", "사진", "ocr"))
+            and any(token in text_lower for token in ("읽어서", "읽어", "ocr", "찍", "촬영", "보여"))
             and not any(token in text_lower for token in ("결과", "나왔", "인식"))
         )
