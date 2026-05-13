@@ -103,6 +103,15 @@ def test_engine_orchestrator_runs_in_contract_order(monkeypatch):
     result = run(orchestrator.run_turn(text="질문", speaker_id="spk-1"))
 
     assert result.conversation.response_text.startswith("[delivery][judge]핵심")
+    assert [event.stage for event in result.engine_trace[:6]] == [
+        "ME_Initialize",
+        "CE_Input",
+        "CE_Latency",
+        "ME_Context",
+        "RE_Intent",
+        "ME_RAG",
+    ]
+    assert any(event.logical_file == "Patient.md" for event in result.memory_trace)
     assert calls == [
         "memory.initialize",
         "conversation.receive_input",

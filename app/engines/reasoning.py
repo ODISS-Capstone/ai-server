@@ -44,6 +44,15 @@ EMERGENCY_KEYWORDS = [
     "심장", "뇌졸중", "마비",
 ]
 DRUG_ID_KEYWORDS = ["알약", "낱알", "이거 뭐", "무슨 약", "약 이름"]
+PROFILE_OR_MEMORY_KEYWORDS = [
+    "제 이름", "저는", "처음 왔", "기억해", "기억하고", "생활습관",
+    "산책", "안부", "격려",
+]
+DIRECT_MEDICAL_QUERY_KEYWORDS = [
+    "먹어도", "같이 먹", "드셔도", "부작용", "금기", "주의", "효능",
+    "효과", "용량", "dur", "복용지도", "복용 계획",
+]
+MEMORY_RECALL_KEYWORDS = ["아까", "이전", "어제", "다시 말", "뭐였", "읽힌"]
 
 
 class ReasoningEngine:
@@ -64,6 +73,25 @@ class ReasoningEngine:
 
         if any(kw in text_lower for kw in EMERGENCY_KEYWORDS):
             return IntentType.EMERGENCY
+
+        if self._is_missing_ocr_image_request(text_lower):
+            return IntentType.MEDICATION_QUERY
+
+        if self._is_nonmedical_smalltalk_request(text_lower):
+            return IntentType.SMALLTALK
+
+        if self._is_medication_record_request(text_lower):
+            return IntentType.MEDICATION_QUERY
+
+        if self._is_memory_recall_query(text_lower) and self._contains_medication_signal(text_lower):
+            if any(kw in text_lower for kw in ("사진", "읽힌", "약 이름")):
+                return IntentType.MEDICATION_QUERY
+            if "약" in text_lower:
+                return IntentType.MEDICATION_QUERY
+            return IntentType.SMALLTALK
+
+        if self._is_profile_or_lifestyle_context(text_lower):
+            return IntentType.SMALLTALK
 
         if any(kw in text_lower for kw in DRUG_ID_KEYWORDS):
             return IntentType.DRUG_IDENTIFICATION
@@ -159,6 +187,36 @@ class ReasoningEngine:
             )
 
         intent = self.classify_intent(text)
+        if "ocr" in text.lower() and any(token in text for token in ("결과", "나왔")):
+            return ReasoningRouteDecision(
+                mode=ReasoningMode.TOOL_FIRST,
+                intent=IntentType.MEDICATION_QUERY,
+                rationale="ocr_result_requires_prescription_logging",
+                tasks=[
+                    ReasoningTask(
+                        type="dur_product_info",
+                        priority=1,
+                        description="OCR 약물 DUR 품목정보 확인",
+                    )
+                ],
+            )
+        if (
+            intent in {IntentType.MEDICATION_QUERY, IntentType.DRUG_IDENTIFICATION}
+            and self._is_memory_recall_query(text.lower())
+            and not any(kw in text.lower() for kw in DIRECT_MEDICAL_QUERY_KEYWORDS)
+            and (
+                str(context.get("prescription_log", "")).strip()
+                or str(context.get("context_memory", "")).strip()
+                or context.get("memory_prompt")
+            )
+        ):
+            return ReasoningRouteDecision(
+                mode=ReasoningMode.MEMORY_ONLY,
+                intent=IntentType.MEDICATION_QUERY,
+                rationale="medication_memory_recall_available",
+                tasks=[],
+            )
+
         if route_input.is_smalltalk and intent == IntentType.SMALLTALK:
             return ReasoningRouteDecision(
                 mode=ReasoningMode.MEMORY_ONLY,
@@ -169,7 +227,7 @@ class ReasoningEngine:
 
         if intent == IntentType.EMERGENCY:
             return ReasoningRouteDecision(
-                mode=ReasoningMode.TOOL_FIRST,
+                mode=ReasoningMode.FRONTIER_FIRST,
                 intent=intent,
                 rationale="emergency_policy_first",
                 tasks=[
@@ -181,7 +239,29 @@ class ReasoningEngine:
                 ],
             )
 
+        lowered = text.lower()
+        if self._is_missing_ocr_image_request(lowered):
+            return ReasoningRouteDecision(
+                mode=ReasoningMode.ASK_USER_CLARIFY,
+                intent=IntentType.MEDICATION_QUERY,
+                rationale="ocr_requested_without_image",
+                tasks=[],
+            )
+
+        if self._is_medication_record_request(lowered):
+            return ReasoningRouteDecision(
+                mode=ReasoningMode.MEMORY_ONLY,
+                intent=IntentType.MEDICATION_QUERY,
+                rationale="medication_record_memory_write",
+                tasks=[],
+            )
+
         planned = self.plan_tasks(intent, context)
+        if intent == IntentType.MEDICATION_QUERY and any(kw in lowered for kw in SUPPLEMENT_KEYWORDS):
+            planned = [
+                {"type": "supplement_lookup", "priority": 1, "description": "건강기능식품 조회 (T11, T12)"},
+                {"type": "search_history", "priority": 2, "description": "관련 이력 검색"},
+            ]
         if planned:
             return ReasoningRouteDecision(
                 mode=ReasoningMode.TOOL_FIRST,
@@ -252,6 +332,18 @@ class ReasoningEngine:
                     dur_results: dict[str, Any] = {}
                     for name in drug_names:
                         dur_results[name] = await dur_api.check_all_dur(name)
+                    results["task_results"]["dur"] = dur_results
+
+                elif task_type == "dur_product_info":
+                    drug_names = self._extract_drug_names(text, context)
+                    dur_results = {}
+                    for name in drug_names:
+                        dur_results[name] = {
+                            "dur_product_info": await dur_api.call_dur_api(
+                                "dur_product_info",
+                                item_name=name,
+                            )
+                        }
                     results["task_results"]["dur"] = dur_results
 
                 elif task_type == "hira_lookup":
@@ -435,8 +527,45 @@ class ReasoningEngine:
         return ""
 
     def _contains_medication_signal(self, text_lower: str) -> bool:
+        if self._is_nonmedical_smalltalk_request(text_lower):
+            return False
         if any(kw in text_lower for kw in MEDICATION_KEYWORDS if kw != "약"):
             return True
         # Prevent false positives like "요약" while keeping short utterances such as
         # "약 맞나요?" as medication queries.
         return "약" in text_lower and "요약" not in text_lower
+
+    def _is_profile_or_lifestyle_context(self, text_lower: str) -> bool:
+        if not any(kw in text_lower for kw in PROFILE_OR_MEMORY_KEYWORDS):
+            return False
+        return not any(kw in text_lower for kw in DIRECT_MEDICAL_QUERY_KEYWORDS)
+
+    def _is_memory_recall_query(self, text_lower: str) -> bool:
+        return any(kw in text_lower for kw in MEMORY_RECALL_KEYWORDS)
+
+    def _is_nonmedical_smalltalk_request(self, text_lower: str) -> bool:
+        return any(
+            phrase in text_lower
+            for phrase in (
+                "약 얘기 말고",
+                "약 이야기 말고",
+                "긴 설명 말고",
+                "짧게 응원",
+                "안부만",
+                "그냥 인사",
+            )
+        )
+
+    def _is_medication_record_request(self, text_lower: str) -> bool:
+        return (
+            "기록" in text_lower
+            and any(token in text_lower for token in ("복용", "먹었다", "먹었다고", "드셨"))
+            and any(token in text_lower for token in ("정", "캡슐", "시럽"))
+        )
+
+    def _is_missing_ocr_image_request(self, text_lower: str) -> bool:
+        return (
+            ("처방전" in text_lower or "사진" in text_lower)
+            and any(token in text_lower for token in ("읽어서", "읽어", "ocr"))
+            and not any(token in text_lower for token in ("결과", "나왔", "인식"))
+        )

@@ -137,6 +137,37 @@ class ConversationComposeResponse(BaseModel):
     requires_tts: bool = Field(True, description="Whether TTS playback is needed")
 
 
+class EngineTraceEvent(BaseModel):
+    """Structured engine-stage call trace event."""
+
+    stage: str = Field(..., description="Scenario-facing stage name such as CE_Input")
+    component: str = Field(..., description="Owning component")
+    action: str = Field(..., description="Concrete action or method")
+    status: str = Field("observed", description="observed/skipped/error")
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class MemoryTraceEvent(BaseModel):
+    """Structured memory read/write trace event."""
+
+    operation: str = Field(..., description="read/write/search/update")
+    logical_file: str = Field(..., description="Scenario-facing logical file name")
+    category: str = Field("", description="MD store category or flash key")
+    path: Optional[str] = Field(None, description="Concrete path when known")
+    status: str = Field("observed", description="observed/skipped/error")
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ToolTraceEvent(BaseModel):
+    """Structured external/deterministic tool call trace event."""
+
+    tool_id: str = Field(..., description="Scenario-facing tool id such as T2")
+    tool_name: str = Field(..., description="Concrete task/tool name")
+    external_api: Optional[str] = Field(None, description="External API family")
+    status: str = Field("observed", description="observed/skipped/error")
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
 class EnginePipelineResult(BaseModel):
     """Unified per-turn trace used by WS/HTTP orchestrators."""
 
@@ -151,3 +182,6 @@ class EnginePipelineResult(BaseModel):
     reviewed_message: str = ""
     delivery_message: str = ""
     conversation: ConversationComposeResponse
+    engine_trace: list[EngineTraceEvent] = Field(default_factory=list)
+    memory_trace: list[MemoryTraceEvent] = Field(default_factory=list)
+    tool_trace: list[ToolTraceEvent] = Field(default_factory=list)

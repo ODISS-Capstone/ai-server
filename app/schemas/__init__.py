@@ -3,7 +3,9 @@
 from app.schemas.engine_contracts import (
     ConversationComposeRequest,
     ConversationComposeResponse,
+    EngineTraceEvent,
     EnginePipelineResult,
+    MemoryTraceEvent,
     MemoryArtifactRef,
     MemoryEvidenceBundle,
     MemoryEvidenceRequest,
@@ -11,6 +13,7 @@ from app.schemas.engine_contracts import (
     ReasoningRouteDecision,
     ReasoningRouteInput,
     ReasoningTask,
+    ToolTraceEvent,
 )
 
 __all__ = [
@@ -23,5 +26,8 @@ __all__ = [
     "MemoryEvidenceBundle",
     "ConversationComposeRequest",
     "ConversationComposeResponse",
+    "EngineTraceEvent",
+    "MemoryTraceEvent",
+    "ToolTraceEvent",
     "EnginePipelineResult",
 ]

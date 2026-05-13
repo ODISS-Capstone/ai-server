@@ -209,14 +209,119 @@ async def call_local_delivery_llm(
         user_profile=json.dumps(user_profile or {}, ensure_ascii=False),
         conversation_context=conversation_context or "(없음)",
     )
-
     answer = await _post_chat_once(
         url,
         key,
         messages,
         model=model or settings.internal_llm_model,
+        chat_template_kwargs={"enable_thinking": False},
     )
     return ensure_disclaimer(answer or source)
+
+
+async def judge_identity_conflict(
+    *,
+    current_text: str,
+    patient_profile: dict[str, Any],
+    recent_history: str = "",
+    current_time: Optional[str] = None,
+    api_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    model: Optional[str] = None,
+) -> dict[str, Any]:
+    """Use the internal LLM to decide whether a speaker conflicts with profile."""
+    url = api_url or settings.internal_llm_api_url
+    key = api_key if api_key is not None else settings.internal_llm_api_key
+    fallback = _heuristic_identity_conflict(current_text, patient_profile)
+    if not url:
+        return {
+            "conflict": fallback,
+            "source": "heuristic_no_internal_llm",
+            "raw": "",
+        }
+
+    messages = get_prompt_registry().render_messages(
+        "identity_conflict_judge",
+        current_time=current_time or "",
+        patient_profile=json.dumps(patient_profile or {}, ensure_ascii=False),
+        recent_history=recent_history[:1200] or "(없음)",
+        current_text=current_text or "",
+    )
+
+    try:
+        answer = await _post_chat_once(
+            url,
+            key,
+            messages,
+            model=model or settings.internal_llm_model,
+            max_tokens=32,
+        )
+    except Exception as exc:  # noqa: BLE001 - identity gate should not block on LLM outage
+        logger.warning("[IdentityJudge] internal_llm_failed fallback=%s error=%s", fallback, exc)
+        return {
+            "conflict": fallback,
+            "source": "heuristic_after_internal_llm_error",
+            "raw": repr(exc),
+        }
+
+    parsed = _parse_identity_judge_answer(answer)
+    if parsed is None:
+        parsed = fallback
+    return {
+        "conflict": parsed,
+        "source": "internal_qwen",
+        "raw": answer[:200],
+        "heuristic_conflict": fallback,
+    }
+
+
+async def extract_identity_profile_with_llm(
+    *,
+    current_text: str,
+    api_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    model: Optional[str] = None,
+) -> dict[str, Any]:
+    """Extract patient identity fields from the current utterance using Qwen."""
+    fallback = _heuristic_identity_extract(current_text)
+    url = api_url or settings.internal_llm_api_url
+    key = api_key if api_key is not None else settings.internal_llm_api_key
+    if not url:
+        return {
+            "profile": fallback,
+            "source": "heuristic_no_internal_llm",
+            "raw": "",
+        }
+
+    messages = get_prompt_registry().render_messages(
+        "identity_profile_extract",
+        current_text=current_text or "",
+    )
+    try:
+        answer = await _post_chat_once(
+            url,
+            key,
+            messages,
+            model=model or settings.internal_llm_model,
+            max_tokens=160,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[IdentityExtract] internal_llm_failed fallback=%s error=%s", fallback, exc)
+        return {
+            "profile": fallback,
+            "source": "heuristic_after_internal_llm_error",
+            "raw": repr(exc),
+        }
+
+    parsed = _parse_identity_profile_answer(answer)
+    if not parsed:
+        parsed = fallback
+    return {
+        "profile": parsed,
+        "source": "internal_qwen",
+        "raw": answer[:300],
+        "heuristic_profile": fallback,
+    }
 
 
 async def call_external_llm(
@@ -355,6 +460,113 @@ def _safe_internal_fallback(query_text: str, llm_doc: str) -> str:
     )
 
 
+def _parse_identity_judge_answer(answer: str) -> Optional[bool]:
+    stripped = (answer or "").strip()
+    if not stripped:
+        return None
+    try:
+        payload = json.loads(stripped)
+        if isinstance(payload, dict) and isinstance(payload.get("conflict"), bool):
+            return payload["conflict"]
+    except json.JSONDecodeError:
+        pass
+    first = next((line.strip().upper() for line in stripped.splitlines() if line.strip()), "")
+    if first.startswith("TRUE"):
+        return True
+    if first.startswith("FALSE"):
+        return False
+    if "TRUE" in first and "FALSE" not in first:
+        return True
+    if "FALSE" in first and "TRUE" not in first:
+        return False
+    return None
+
+
+def _parse_identity_profile_answer(answer: str) -> dict[str, Any]:
+    raw = (answer or "").strip()
+    if not raw:
+        return {}
+    match = None
+    if "{" in raw and "}" in raw:
+        match = raw[raw.find("{"): raw.rfind("}") + 1]
+    try:
+        payload = json.loads(match or raw)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    profile: dict[str, Any] = {}
+    name = str(payload.get("name") or "").strip()
+    age = str(payload.get("age") or "").strip()
+    gender = str(payload.get("gender") or "").strip()
+    conditions = payload.get("conditions") or []
+    if name:
+        profile["name"] = name
+    if age:
+        profile["age"] = age
+    if gender:
+        profile["gender"] = gender
+    if isinstance(conditions, list):
+        normalized_conditions = [str(item).strip() for item in conditions if str(item).strip()]
+        if normalized_conditions:
+            profile["conditions"] = normalized_conditions
+    return profile
+
+
+def _heuristic_identity_extract(text: str) -> dict[str, Any]:
+    profile: dict[str, Any] = {}
+    if not text:
+        return profile
+    import re
+
+    name_match = re.search(
+        r"(?:제\s*이름은|저는|나는)\s*([가-힣]{2,5}?)(?:이고|고|입니다|이에요|예요|,|\s|$)",
+        text,
+    )
+    if name_match:
+        profile["name"] = name_match.group(1)
+    age_match = re.search(r"(\d{1,3})\s*(?:살|세)", text)
+    if age_match:
+        profile["age"] = age_match.group(1)
+    if "남자" in text or "남성" in text:
+        profile["gender"] = "남성"
+    elif "여자" in text or "여성" in text:
+        profile["gender"] = "여성"
+    conditions = [
+        token
+        for token in ("고혈압", "당뇨", "천식", "신장질환", "간질환", "심장질환")
+        if token in text
+    ]
+    if conditions:
+        profile["conditions"] = conditions
+    return profile
+
+
+def _heuristic_identity_conflict(text: str, profile: dict[str, Any]) -> bool:
+    """Conservative fallback used only when the internal LLM is unavailable."""
+    if not text or not profile:
+        return False
+    name = str(profile.get("name") or "").strip()
+    age = str(profile.get("age") or "").strip()
+    gender = str(profile.get("gender") or "").strip()
+    if name and name in text:
+        return False
+    if age and (f"{age}살" in text or f"{age}세" in text):
+        return False
+    if gender and gender in text:
+        return False
+    if name and any(marker in text for marker in ("제 이름은", "저는", "나는")):
+        if name not in text:
+            return True
+    if age and ("살" in text or "세" in text) and f"{age}살" not in text and f"{age}세" not in text:
+        return True
+    if gender == "남성" and any(token in text for token in ("여자", "여성")):
+        return True
+    if gender == "여성" and any(token in text for token in ("남자", "남성")):
+        return True
+    return False
+
+
 def _json_headers(api_key: Optional[str]) -> dict[str, str]:
     headers = {"Content-Type": "application/json"}
     if api_key:
@@ -378,6 +590,7 @@ async def _post_chat_once(
     *,
     model: str = "qwen",
     max_tokens: int = 512,
+    chat_template_kwargs: Optional[dict[str, Any]] = None,
 ) -> str:
     async def post_internal() -> str:
         started = perf_counter()
@@ -389,14 +602,17 @@ async def _post_chat_once(
             max_tokens,
         )
         async with httpx.AsyncClient(timeout=60.0) as client:
+            payload: dict[str, Any] = {
+                "model": model,
+                "messages": messages,
+                "max_tokens": max_tokens,
+            }
+            if chat_template_kwargs:
+                payload["chat_template_kwargs"] = chat_template_kwargs
             r = await client.post(
                 url,
                 headers=_json_headers(key),
-                json={
-                    "model": model,
-                    "messages": messages,
-                    "max_tokens": max_tokens,
-                },
+                json=payload,
             )
             r.raise_for_status()
             data = r.json()

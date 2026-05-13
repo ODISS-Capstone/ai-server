@@ -14,7 +14,7 @@ server.mermaid 매핑:
 import json
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 from app.core.config import settings
@@ -149,6 +149,127 @@ class MemoryEngine:
         )
         context.update(structured_context)
         return context
+
+    async def load_identity_state(self, speaker_id: str) -> dict[str, Any]:
+        """Load patient identity metadata used before multi-speaker turns."""
+        exists = await self.store.user_exists(speaker_id)
+        if not exists:
+            await self._register_new_user(speaker_id)
+        profile_md = await self.store.read_user_file(speaker_id, "profile.md")
+        profile = self._parse_profile(profile_md)
+        return {
+            "speaker_id": speaker_id,
+            "exists": exists,
+            "profile": profile,
+            "profile_text": profile_md,
+            "pending_identity_action": profile.get("pending_identity_action", ""),
+            "pending_identity_candidate": profile.get("pending_identity_candidate", {}),
+            "last_seen_at": profile.get("last_seen_at", ""),
+            "verified_at": profile.get("verified_at", ""),
+        }
+
+    async def save_identity_profile(
+        self,
+        speaker_id: str,
+        profile_update: dict[str, Any],
+        *,
+        pending_identity_action: str = "",
+        mark_verified: bool = False,
+        mark_seen: bool = True,
+        now: Optional[datetime] = None,
+    ) -> dict[str, Any]:
+        """Merge identity fields into the patient profile markdown."""
+        current = self._parse_profile(await self.store.read_user_file(speaker_id, "profile.md"))
+        merged = {**current, **{key: value for key, value in profile_update.items() if value}}
+        timestamp = (now or datetime.now()).isoformat(timespec="seconds")
+        if mark_seen:
+            merged["last_seen_at"] = timestamp
+        if mark_verified:
+            merged["verified_at"] = timestamp
+        merged["pending_identity_action"] = pending_identity_action
+        if "pending_identity_candidate" in profile_update:
+            merged["pending_identity_candidate"] = profile_update["pending_identity_candidate"]
+        elif not pending_identity_action:
+            merged.pop("pending_identity_candidate", None)
+        content = self._format_profile_markdown(speaker_id, merged, registered_at=timestamp)
+        await self.store.save_user_file(speaker_id, "profile.md", content)
+        await self.structured_memory.sync_patient_profile(
+            speaker_id,
+            {
+                "name": merged.get("name", ""),
+                "age": merged.get("age", ""),
+                "gender": merged.get("gender", ""),
+                "conditions": self._normalize_conditions(merged.get("conditions")),
+            },
+        )
+        return merged
+
+    async def mark_identity_pending(self, speaker_id: str, action: str) -> dict[str, Any]:
+        return await self.save_identity_profile(
+            speaker_id,
+            {},
+            pending_identity_action=action,
+            mark_seen=False,
+        )
+
+    async def mark_identity_candidate(
+        self,
+        speaker_id: str,
+        candidate: dict[str, Any],
+        *,
+        action: str = "confirm_new_identity",
+    ) -> dict[str, Any]:
+        return await self.save_identity_profile(
+            speaker_id,
+            {"pending_identity_candidate": candidate},
+            pending_identity_action=action,
+            mark_seen=False,
+        )
+
+    async def confirm_identity_candidate(self, speaker_id: str) -> dict[str, Any]:
+        state = await self.load_identity_state(speaker_id)
+        candidate = state.get("pending_identity_candidate") or {}
+        if not isinstance(candidate, dict):
+            candidate = {}
+        return await self.save_identity_profile(
+            speaker_id,
+            candidate,
+            pending_identity_action="",
+            mark_verified=True,
+        )
+
+    async def mark_identity_seen(
+        self,
+        speaker_id: str,
+        *,
+        verified: bool = False,
+        now: Optional[datetime] = None,
+    ) -> dict[str, Any]:
+        return await self.save_identity_profile(
+            speaker_id,
+            {},
+            pending_identity_action="",
+            mark_verified=verified,
+            mark_seen=True,
+            now=now,
+        )
+
+    async def force_identity_last_seen_minutes_ago(
+        self,
+        speaker_id: str,
+        minutes: int,
+    ) -> dict[str, Any]:
+        forced_time = datetime.now() - timedelta(minutes=minutes)
+        return await self.save_identity_profile(
+            speaker_id,
+            {},
+            pending_identity_action="",
+            mark_seen=True,
+            now=forced_time,
+        )
+
+    def extract_identity_from_text(self, text: str) -> dict[str, Any]:
+        return self._extract_profile_from_text(text)
 
     async def build_query_memory_context(
         self,
@@ -313,6 +434,11 @@ class MemoryEngine:
         await self.store.write_flash("current_requirement", req_content)
 
         if speaker_id:
+            profile_update = self._extract_profile_from_text(query_text)
+            if profile_update:
+                await self._save_user_profile(speaker_id, profile_update)
+                await self.update_flash_profile(speaker_id, profile_update)
+
             existing = await self.store.read_user_file(speaker_id, "history.md")
             entry = (
                 f"\n---\n### {now} ({resp_type})\n"
@@ -339,14 +465,55 @@ class MemoryEngine:
 
     # ── 내부 유틸 ──
 
+    async def _save_user_profile(self, speaker_id: str, profile: dict[str, Any]) -> None:
+        await self.save_identity_profile(
+            speaker_id,
+            profile,
+            pending_identity_action="",
+            mark_verified=True,
+        )
+
+    def _extract_profile_from_text(self, text: str) -> dict[str, Any]:
+        profile: dict[str, Any] = {}
+        name_match = re.search(
+            r"(?:제\s*이름은|이름은)\s*([가-힣]{2,5}?)(?:이고|고|입니다|이에요|예요|,|\s|$)",
+            text,
+        ) or re.search(
+            r"(?:저는|나는)\s*([가-힣]{2,5}?)(?:이고|고|입니다|이에요|예요|,|\s|$)",
+            text,
+        )
+        if name_match:
+            profile["name"] = name_match.group(1)
+        age_match = re.search(r"(\d{1,3})\s*살", text)
+        if age_match:
+            profile["age"] = age_match.group(1)
+        if "남자" in text or "남성" in text:
+            profile["gender"] = "남성"
+        elif "여자" in text or "여성" in text:
+            profile["gender"] = "여성"
+        conditions = []
+        for token in ("고혈압", "당뇨", "천식", "신장질환", "간질환", "심장질환", "임신 가능성", "임신"):
+            if token in text:
+                conditions.append(token)
+        if conditions:
+            profile["conditions"] = conditions
+        return profile
+
     async def _register_new_user(self, speaker_id: str) -> None:
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        profile = (
-            f"# 환자 프로필\n"
-            f"> 등록일: {now}\n\n"
-            f"| 항목 | 값 |\n|------|----|\n"
-            f"| ID | {speaker_id} |\n"
-            f"| 이름 | - |\n| 성별 | - |\n| 연령 | - |\n| 기저질환 | - |\n"
+        now = datetime.now()
+        profile = self._format_profile_markdown(
+            speaker_id,
+            {
+                "name": "",
+                "gender": "",
+                "age": "",
+                "conditions": [],
+                "pending_identity_action": "registration",
+                "pending_identity_candidate": {},
+                "last_seen_at": "",
+                "verified_at": "",
+            },
+            registered_at=now.isoformat(timespec="seconds"),
         )
         await self.store.save_user_file(speaker_id, "profile.md", profile)
         await self.structured_memory.sync_patient_profile(
@@ -361,20 +528,45 @@ class MemoryEngine:
 
         registration = (
             f"# 신규 환자 등록\n"
-            f"> 등록 시각: {now}\n"
+            f"> 등록 시각: {now.strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"> ID: {speaker_id}\n"
         )
         await self.store.save("patients", registration)
 
     def _parse_profile(self, profile_md: str) -> dict:
         result: dict[str, Any] = {}
+        key_map = {
+            "ID": "speaker_id",
+            "이름": "name",
+            "성별": "gender",
+            "연령": "age",
+            "기저질환": "conditions",
+            "최종대화": "last_seen_at",
+            "최종확인": "verified_at",
+            "신원확인상태": "pending_identity_action",
+            "신원후보": "pending_identity_candidate",
+        }
         for line in profile_md.split("\n"):
             if "|" in line and "---" not in line and "항목" not in line:
                 parts = [p.strip() for p in line.split("|") if p.strip()]
                 if len(parts) == 2:
                     key, value = parts
                     if value != "-":
-                        result[key] = value
+                        canonical_key = key_map.get(key, key)
+                        if canonical_key == "conditions":
+                            result[canonical_key] = [
+                                item.strip()
+                                for item in value.split(",")
+                                if item.strip() and item.strip() != "-"
+                            ]
+                        else:
+                            result[canonical_key] = value
+                        if canonical_key == "pending_identity_candidate":
+                            try:
+                                parsed_candidate = json.loads(value)
+                            except json.JSONDecodeError:
+                                parsed_candidate = {}
+                            result[canonical_key] = parsed_candidate if isinstance(parsed_candidate, dict) else {}
         return result
 
     def _text_relevant(self, text: str, query: str) -> bool:
@@ -510,3 +702,40 @@ class MemoryEngine:
             if med not in unique:
                 unique.append(med)
         return unique[:5]
+
+    def _format_profile_markdown(
+        self,
+        speaker_id: str,
+        profile: dict[str, Any],
+        *,
+        registered_at: str,
+    ) -> str:
+        conditions = self._normalize_conditions(profile.get("conditions"))
+        pending = profile.get("pending_identity_action", "")
+        candidate = profile.get("pending_identity_candidate") or {}
+        candidate_text = "-"
+        if isinstance(candidate, dict) and candidate:
+            candidate_text = json.dumps(candidate, ensure_ascii=False)
+        return (
+            "# 환자 프로필\n"
+            f"> 등록일: {registered_at}\n\n"
+            "| 항목 | 값 |\n|------|----|\n"
+            f"| ID | {speaker_id} |\n"
+            f"| 이름 | {profile.get('name') or '-'} |\n"
+            f"| 성별 | {profile.get('gender') or '-'} |\n"
+            f"| 연령 | {profile.get('age') or '-'} |\n"
+            f"| 기저질환 | {', '.join(conditions) if conditions else '-'} |\n"
+            f"| 최종대화 | {profile.get('last_seen_at') or '-'} |\n"
+            f"| 최종확인 | {profile.get('verified_at') or '-'} |\n"
+            f"| 신원확인상태 | {pending or '-'} |\n"
+            f"| 신원후보 | {candidate_text} |\n"
+        )
+
+    def _normalize_conditions(self, value: Any) -> list[str]:
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item).strip()]
+        if isinstance(value, str):
+            if not value or value == "-":
+                return []
+            return [item.strip() for item in value.split(",") if item.strip()]
+        return []

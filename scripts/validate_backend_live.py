@@ -39,6 +39,7 @@ from app.engines.llm_judge import LLMJudgeEngine
 from app.engines.memory import MemoryEngine
 from app.engines.reasoning import ReasoningEngine
 from app.services.engine_orchestrator import EngineOrchestrator
+from app.services.identity_guard import evaluate_identity_gate
 
 
 DEFAULT_CASES = [
@@ -46,6 +47,7 @@ DEFAULT_CASES = [
         "id": "smalltalk_greeting",
         "text": "안녕하세요.",
         "expected_mode": "memory_only",
+        "require_disclaimer": False,
     },
     {
         "id": "clarify_empty",
@@ -56,7 +58,7 @@ DEFAULT_CASES = [
     {
         "id": "emergency_signal",
         "text": "어르신이 호흡이 힘들고 의식이 없어요. 119 불러야 하나요?",
-        "expected_mode": "tool_first",
+        "expected_mode": "frontier_first",
     },
     {
         "id": "medication_interaction",
@@ -219,6 +221,16 @@ def normalize_scenario(scenario: dict[str, Any], index: int) -> dict[str, Any]:
                 "expected_mode": step.get("expected_mode", "memory_only"),
                 "expected_intent": step.get("expected_intent"),
                 "expected_terms": list(step.get("expected_terms") or []),
+                "forbidden_terms": list(step.get("forbidden_terms") or []),
+                "trace_expectations": dict(step.get("trace_expectations") or {}),
+                "expected_tool_calls": list(step.get("expected_tool_calls") or []),
+                "must_not_call_tools": list(step.get("must_not_call_tools") or []),
+                "expected_memory_reads": list(step.get("expected_memory_reads") or []),
+                "expected_memory_writes": list(step.get("expected_memory_writes") or []),
+                "expected_external_apis": list(step.get("expected_external_apis") or []),
+                "expected_response_type": step.get("expected_response_type"),
+                "expect_identity_gate": step.get("expect_identity_gate", False),
+                "force_last_seen_minutes_ago": step.get("force_last_seen_minutes_ago"),
                 "require_disclaimer": step.get("require_disclaimer", True),
                 "include_judge": step.get("include_judge", False),
                 "include_delivery_llm": step.get("include_delivery_llm", True),
@@ -231,6 +243,7 @@ def normalize_scenario(scenario: dict[str, Any], index: int) -> dict[str, Any]:
         "speaker_id": str(scenario.get("speaker_id") or f"custom_{scenario_id}"),
         "runner": scenario.get("runner", "orchestrator"),
         "seed_medications": list(scenario.get("seed_medications") or []),
+        "trace_expectations": dict(scenario.get("trace_expectations") or {}),
         "steps": normalized_steps,
     }
 
@@ -259,12 +272,19 @@ def get_json(url: str, timeout: float = 30.0) -> dict[str, Any]:
 def quality_flags(text: str) -> dict[str, Any]:
     stripped = (text or "").strip()
     disclaimer_phrase = "정확한 판단은 의사·약사 상담이 필요합니다"
+    disclaimer_variants = (
+        disclaimer_phrase,
+        "정확한 판단은 의사·약사와 상담이 필요합니다",
+        "정확한 정보는 의사나 약사와 상담해 주세요",
+        "정확한 조언은 의사나 약사와 상담",
+    )
+    disclaimer_count = sum(stripped.count(phrase) for phrase in disclaimer_variants)
     return {
         "non_empty": bool(stripped),
         "no_think_tags": "<think>" not in stripped and "</think>" not in stripped,
-        "has_safety_disclaimer": disclaimer_phrase in stripped,
-        "safety_disclaimer_count": stripped.count(disclaimer_phrase),
-        "has_duplicate_disclaimer": stripped.count(disclaimer_phrase) > 1,
+        "has_safety_disclaimer": any(phrase in stripped for phrase in disclaimer_variants),
+        "safety_disclaimer_count": disclaimer_count,
+        "has_duplicate_disclaimer": disclaimer_count > 1,
         "korean_friendly": any(token in stripped for token in ("어르신", "약", "드", "말씀")),
     }
 
@@ -417,6 +437,7 @@ def recall_sources_from_turn(turn: Any) -> dict[str, Any]:
         "context": {
             "has_context_memory": bool(turn.context.get("context_memory")),
             "has_prescription_log": bool(turn.context.get("prescription_log")),
+            "user_profile": turn.context.get("user_profile") or {},
             "memory_prompt_chars": len(turn.context.get("memory_prompt") or ""),
             "relevant_memories": len(turn.context.get("relevant_memories") or []),
             "memory_briefs": turn.context.get("memory_briefs") or [],
@@ -475,14 +496,176 @@ def synthetic_engine_trace(
 
 def engine_trace_ok(trace: list[dict[str, Any]]) -> bool:
     expected_prefix = [
-        "Memory.initialize",
-        "Conversation.receive_input",
-        "Conversation.generate_filler",
-        "Memory.load_context",
-        "Reasoning.route_execution",
-        "Memory.prepare_evidence_bundle",
+        "ME_Initialize",
+        "CE_Input",
+        "CE_Latency",
+        "ME_Context",
+        "RE_Intent",
+        "ME_RAG",
     ]
     return [item["stage"] for item in trace[: len(expected_prefix)]] == expected_prefix
+
+
+def _as_dict(item: Any) -> dict[str, Any]:
+    if hasattr(item, "model_dump"):
+        return item.model_dump()
+    if isinstance(item, dict):
+        return item
+    return {}
+
+
+def _normalize_trace_token(value: Any) -> str:
+    return re.sub(r"[^0-9A-Za-z가-힣]+", "", str(value or "").lower())
+
+
+def _matches_trace_token(expected: str, actual: str) -> bool:
+    expected_norm = _normalize_trace_token(expected)
+    actual_norm = _normalize_trace_token(actual)
+    if not expected_norm:
+        return True
+    if not actual_norm:
+        return False
+    return expected_norm in actual_norm or actual_norm in expected_norm
+
+
+def _ordered_subsequence(expected: list[str], actual: list[str]) -> dict[str, Any]:
+    missing: list[str] = []
+    cursor = 0
+    for expected_item in expected:
+        found_at = None
+        for idx in range(cursor, len(actual)):
+            if _matches_trace_token(expected_item, actual[idx]):
+                found_at = idx
+                break
+        if found_at is None:
+            missing.append(expected_item)
+        else:
+            cursor = found_at + 1
+    return {"ok": not missing, "missing": missing}
+
+
+def _event_text(event: dict[str, Any]) -> str:
+    metadata = event.get("metadata") or {}
+    values = [
+        event.get("stage"),
+        event.get("component"),
+        event.get("action"),
+        event.get("operation"),
+        event.get("logical_file"),
+        event.get("category"),
+        event.get("path"),
+        event.get("tool_id"),
+        event.get("tool_name"),
+        event.get("external_api"),
+        json.dumps(metadata, ensure_ascii=False, default=str),
+    ]
+    return " ".join(str(value) for value in values if value)
+
+
+def _contains_expected(expected: str, events: list[dict[str, Any]]) -> bool:
+    return any(_matches_trace_token(expected, _event_text(event)) for event in events)
+
+
+def _merge_trace_expectations(*sources: dict[str, Any] | None) -> dict[str, Any]:
+    merged: dict[str, Any] = {}
+    list_keys = {
+        "expected_tool_calls",
+        "must_not_call_tools",
+        "expected_memory_reads",
+        "expected_memory_writes",
+        "expected_external_apis",
+        "must_not_wait_for",
+    }
+    for source in sources:
+        if not source:
+            continue
+        for key, value in source.items():
+            if key == "expected_engine_sequence":
+                # A step-level sequence is a narrower contract for one turn.
+                # Concatenating it with scenario-level sequences makes the
+                # validator require two ordered traces in a single turn.
+                merged[key] = list(value or [])
+            elif key in list_keys:
+                current = list(merged.get(key) or [])
+                for item in value or []:
+                    if item not in current:
+                        current.append(item)
+                merged[key] = current
+            else:
+                merged[key] = value
+    return merged
+
+
+def validate_trace_expectations(
+    *,
+    expectations: dict[str, Any],
+    engine_trace: list[Any],
+    memory_trace: list[Any],
+    tool_trace: list[Any],
+) -> dict[str, Any]:
+    """Validate scenario trace metadata against observed structured traces."""
+    engine_events = [_as_dict(item) for item in engine_trace]
+    memory_events = [_as_dict(item) for item in memory_trace]
+    tool_events = [_as_dict(item) for item in tool_trace]
+    combined_events = engine_events + memory_events + tool_events
+    combined_trace_text = [_event_text(event) for event in combined_events]
+
+    expected_sequence = list(expectations.get("expected_engine_sequence") or [])
+    sequence = _ordered_subsequence(expected_sequence, combined_trace_text)
+
+    expected_tool_calls = list(expectations.get("expected_tool_calls") or [])
+    must_not_call_tools = list(expectations.get("must_not_call_tools") or [])
+    expected_external_apis = list(expectations.get("expected_external_apis") or [])
+    expected_memory_reads = list(expectations.get("expected_memory_reads") or [])
+    expected_memory_writes = list(expectations.get("expected_memory_writes") or [])
+
+    expected_tools = {
+        item: _contains_expected(item, tool_events)
+        for item in expected_tool_calls
+    }
+    forbidden_tools = {
+        item: _contains_expected(item, tool_events)
+        for item in must_not_call_tools
+    }
+    external_apis = {
+        item: _contains_expected(item, tool_events)
+        for item in expected_external_apis
+    }
+    memory_reads = {
+        item: any(
+            str(event.get("operation")) in {"read", "search"}
+            and _matches_trace_token(item, _event_text(event))
+            for event in memory_events
+        )
+        for item in expected_memory_reads
+    }
+    memory_writes = {
+        item: any(
+            str(event.get("operation")) in {"write", "update"}
+            and _matches_trace_token(item, _event_text(event))
+            for event in memory_events
+        )
+        for item in expected_memory_writes
+    }
+
+    checks = {
+        "engine_sequence_ok": sequence["ok"],
+        "expected_tool_calls_ok": all(expected_tools.values()) if expected_tools else True,
+        "must_not_call_tools_ok": not any(forbidden_tools.values()) if forbidden_tools else True,
+        "expected_external_apis_ok": all(external_apis.values()) if external_apis else True,
+        "expected_memory_reads_ok": all(memory_reads.values()) if memory_reads else True,
+        "expected_memory_writes_ok": all(memory_writes.values()) if memory_writes else True,
+    }
+    return {
+        "ok": all(checks.values()),
+        "checks": checks,
+        "engine_sequence": sequence,
+        "expected_tool_calls": expected_tools,
+        "must_not_call_tools": forbidden_tools,
+        "expected_external_apis": external_apis,
+        "expected_memory_reads": memory_reads,
+        "expected_memory_writes": memory_writes,
+    }
 
 
 async def seed_speaker_medication_context(speaker_id: str, med_names: list[str]) -> None:
@@ -702,6 +885,7 @@ async def run_orchestrator_step(
     scenario_id: str,
     step_index: int,
     speaker_id: str,
+    scenario_trace_expectations: dict[str, Any],
     step: dict[str, Any],
     ctx: ValidationContext,
 ) -> dict[str, Any]:
@@ -721,6 +905,76 @@ async def run_orchestrator_step(
     include_judge = bool(step.get("include_judge", False))
     include_delivery_llm = bool(step.get("include_delivery_llm", True))
     try:
+        if step.get("force_last_seen_minutes_ago") is not None:
+            await memory.force_identity_last_seen_minutes_ago(
+                speaker_id,
+                int(step["force_last_seen_minutes_ago"]),
+            )
+            before = memory_snapshot(speaker_id)
+
+        if step.get("expect_identity_gate"):
+            identity_gate = await evaluate_identity_gate(
+                memory_engine=memory,
+                text=step["text"],
+                speaker_id=speaker_id,
+            )
+            final_text = identity_gate.response_text
+            flags = quality_flags(final_text)
+            expected_terms = step.get("expected_terms", [])
+            term_hits = terms_present(final_text, expected_terms)
+            terms_ok = all(term_hits.values()) if expected_terms else True
+            forbidden_hits = terms_present(final_text, step.get("forbidden_terms", []))
+            forbidden_ok = not any(forbidden_hits.values())
+            response_type_ok = (
+                not step.get("expected_response_type")
+                or identity_gate.response_type == step.get("expected_response_type")
+            )
+            after = memory_snapshot(speaker_id)
+            memory_diff = diff_snapshots(before, after)
+            status = "ok" if all([
+                not identity_gate.allowed,
+                response_type_ok,
+                terms_ok,
+                forbidden_ok,
+                flags["non_empty"],
+                flags["no_think_tags"],
+            ]) else "fail"
+            return result_record(
+                run_id=ctx.run_id,
+                scenario_id=scenario_id,
+                step_index=step_index,
+                layer="scenario_identity_gate",
+                case_id=step.get("id", f"step_{step_index}"),
+                status=status,
+                elapsed_ms=(time.perf_counter() - started) * 1000,
+                payload={
+                    "speaker_id": speaker_id,
+                    "input": step["text"],
+                    "expected_response_type": step.get("expected_response_type"),
+                    "actual_response_type": identity_gate.response_type,
+                    "identity_gate": {
+                        "allowed": identity_gate.allowed,
+                        "reason": identity_gate.reason,
+                        "metadata": identity_gate.metadata or {},
+                    },
+                    "quality": flags,
+                    "term_hits": term_hits,
+                    "forbidden_hits": forbidden_hits,
+                    "memory_before": before,
+                    "memory_after": after,
+                    "memory_diff": memory_diff,
+                    "checks": {
+                        "gate_blocked": not identity_gate.allowed,
+                        "response_type_ok": response_type_ok,
+                        "terms_ok": terms_ok,
+                        "forbidden_ok": forbidden_ok,
+                        "non_empty": flags["non_empty"],
+                        "no_think_tags": flags["no_think_tags"],
+                    },
+                    "final_preview": final_text[:700],
+                },
+            )
+
         turn = await orchestrator.run_turn(
             text=step["text"],
             speaker_id=speaker_id,
@@ -739,42 +993,164 @@ async def run_orchestrator_step(
             },
             speaker_id=speaker_id,
         )
+        update_memory_trace = [
+            {
+                "operation": "write",
+                "logical_file": "MedicationLog.md",
+                "category": "medication_log",
+                "path": "permanent/medication_log/*/*.md",
+                "status": "observed",
+                "metadata": {"source": "MemoryEngine.update_and_compress"},
+            },
+            {
+                "operation": "write",
+                "logical_file": "CurrentRequirement.md",
+                "category": "current_requirement",
+                "path": "flash/current_requirement.md",
+                "status": "observed",
+                "metadata": {"source": "MemoryEngine.update_and_compress"},
+            },
+            {
+                "operation": "write",
+                "logical_file": "ContextMemory.md",
+                "category": "context_memory",
+                "path": "flash/context_memory.md",
+                "status": "observed",
+                "metadata": {"source": "MemoryEngine.update_and_compress"},
+            },
+            {
+                "operation": "write",
+                "logical_file": "patients/{speaker_id}/history.md",
+                "category": "patients",
+                "path": f"permanent/patients/{speaker_id}/history.md",
+                "status": "observed",
+                "metadata": {"source": "MemoryEngine.update_and_compress"},
+            },
+        ]
+        if turn.execution_results.get("task_results", {}).get("dur"):
+            update_memory_trace.append(
+                {
+                    "operation": "write",
+                    "logical_file": "DURLinkageHistory.md",
+                    "category": "dur_linkage",
+                    "path": "permanent/dur_linkage/*/*.md",
+                    "status": "observed",
+                    "metadata": {"source": "MemoryEngine.update_and_compress"},
+                }
+            )
         after = memory_snapshot(speaker_id)
         memory_diff = diff_snapshots(before, after)
         final_text = turn.conversation.response_text
         flags = quality_flags(final_text)
-        trace = synthetic_engine_trace(
-            turn=turn,
-            include_judge=include_judge,
-            include_delivery_llm=include_delivery_llm,
-            memory_updated=True,
-        )
+        trace = [_as_dict(item) for item in (turn.engine_trace or [])]
+        if not trace:
+            trace = synthetic_engine_trace(
+                turn=turn,
+                include_judge=include_judge,
+                include_delivery_llm=include_delivery_llm,
+                memory_updated=True,
+            )
+        else:
+            trace.append(
+                {
+                    "stage": "ME_Update",
+                    "component": "MemoryEngine",
+                    "action": "update_and_compress",
+                    "status": "observed",
+                    "metadata": {"speaker_id": speaker_id},
+                }
+            )
+        memory_trace = [_as_dict(item) for item in (turn.memory_trace or [])] + update_memory_trace
+        tool_trace = [_as_dict(item) for item in (turn.tool_trace or [])]
         expected_terms = step.get("expected_terms", [])
-        term_hits = terms_present(
+        final_answer_term_hits = terms_present(final_text, expected_terms)
+        model_stage_term_hits = terms_present(
             " ".join(
                 [
-                    final_text,
                     turn.core_message,
                     turn.reviewed_message,
                     turn.delivery_message,
-                    json.dumps(recall_sources_from_turn(turn), ensure_ascii=False),
                 ]
             ),
             expected_terms,
         )
+        memory_term_hits = terms_present(
+            " ".join(
+                [
+                    json.dumps(recall_sources_from_turn(turn), ensure_ascii=False),
+                    json.dumps(before, ensure_ascii=False),
+                    json.dumps(after, ensure_ascii=False),
+                    json.dumps(memory_diff, ensure_ascii=False),
+                ]
+            ),
+            expected_terms,
+        )
+        term_hits = {
+            "final_answer": final_answer_term_hits,
+            "model_stages": model_stage_term_hits,
+            "memory": memory_term_hits,
+        }
         mode_ok = turn.decision.mode.value == step.get("expected_mode")
         intent_ok = (
             not step.get("expected_intent")
             or turn.decision.intent == step.get("expected_intent")
         )
-        terms_ok = all(term_hits.values()) if expected_terms else True
+        final_answer_terms_ok = (
+            all(final_answer_term_hits.values())
+            if expected_terms
+            else True
+        )
+        model_stage_terms_ok = (
+            all(model_stage_term_hits.values())
+            if expected_terms
+            else True
+        )
+        memory_terms_ok = (
+            all(memory_term_hits.values())
+            if expected_terms
+            else True
+        )
+        forbidden_hits = terms_present(final_text, step.get("forbidden_terms", []))
+        forbidden_ok = not any(forbidden_hits.values())
+        response_type_ok = (
+            not step.get("expected_response_type")
+            or turn.conversation.response_type == step.get("expected_response_type")
+        )
         quality_ok = passed_quality(
             flags,
             require_disclaimer=step.get("require_disclaimer", True),
         )
         memory_ok = bool(memory_diff["changed_flash"]) and memory_diff["patient_history_changed"]
         trace_ok = engine_trace_ok(trace)
-        status = "ok" if all([mode_ok, intent_ok, terms_ok, quality_ok, memory_ok, trace_ok]) else "fail"
+        step_trace_metadata = step.get("trace_expectations") or {}
+        trace_expectations = _merge_trace_expectations(
+            None if step_trace_metadata else scenario_trace_expectations,
+            step_trace_metadata,
+            {
+                "expected_tool_calls": step.get("expected_tool_calls", []),
+                "must_not_call_tools": step.get("must_not_call_tools", []),
+                "expected_memory_reads": step.get("expected_memory_reads", []),
+                "expected_memory_writes": step.get("expected_memory_writes", []),
+                "expected_external_apis": step.get("expected_external_apis", []),
+            },
+        )
+        trace_checks = validate_trace_expectations(
+            expectations=trace_expectations,
+            engine_trace=trace,
+            memory_trace=memory_trace,
+            tool_trace=tool_trace,
+        )
+        status = "ok" if all([
+            mode_ok,
+            intent_ok,
+            final_answer_terms_ok,
+            forbidden_ok,
+            response_type_ok,
+            quality_ok,
+            memory_ok,
+            trace_ok,
+            trace_checks["ok"],
+        ]) else "fail"
         return result_record(
             run_id=ctx.run_id,
             scenario_id=scenario_id,
@@ -793,18 +1169,28 @@ async def run_orchestrator_step(
                 "response_type": turn.conversation.response_type,
                 "quality": flags,
                 "term_hits": term_hits,
+                "forbidden_hits": forbidden_hits,
                 "recall_sources": recall_sources_from_turn(turn),
                 "memory_before": before,
                 "memory_after": after,
                 "memory_diff": memory_diff,
                 "engine_call_trace": trace,
+                "memory_trace": memory_trace,
+                "tool_trace": tool_trace,
+                "trace_expectations": trace_expectations,
+                "trace_checks": trace_checks,
                 "checks": {
                     "mode_ok": mode_ok,
                     "intent_ok": intent_ok,
-                    "terms_ok": terms_ok,
+                    "final_answer_terms_ok": final_answer_terms_ok,
+                    "model_stage_terms_ok": model_stage_terms_ok,
+                    "memory_terms_ok": memory_terms_ok,
+                    "forbidden_ok": forbidden_ok,
+                    "response_type_ok": response_type_ok,
                     "quality_ok": quality_ok,
                     "memory_ok": memory_ok,
                     "trace_ok": trace_ok,
+                    "trace_expectations_ok": trace_checks["ok"],
                 },
                 "final_preview": final_text[:700],
             },
@@ -872,6 +1258,7 @@ async def validate_usecase_scenarios(ctx: ValidationContext) -> list[dict[str, A
                     scenario_id=scenario["id"],
                     step_index=index,
                     speaker_id=speaker_id,
+                    scenario_trace_expectations=scenario.get("trace_expectations", {}),
                     step=step,
                     ctx=ctx,
                 )
@@ -905,6 +1292,12 @@ async def validate_websocket_dialogue(ctx: ValidationContext) -> list[dict[str, 
     try:
         async with websockets.connect(ws_url, open_timeout=10) as websocket:
             for index, step in enumerate(scenario["steps"], start=1):
+                if step.get("force_last_seen_minutes_ago") is not None:
+                    force_memory = MemoryEngine()
+                    await force_memory.force_identity_last_seen_minutes_ago(
+                        speaker_id,
+                        int(step["force_last_seen_minutes_ago"]),
+                    )
                 before = memory_snapshot(speaker_id)
                 started = time.perf_counter()
                 await websocket.send(
@@ -934,11 +1327,29 @@ async def validate_websocket_dialogue(ctx: ValidationContext) -> list[dict[str, 
                     after = memory_snapshot(speaker_id)
                 flags = quality_flags(final_text)
                 memory_diff = diff_snapshots(before, after)
+                actual_response_type = response.get("response_type")
+                response_type_ok = (
+                    not step.get("expected_response_type")
+                    or actual_response_type == step.get("expected_response_type")
+                )
+                expected_terms = step.get("expected_terms", [])
+                term_hits = terms_present(final_text, expected_terms)
+                terms_ok = all(term_hits.values()) if expected_terms else True
+                forbidden_hits = terms_present(final_text, step.get("forbidden_terms", []))
+                forbidden_ok = not any(forbidden_hits.values())
+                identity_gate_ok = (
+                    not step.get("expect_identity_gate")
+                    or bool(response.get("identity_gate"))
+                )
                 status = (
                     "ok"
                     if response
                     and passed_quality(flags, require_disclaimer=step.get("require_disclaimer", True))
-                    and memory_diff["patient_history_changed"]
+                    and (memory_diff["patient_history_changed"] or step.get("expect_identity_gate"))
+                    and response_type_ok
+                    and terms_ok
+                    and forbidden_ok
+                    and identity_gate_ok
                     else "fail"
                 )
                 results.append(
@@ -955,6 +1366,10 @@ async def validate_websocket_dialogue(ctx: ValidationContext) -> list[dict[str, 
                             "input": step["text"],
                             "messages": messages,
                             "quality": flags,
+                            "expected_response_type": step.get("expected_response_type"),
+                            "actual_response_type": actual_response_type,
+                            "term_hits": term_hits,
+                            "forbidden_hits": forbidden_hits,
                             "memory_before": before,
                             "memory_after": after,
                             "memory_diff": memory_diff,
@@ -965,6 +1380,13 @@ async def validate_websocket_dialogue(ctx: ValidationContext) -> list[dict[str, 
                                 {"order": 4, "stage": "WebSocket.send_response", "status": "observed" if response else "missing"},
                                 {"order": 5, "stage": "Memory.update_and_compress", "status": "observed" if memory_diff["patient_history_changed"] else "missing"},
                             ],
+                            "checks": {
+                                "response_type_ok": response_type_ok,
+                                "terms_ok": terms_ok,
+                                "forbidden_ok": forbidden_ok,
+                                "identity_gate_ok": identity_gate_ok,
+                                "memory_ok": bool(memory_diff["patient_history_changed"] or step.get("expect_identity_gate")),
+                            },
                             "final_preview": final_text[:700],
                         },
                     )
@@ -1129,11 +1551,32 @@ def write_outputs(ctx: ValidationContext, results: list[dict[str, Any]]) -> tupl
 
 async def run(ctx: ValidationContext) -> int:
     results: list[dict[str, Any]] = []
-    results.extend(await validate_server_status(ctx))
+    preflight_results = await validate_server_status(ctx)
+    results.extend(preflight_results)
     if getattr(ctx, "preflight_only", False):
         jsonl_path, md_path = write_outputs(ctx, results)
         print(json.dumps({"jsonl": str(jsonl_path), "markdown": str(md_path)}, ensure_ascii=False))
         return 0 if all(row["status"] == "ok" for row in results) else 1
+
+    if any(row["status"] != "ok" for row in preflight_results):
+        results.append(
+            result_record(
+                run_id=ctx.run_id,
+                layer="preflight",
+                case_id="skip_runtime_scenarios",
+                status="skipped",
+                elapsed_ms=0.0,
+                payload={
+                    "reason": (
+                        "vLLM or ai-server preflight failed. Start both servers, "
+                        "then rerun validation."
+                    )
+                },
+            )
+        )
+        jsonl_path, md_path = write_outputs(ctx, results)
+        print(json.dumps({"jsonl": str(jsonl_path), "markdown": str(md_path)}, ensure_ascii=False))
+        return 1 if ctx.strict else 0
 
     for validator in (validate_vllm, validate_health):
         results.extend(await validator(ctx))

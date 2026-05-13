@@ -62,6 +62,54 @@
           "expected_terms": ["아스피린"]
         }
       ]
+    },
+    {
+      "id": "my_identity_recheck",
+      "speaker_id": "note_identity_user",
+      "runner": "websocket",
+      "seed_medications": [],
+      "steps": [
+        {
+          "id": "new_user_identity_question",
+          "text": "안녕하세요. 처음 왔어요.",
+          "expected_response_type": "identity_check",
+          "expect_identity_gate": true,
+          "require_disclaimer": false
+        },
+        {
+          "id": "registration_candidate_detected",
+          "text": "제 이름은 김민수고 72살 남자예요. 고혈압이 있어요.",
+          "expected_response_type": "identity_check",
+          "expect_identity_gate": true,
+          "expected_terms": ["김민수"],
+          "require_disclaimer": false
+        },
+        {
+          "id": "registration_confirmed",
+          "text": "네, 김민수로 등록해 주세요.",
+          "expected_response_type": "identity_check",
+          "expect_identity_gate": true,
+          "expected_terms": ["김민수"],
+          "require_disclaimer": false
+        },
+        {
+          "id": "recheck_after_timeout",
+          "text": "혈압약 먹는 시간 다시 알려줘.",
+          "force_last_seen_minutes_ago": 6,
+          "expected_response_type": "identity_check",
+          "expect_identity_gate": true,
+          "expected_terms": ["김민수"],
+          "require_disclaimer": false
+        },
+        {
+          "id": "identity_conflict",
+          "text": "저는 박지윤인데요. 이 약 먹어도 돼요?",
+          "expected_response_type": "identity_check",
+          "expect_identity_gate": true,
+          "forbidden_terms": ["복용하세요", "같이 먹어도 됩니다"],
+          "require_disclaimer": false
+        }
+      ]
     }
   ]
 }
@@ -78,3 +126,7 @@
 - `steps[].expected_intent`: 예: `smalltalk`, `medication_query`, `emergency`, `unknown`
 - `steps[].expected_terms`: 최종 응답, 핵심 메시지, recall source 중 반드시 포함되어야 하는 단어
 - `steps[].require_disclaimer`: 기본값 `true`, clarify/smalltalk에서 안전 문구를 요구하지 않으려면 `false`
+- `steps[].expected_response_type`: 예: `identity_check`
+- `steps[].expect_identity_gate`: 신원확인 gate 응답을 기대하면 `true`
+- `steps[].force_last_seen_minutes_ago`: 테스트에서 마지막 대화 시각을 N분 전으로 강제
+- `steps[].forbidden_terms`: 답변에 나오면 실패 처리할 단어

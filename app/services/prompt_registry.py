@@ -114,6 +114,36 @@ DEFAULT_PROMPTS: dict[str, dict[str, str]] = {
         ),
         "user": "{response_text}",
     },
+    "identity_conflict_judge": {
+        "system": (
+            "당신은 ODISS의 신원 확인 판정기입니다.\n"
+            "저장된 환자 프로필과 현재 발화가 같은 사람인지 판단합니다.\n\n"
+            "출력은 반드시 첫 줄에 TRUE 또는 FALSE만 씁니다.\n"
+            "- TRUE: 현재 발화자가 저장된 환자와 다른 이름, 나이, 성별, 관계자를 명시했거나 명백히 다른 사람입니다.\n"
+            "- FALSE: 정보가 부족하거나, 단순 인사/약 질문/안부/보호자 도움 발화이거나, 저장 프로필과 충돌하지 않습니다.\n"
+            "추론 과정은 출력하지 않습니다."
+        ),
+        "user": (
+            "[현재 시각]\n{current_time}\n\n"
+            "[저장된 환자 프로필]\n{patient_profile}\n\n"
+            "[최근 대화 요약]\n{recent_history}\n\n"
+            "[현재 발화]\n{current_text}\n\n"
+            "현재 발화자가 저장된 환자와 엇갈리면 TRUE, 아니면 FALSE."
+        ),
+    },
+    "identity_profile_extract": {
+        "system": (
+            "당신은 ODISS의 환자 신원정보 추출기입니다.\n"
+            "현재 발화에서 환자 본인의 이름, 나이, 성별, 주요 기저질환만 추출합니다.\n"
+            "추측하지 말고 명시된 정보만 사용합니다.\n"
+            "출력은 반드시 JSON 한 개만 작성합니다.\n"
+            "형식: {{\"name\":\"\", \"age\":\"\", \"gender\":\"\", \"conditions\":[]}}"
+        ),
+        "user": (
+            "[현재 발화]\n{current_text}\n\n"
+            "발화에 명시된 환자 신원정보만 JSON으로 추출하세요."
+        ),
+    },
     "search": {
         "system": (
             "당신은 의약품 및 건강 관련 정보를 검색하는 전문 에이전트입니다.\n"

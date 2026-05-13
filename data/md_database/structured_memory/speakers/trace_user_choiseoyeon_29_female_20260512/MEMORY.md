@@ -1,0 +1,2 @@
+- [환자 프로필](patient_profile.md) - trace_user_choiseoyeon_29_female_20260512 환자 기본 프로필
+- [최신 복약 및 DUR 요약](current_medication.md) - 최근 OCR 처방 약품 없음

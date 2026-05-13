@@ -133,7 +133,7 @@ class ConversationEngine:
         if not any(text.startswith(prefix) for prefix in ["네,", "어르신", honorific]):
             text = f"{honorific}, {text[0].lower() + text[1:]}" if len(text) > 1 else text
 
-        if "의사" not in text and "약사" not in text:
+        if "의사·약사 상담" not in text and "전문가" not in text:
             if not text.rstrip().endswith("."):
                 text += "."
             text += " 정확한 판단은 의사·약사 상담이 필요합니다."
@@ -201,10 +201,13 @@ class ConversationEngine:
           + reviewed/delivery text candidates.
         """
         if contract.decision.mode == ReasoningMode.ASK_USER_CLARIFY:
-            text = (
-                "어르신, 확인이 필요한 약 이름이나 증상을 조금 더 자세히 말씀해 주세요. "
-                "예: 약 이름, 하루 몇 번 드시는지, 언제부터 불편하셨는지."
-            )
+            if "처방전" in contract.input_text and "사진" in contract.input_text:
+                text = "어르신, 처방전 사진을 먼저 올리거나 촬영해 주세요. 사진이 있어야 약 이름과 주의사항을 확인할 수 있어요."
+            else:
+                text = (
+                    "어르신, 확인이 필요한 약 이름이나 증상을 조금 더 자세히 말씀해 주세요. "
+                    "예: 약 이름, 하루 몇 번 드시는지, 언제부터 불편하셨는지."
+                )
             return ConversationComposeResponse(
                 response_text=text,
                 response_type="clarify",
@@ -241,6 +244,21 @@ class ConversationEngine:
             and contract.decision.intent == "smalltalk"
             else "medical_response"
         )
+        if response_type == "smalltalk":
+            return ConversationComposeResponse(
+                response_text=self._ensure_elder_prefix(source),
+                response_type=response_type,
+                requires_tts=True,
+            )
+        if (
+            contract.decision.mode == ReasoningMode.MEMORY_ONLY
+            and self._is_memory_ack_or_recall(contract.input_text)
+        ):
+            return ConversationComposeResponse(
+                response_text=self._ensure_elder_prefix(source),
+                response_type=response_type,
+                requires_tts=True,
+            )
         text = self.apply_tone(
             source,
             user_profile=contract.user_profile,
@@ -283,3 +301,25 @@ class ConversationEngine:
         cleaned = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
         cleaned = re.sub(r"<think>.*$", "", cleaned, flags=re.DOTALL)
         return cleaned.strip()
+
+    def _ensure_elder_prefix(self, text: str) -> str:
+        text = (text or "").strip()
+        if not text:
+            return "어르신, 듣고 있어요."
+        if text.startswith(("어르신", "네,")):
+            return text
+        return f"어르신, {text}"
+
+    def _is_memory_ack_or_recall(self, text: str) -> bool:
+        lowered = text.lower()
+        if "ocr" in lowered or "읽힌 처방 약 이름" in text:
+            return False
+        return any(
+            token in lowered
+            for token in (
+                "기록해",
+                "기록한",
+                "뭐였",
+                "다시 말",
+            )
+        )

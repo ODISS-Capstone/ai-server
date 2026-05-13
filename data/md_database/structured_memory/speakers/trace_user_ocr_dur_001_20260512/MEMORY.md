@@ -1,0 +1,2 @@
+- [최신 복약 및 DUR 요약](current_medication.md) - 최근 OCR 처방 약품: 와파린정, 아스피린장용정, 오메프라졸캡슐, 로사르탄정
+- [환자 프로필](patient_profile.md) - trace_user_ocr_dur_001_20260512 환자 기본 프로필

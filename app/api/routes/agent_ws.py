@@ -20,6 +20,7 @@ from app.engines.memory import MemoryEngine
 from app.engines.reasoning import ReasoningEngine
 from app.engines.llm_judge import LLMJudgeEngine
 from app.services.engine_orchestrator import EngineOrchestrator
+from app.services.identity_guard import evaluate_identity_gate
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -101,6 +102,31 @@ async def _handle_stt(websocket: WebSocket, message: dict) -> None:
         )
         return
 
+    identity_gate = await evaluate_identity_gate(
+        memory_engine=memory_engine,
+        text=text,
+        speaker_id=speaker_id,
+    )
+    if not identity_gate.allowed:
+        response = conversation_engine.build_response(
+            {
+                "text": identity_gate.response_text,
+                "type": identity_gate.response_type,
+                "requires_tts": True,
+            }
+        )
+        await websocket.send_json(
+            {
+                "type": "response",
+                **response,
+                "identity_gate": {
+                    "reason": identity_gate.reason,
+                    "metadata": identity_gate.metadata or {},
+                },
+            }
+        )
+        return
+
     turn = await engine_orchestrator.run_turn(
         text=text,
         speaker_id=speaker_id,
@@ -137,6 +163,8 @@ async def _handle_stt(websocket: WebSocket, message: dict) -> None:
         },
         speaker_id=speaker_id,
     )
+    if speaker_id:
+        await memory_engine.mark_identity_seen(speaker_id, verified=True)
 
 
 async def _handle_ocr(websocket: WebSocket, message: dict) -> None:
