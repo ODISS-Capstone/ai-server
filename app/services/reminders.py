@@ -18,6 +18,7 @@ DEFAULT_REMINDER_TIMES = {
     "점심": "13:00",
     "저녁": "19:00",
 }
+REMINDER_PENDING_TTL = timedelta(minutes=5)
 
 
 @dataclass
@@ -73,6 +74,7 @@ class ReminderService:
         self._callbacks: dict[str, SendCallback] = {}
         self._tasks: dict[tuple[str, str], asyncio.Task] = {}
         self._pending: dict[str, ReminderSchedule] = {}
+        self._pending_started_at: dict[str, datetime] = {}
         self._active: dict[str, ReminderSchedule] = {}
         self._memory: dict[str, MemoryEngine] = {}
         self._restored: set[str] = set()
@@ -86,6 +88,8 @@ class ReminderService:
         if not speaker_id:
             return
         self._callbacks.pop(speaker_id, None)
+        self._pending.pop(speaker_id, None)
+        self._pending_started_at.pop(speaker_id, None)
         for key in [key for key in self._tasks if key[0] == speaker_id]:
             self._tasks.pop(key).cancel()
         self._restored.discard(speaker_id)
@@ -119,6 +123,26 @@ class ReminderService:
         self._memory[speaker_id] = memory_engine
         stripped = (text or "").strip()
 
+        if speaker_id in self._pending:
+            if self._is_pending_expired(speaker_id):
+                self._pending.pop(speaker_id, None)
+                self._pending_started_at.pop(speaker_id, None)
+                if self.extract_time_overrides(stripped) or self._is_affirmative(stripped) or self._is_rejection(stripped):
+                    return "이전 알림 설정 대기 시간이 지나 취소했습니다. 알림을 다시 설정하려면 새로 말씀해 주세요."
+                return None
+            if self._is_rejection(stripped):
+                self._pending.pop(speaker_id, None)
+                self._pending_started_at.pop(speaker_id, None)
+                return "알겠습니다. 방금 시작한 복약 알림 설정은 취소했습니다."
+            if self.extract_time_overrides(stripped) or self._is_affirmative(stripped):
+                return await self.finalize_pending(
+                    memory_engine=memory_engine,
+                    speaker_id=speaker_id,
+                    text=stripped,
+                    user_profile=user_profile,
+                )
+            return "복약 알림 설정을 계속할까요? 계속하려면 '네', 취소하려면 '아니'라고 말씀해 주세요."
+
         if self.is_taken_recall(stripped):
             return await self.recall_last_taken(
                 memory_engine=memory_engine,
@@ -128,16 +152,6 @@ class ReminderService:
 
         if self.is_taken_confirmation(stripped):
             return await self.record_taken(
-                memory_engine=memory_engine,
-                speaker_id=speaker_id,
-                text=stripped,
-                user_profile=user_profile,
-            )
-
-        if speaker_id in self._pending and (
-            self.extract_time_overrides(stripped) or self._is_affirmative(stripped)
-        ):
-            return await self.finalize_pending(
                 memory_engine=memory_engine,
                 speaker_id=speaker_id,
                 text=stripped,
@@ -168,6 +182,7 @@ class ReminderService:
             display_name=name,
             medication_label=medication_label,
         )
+        self._pending_started_at[speaker_id] = self._now()
         return (
             f"네, {name}. 현재 저장된 복약 정보 기준으로 식후 복용 알림을 설정할 수 있습니다. "
             "기본 알림 시간은 아침은 오전 8시, 점심은 오후 1시, 저녁은 오후 7시로 설정하려고 하는데 괜찮으신가요?"
@@ -186,6 +201,7 @@ class ReminderService:
             speaker_id,
             ReminderSchedule(speaker_id=speaker_id, times=dict(DEFAULT_REMINDER_TIMES)),
         )
+        self._pending_started_at.pop(speaker_id, None)
         schedule.times.update(self.extract_time_overrides(text))
         name = self._name(user_profile)
         schedule.display_name = name
@@ -478,6 +494,17 @@ class ReminderService:
     @staticmethod
     def _is_affirmative(text: str) -> bool:
         return any(token in text.strip().lower() for token in ("네", "예", "응", "그래", "괜찮", "좋아", "맞아"))
+
+    def _is_pending_expired(self, speaker_id: str) -> bool:
+        started_at = self._pending_started_at.get(speaker_id)
+        if not started_at:
+            return False
+        return self._now() - started_at > REMINDER_PENDING_TTL
+
+    @staticmethod
+    def _is_rejection(text: str) -> bool:
+        lowered = text.strip().lower()
+        return any(token in lowered for token in ("아니", "아냐", "취소", "하지 마", "하지마", "싫", "필요 없어", "안 해"))
 
     @staticmethod
     def _medication_label_from_context(prescription_log: str) -> str:

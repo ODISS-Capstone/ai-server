@@ -39,7 +39,6 @@ from app.engines.llm_judge import LLMJudgeEngine
 from app.engines.memory import MemoryEngine
 from app.engines.reasoning import ReasoningEngine
 from app.services.engine_orchestrator import EngineOrchestrator
-from app.services.identity_guard import evaluate_identity_gate
 
 
 DEFAULT_CASES = [
@@ -271,6 +270,7 @@ def get_json(url: str, timeout: float = 30.0) -> dict[str, Any]:
 
 def quality_flags(text: str) -> dict[str, Any]:
     stripped = (text or "").strip()
+    has_think_tag = bool(re.search(r"</?think\b", stripped, flags=re.IGNORECASE))
     disclaimer_phrase = "정확한 판단은 의사·약사 상담이 필요합니다"
     disclaimer_variants = (
         disclaimer_phrase,
@@ -281,11 +281,11 @@ def quality_flags(text: str) -> dict[str, Any]:
     disclaimer_count = sum(stripped.count(phrase) for phrase in disclaimer_variants)
     return {
         "non_empty": bool(stripped),
-        "no_think_tags": "<think>" not in stripped and "</think>" not in stripped,
+        "no_think_tags": not has_think_tag,
         "has_safety_disclaimer": any(phrase in stripped for phrase in disclaimer_variants),
         "safety_disclaimer_count": disclaimer_count,
         "has_duplicate_disclaimer": disclaimer_count > 1,
-        "korean_friendly": any(token in stripped for token in ("어르신", "약", "드", "말씀")),
+        "korean_friendly": any(token in stripped for token in ("사용자님", "님", "약", "드", "말씀")),
     }
 
 
@@ -913,12 +913,16 @@ async def run_orchestrator_step(
             before = memory_snapshot(speaker_id)
 
         if step.get("expect_identity_gate"):
-            identity_gate = await evaluate_identity_gate(
-                memory_engine=memory,
+            turn = await orchestrator.run_turn(
                 text=step["text"],
                 speaker_id=speaker_id,
+                include_judge=False,
+                include_delivery_llm=False,
+                allow_frontier_memory_fallback=False,
+                run_identity_gate=True,
             )
-            final_text = identity_gate.response_text
+            identity_gate = turn.identity_gate
+            final_text = turn.conversation.response_text
             flags = quality_flags(final_text)
             expected_terms = step.get("expected_terms", [])
             term_hits = terms_present(final_text, expected_terms)
@@ -927,12 +931,12 @@ async def run_orchestrator_step(
             forbidden_ok = not any(forbidden_hits.values())
             response_type_ok = (
                 not step.get("expected_response_type")
-                or identity_gate.response_type == step.get("expected_response_type")
+                or turn.conversation.response_type == step.get("expected_response_type")
             )
             after = memory_snapshot(speaker_id)
             memory_diff = diff_snapshots(before, after)
             status = "ok" if all([
-                not identity_gate.allowed,
+                not identity_gate.get("allowed", True),
                 response_type_ok,
                 terms_ok,
                 forbidden_ok,
@@ -951,12 +955,14 @@ async def run_orchestrator_step(
                     "speaker_id": speaker_id,
                     "input": step["text"],
                     "expected_response_type": step.get("expected_response_type"),
-                    "actual_response_type": identity_gate.response_type,
+                    "actual_response_type": turn.conversation.response_type,
                     "identity_gate": {
-                        "allowed": identity_gate.allowed,
-                        "reason": identity_gate.reason,
-                        "metadata": identity_gate.metadata or {},
+                        "allowed": identity_gate.get("allowed"),
+                        "reason": identity_gate.get("reason"),
+                        "metadata": identity_gate.get("metadata") or {},
                     },
+                    "engine_call_trace": [_as_dict(item) for item in turn.engine_trace],
+                    "memory_trace": [_as_dict(item) for item in turn.memory_trace],
                     "quality": flags,
                     "term_hits": term_hits,
                     "forbidden_hits": forbidden_hits,
@@ -964,7 +970,7 @@ async def run_orchestrator_step(
                     "memory_after": after,
                     "memory_diff": memory_diff,
                     "checks": {
-                        "gate_blocked": not identity_gate.allowed,
+                        "gate_blocked": not identity_gate.get("allowed", True),
                         "response_type_ok": response_type_ok,
                         "terms_ok": terms_ok,
                         "forbidden_ok": forbidden_ok,

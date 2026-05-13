@@ -124,25 +124,20 @@ async def ask(req: AskRequest) -> AskResponse:
     )
     await memory_engine.initialize()
 
-    # 최근 파이프라인 기록에서 llm_doc 및 dur 복원
-    latest = await md_store.read_latest("medication_log", n=5)
-    llm_doc = ""
-
-    for entry in latest:
-        content = entry.get("content", "")
-        if req.session_id in content:
-            for line in content.split("\n"):
-                if line.startswith("> 세션 ID:") and req.session_id in line:
-                    # LLM 문서 섹션 추출
-                    if "## LLM 문서" in content:
-                        llm_doc = content.split("## LLM 문서\n")[-1].strip()
-                    break
+    llm_doc = await _load_pipeline_llm_doc(req.session_id)
 
     query_text = req.query_text or ""
-    if not query_text and not llm_doc:
+    if not llm_doc:
         raise HTTPException(status_code=404, detail="Session not found or no data available")
     if not query_text and llm_doc:
         query_text = "이전 세션의 복약 정보를 다시 쉽게 설명해줘."
+
+    preloaded_context = await memory_engine.load_context(None)
+    preloaded_context["prescription_log"] = llm_doc
+    preloaded_context["context_memory"] = (
+        f"# 파이프라인 세션 복약 문서\n> 세션 ID: {req.session_id}\n\n{llm_doc}"
+    )
+    preloaded_context["memory_prompt"] = llm_doc
 
     turn = await engine_orchestrator.run_turn(
         text=query_text,
@@ -150,6 +145,7 @@ async def ask(req: AskRequest) -> AskResponse:
         include_judge=True,
         include_delivery_llm=True,
         allow_frontier_memory_fallback=True,
+        preloaded_context=preloaded_context,
     )
     answer_internal = turn.core_message
     answer_external = turn.evidence.frontier_answer_preview or None
@@ -193,3 +189,16 @@ async def ask(req: AskRequest) -> AskResponse:
         sent_to_mcp=sent_to_mcp,
         sent_to_device=sent_to_device,
     )
+
+
+async def _load_pipeline_llm_doc(session_id: str) -> str:
+    """Load the exact pipeline session document instead of relying on global flash memory."""
+    hits = await md_store.search("medication_log", session_id, limit=3)
+    for hit in hits:
+        content = await md_store.read_entry(hit["path"])
+        if f"> 세션 ID: {session_id}" not in content:
+            continue
+        if "## LLM 문서\n" not in content:
+            continue
+        return content.split("## LLM 문서\n", 1)[1].strip()
+    return ""

@@ -12,7 +12,7 @@
 import json
 import logging
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -40,6 +40,8 @@ engine_orchestrator = EngineOrchestrator(
 )
 reminder_service = ReminderService()
 _pending_ocr_by_speaker: dict[str, dict[str, Any]] = {}
+OCR_PENDING_TTL = timedelta(minutes=5)
+ANONYMOUS_OCR_KEY = "__anonymous__"
 
 
 @router.websocket("/ws/chat")
@@ -253,8 +255,11 @@ async def _handle_ocr(websocket: WebSocket, message: dict) -> None:
         return
 
     if medications:
-        key = speaker_id or "__anonymous__"
-        _pending_ocr_by_speaker[key] = ocr_data
+        key = _pending_ocr_key(speaker_id)
+        _pending_ocr_by_speaker[key] = {
+            "data": ocr_data,
+            "created_at": datetime.now(),
+        }
         summary = _format_ocr_summary(ocr_data)
         await websocket.send_json(
             {
@@ -283,13 +288,47 @@ async def _handle_pending_ocr_confirmation(
     text: str,
     speaker_id: str | None,
 ) -> bool:
-    key = speaker_id or "__anonymous__"
-    if key not in _pending_ocr_by_speaker:
-        return False
-    if not _is_ocr_save_confirmation(text):
+    key = _pending_ocr_key(speaker_id)
+    pending = _pending_ocr_by_speaker.get(key)
+    if not pending:
         return False
 
-    ocr_data = _pending_ocr_by_speaker.pop(key)
+    if _is_pending_ocr_expired(pending):
+        _pending_ocr_by_speaker.pop(key, None)
+        response_text = (
+            "이전 처방전 확인 시간이 지나 저장하지 않았습니다. "
+            "약봉투나 처방전을 다시 보여주시면 새로 확인하겠습니다."
+        )
+        response = conversation_engine.build_response(
+            {"text": response_text, "type": "ocr_expired", "requires_tts": True}
+        )
+        await websocket.send_json({"type": "response", **response})
+        return True
+
+    if _is_ocr_save_rejection(text):
+        _pending_ocr_by_speaker.pop(key, None)
+        response_text = (
+            "알겠습니다. 방금 인식한 처방전 정보는 저장하지 않았습니다. "
+            "다시 촬영하거나 약 이름을 말해주시면 새로 확인하겠습니다."
+        )
+        response = conversation_engine.build_response(
+            {"text": response_text, "type": "ocr_cancelled", "requires_tts": True}
+        )
+        await websocket.send_json({"type": "response", **response})
+        return True
+
+    if not _is_ocr_save_confirmation(text):
+        response_text = (
+            "방금 인식한 처방전 정보를 저장할지 먼저 확인해 주세요. "
+            "저장하려면 '네, 저장해'라고 말하고, 아니면 '아니, 저장하지 마'라고 말해 주세요."
+        )
+        response = conversation_engine.build_response(
+            {"text": response_text, "type": "ocr_confirmation_required", "requires_tts": True}
+        )
+        await websocket.send_json({"type": "response", **response})
+        return True
+
+    ocr_data = _pending_ocr_data(_pending_ocr_by_speaker.pop(key))
     medications = ocr_data.get("medications", [])
     await memory_engine.log_ocr_result(ocr_data)
     await _store_ocr_prescription_baseline(ocr_data, medications)
@@ -348,15 +387,53 @@ async def _sync_ocr_dur_background(
         from app.tools.dur_api import check_dur_for_prescription
 
         dur_results = await check_dur_for_prescription(medications)
-        dur_dicts = [r.get("dur", {}) for r in dur_results]
-        await memory_engine.sync_ocr_dur(ocr_data, dur_dicts, speaker_id=speaker_id)
+        await memory_engine.sync_ocr_dur(ocr_data, dur_results, speaker_id=speaker_id)
     except Exception as exc:  # noqa: BLE001 - background sync must not break WS response
         logger.warning("Background OCR DUR sync failed: %s", exc)
 
 
+def _pending_ocr_key(speaker_id: str | None) -> str:
+    return speaker_id or ANONYMOUS_OCR_KEY
+
+
+def _pending_ocr_data(pending: dict[str, Any]) -> dict[str, Any]:
+    data = pending.get("data")
+    return data if isinstance(data, dict) else pending
+
+
+def _is_pending_ocr_expired(pending: dict[str, Any]) -> bool:
+    created_at = pending.get("created_at")
+    if not isinstance(created_at, datetime):
+        return False
+    return datetime.now() - created_at > OCR_PENDING_TTL
+
+
 def _is_ocr_save_confirmation(text: str) -> bool:
+    if _is_ocr_save_rejection(text):
+        return False
     lowered = text.strip().lower()
-    return any(token in lowered for token in ("저장", "응", "네", "그래", "좋아", "맞아"))
+    return any(token in lowered for token in ("저장", "응", "네", "예", "그래", "좋아", "맞아", "확인"))
+
+
+def _is_ocr_save_rejection(text: str) -> bool:
+    lowered = text.strip().lower()
+    return any(
+        token in lowered
+        for token in (
+            "아니",
+            "아냐",
+            "싫",
+            "취소",
+            "저장하지",
+            "저장 안",
+            "하지 마",
+            "하지마",
+            "틀렸",
+            "다시",
+            "재촬영",
+            "삭제",
+        )
+    )
 
 
 def _is_uncertain_ocr_result(ocr_data: dict[str, Any]) -> bool:

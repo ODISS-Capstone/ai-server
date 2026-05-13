@@ -62,12 +62,12 @@ def test_conversation_contract_never_exposes_think_token():
             core_message="",
             reviewed_message="",
             delivery_message=(
-                "<think>1. internal reasoning</think>\n"
+                "<think data-source=\"qwen\">1. internal reasoning</think>\n"
                 "와파린과 아스피린은 출혈 위험이 올라갈 수 있습니다."
             ),
         )
     )
-    assert "<think>" not in result.response_text
+    assert "<think" not in result.response_text.lower()
     assert "의사·약사 상담" in result.response_text
 
 

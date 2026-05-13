@@ -112,7 +112,7 @@ class MemoryEvidenceBundle(BaseModel):
 
 
 class ConversationComposeRequest(BaseModel):
-    """Input contract for elder-facing response composition."""
+    """Input contract for user-facing response composition."""
 
     input_text: str = Field(..., description="Original user text")
     user_profile: dict[str, Any] = Field(
@@ -132,7 +132,7 @@ class ConversationComposeRequest(BaseModel):
 class ConversationComposeResponse(BaseModel):
     """Final conversation output passed to transport layer."""
 
-    response_text: str = Field(..., description="Final elder-facing response text")
+    response_text: str = Field(..., description="Final user-facing response text")
     response_type: str = Field(..., description="smalltalk/medical_response/fallback")
     requires_tts: bool = Field(True, description="Whether TTS playback is needed")
 
@@ -173,6 +173,7 @@ class EnginePipelineResult(BaseModel):
 
     input_data: dict[str, Any] = Field(default_factory=dict)
     context: dict[str, Any] = Field(default_factory=dict)
+    identity_gate: dict[str, Any] = Field(default_factory=dict)
     decision: ReasoningRouteDecision
     evidence: MemoryEvidenceBundle
     execution_results: dict[str, Any] = Field(default_factory=dict)

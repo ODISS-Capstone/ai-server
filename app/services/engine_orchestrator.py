@@ -14,16 +14,20 @@ from app.engines.memory import MemoryEngine
 from app.engines.reasoning import ReasoningEngine
 from app.schemas.engine_contracts import (
     ConversationComposeRequest,
+    ConversationComposeResponse,
     EnginePipelineResult,
     EngineTraceEvent,
     MemoryEvidenceRequest,
     MemoryEvidenceBundle,
     MemoryTraceEvent,
     ReasoningMode,
+    ReasoningRouteDecision,
     ReasoningRouteInput,
     ToolTraceEvent,
 )
+from app.services.identity_guard import evaluate_identity_gate
 from app.services.llm import call_local_delivery_llm
+from app.services.patient_safety import classify_patient_safety_situation
 
 logger = logging.getLogger(__name__)
 
@@ -53,10 +57,12 @@ class EngineOrchestrator:
         include_delivery_llm: bool = True,
         allow_frontier_memory_fallback: bool = True,
         preloaded_context: Optional[dict[str, Any]] = None,
+        run_identity_gate: bool = False,
     ) -> EnginePipelineResult:
         engine_trace: list[EngineTraceEvent] = []
         memory_trace: list[MemoryTraceEvent] = []
         tool_trace: list[ToolTraceEvent] = []
+        identity_gate_info: dict[str, Any] = {}
 
         def trace_engine(
             stage: str,
@@ -136,6 +142,90 @@ class EngineOrchestrator:
             (perf_counter() - stage_started) * 1000,
         )
 
+        if run_identity_gate:
+            stage_started = perf_counter()
+            identity_gate = await evaluate_identity_gate(
+                memory_engine=self.memory,
+                text=text,
+                speaker_id=speaker_id,
+            )
+            identity_gate_info = {
+                "allowed": identity_gate.allowed,
+                "reason": identity_gate.reason,
+                "response_type": identity_gate.response_type,
+                "metadata": identity_gate.metadata or {},
+            }
+            trace_engine(
+                "ME_Context",
+                "MemoryEngine",
+                "identity_gate",
+                allowed=identity_gate.allowed,
+                reason=identity_gate.reason,
+            )
+            if speaker_id:
+                trace_memory("read", "Patient.md", category="patients", path=f"patients/{speaker_id}/profile.md")
+                if not identity_gate.allowed and identity_gate.reason in {
+                    "identity_registered",
+                    "identity_candidate_registered",
+                    "confirm_new_identity",
+                    "identity_conflict",
+                    "needs_registration",
+                }:
+                    trace_memory("write", "Patient.md", category="patients", path=f"patients/{speaker_id}/profile.md")
+                if not identity_gate.allowed and identity_gate.reason in {
+                    "identity_registered",
+                    "identity_candidate_registered",
+                }:
+                    trace_memory("write", "CurrentUserProfile.md", category="current_user_profile", path="flash/current_user_profile.md")
+            logger.info(
+                "[MemoryEngine] identity_gate allowed=%s reason=%s elapsed_ms=%.1f",
+                identity_gate.allowed,
+                identity_gate.reason,
+                (perf_counter() - stage_started) * 1000,
+            )
+            if not identity_gate.allowed:
+                decision = ReasoningRouteDecision(
+                    mode=ReasoningMode.MEMORY_ONLY,
+                    intent="identity_check",
+                    rationale=identity_gate.reason,
+                    tasks=[],
+                )
+                evidence = self._empty_evidence(text)
+                response_text = identity_gate.response_text or "신원 확인이 필요합니다."
+                conversation = ConversationComposeResponse(
+                    response_text=response_text,
+                    response_type=identity_gate.response_type,
+                    requires_tts=True,
+                )
+                trace_engine(
+                    "CE_Response",
+                    "ConversationEngine",
+                    "identity_gate_response",
+                    response_type=conversation.response_type,
+                    requires_tts=conversation.requires_tts,
+                )
+                return EnginePipelineResult(
+                    input_data=input_data,
+                    context={"speaker_id": speaker_id},
+                    identity_gate=identity_gate_info,
+                    decision=decision,
+                    evidence=evidence,
+                    execution_results={
+                        "intent": decision.intent,
+                        "query": text,
+                        "task_results": {"identity_gate": identity_gate_info},
+                        "emergency": False,
+                    },
+                    filler_text=filler_text,
+                    core_message=response_text,
+                    reviewed_message=response_text,
+                    delivery_message=response_text,
+                    conversation=conversation,
+                    engine_trace=engine_trace,
+                    memory_trace=memory_trace,
+                    tool_trace=tool_trace,
+                )
+
         stage_started = perf_counter()
         context = dict(preloaded_context) if preloaded_context is not None else await self.memory.load_context(speaker_id)
         trace_engine(
@@ -179,7 +269,10 @@ class EngineOrchestrator:
 
         ocr_medications = self._extract_ocr_medications_from_text(text)
         if ocr_medications:
-            await self._store_ocr_prescription_context(ocr_medications)
+            if hasattr(self.memory, "store_ocr_text_result"):
+                await self.memory.store_ocr_text_result(text, speaker_id=speaker_id)
+            else:
+                await self._store_ocr_prescription_context(ocr_medications)
             context["prescription_log"] = self._format_prescription_log(ocr_medications)
             trace_memory("write", "OCRHistory.md", category="ocr_history", path="permanent/ocr_history/*/*.md")
             trace_memory("write", "Prescription.md", category="prescriptions", path="permanent/prescriptions/*/*.md")
@@ -476,6 +569,7 @@ class EngineOrchestrator:
         return EnginePipelineResult(
             input_data=input_data,
             context=context,
+            identity_gate=identity_gate_info,
             decision=decision,
             evidence=evidence,
             execution_results=execution_results,
@@ -614,10 +708,17 @@ class EngineOrchestrator:
         prescription_meds = self._medications_from_prescription_log(context.get("prescription_log", ""))
 
         if decision.intent == "emergency":
+            safety = classify_patient_safety_situation(text)
+            if safety:
+                return safety.response_text
             return "응급 상황입니다. 즉시 119에 연락하거나 가까운 응급실로 이동하세요."
 
         if decision.mode == ReasoningMode.ASK_USER_CLARIFY and "처방전" in text and "사진" in text:
             return "처방전 사진을 먼저 올리거나 촬영해 주세요. 사진이 있어야 약 이름과 주의사항을 확인할 수 있습니다."
+
+        safety = classify_patient_safety_situation(text)
+        if safety:
+            return safety.response_text
 
         if profile and self._is_profile_recall(text):
             name = profile.get("name") or "등록된 사용자"
@@ -690,29 +791,47 @@ class EngineOrchestrator:
                 "다만 실제 약 이름과 복용량은 약봉투에 적힌 내용과 반드시 한 번 더 확인해 주세요."
             )
 
-        if "어제 밤" in text and "기록" in text:
-            return "어제 밤 9시에 로사르탄정을 복용했다고 기록되어 있습니다."
+        if "어제" in text and any(token in text for token in ("기록", "먹", "복용")):
+            event = self._latest_medication_event_from_execution(execution_results)
+            if event:
+                med = event.get("medication") or "기록된 약"
+                time_text = self._display_event_time(str(event.get("time") or ""))
+                if time_text:
+                    return f"어제 {time_text}에 {med}을 복용했다고 기록되어 있습니다."
+                return f"어제 {med}을 복용했다고 기록되어 있습니다."
+            return "어제 복용 기록을 찾지 못했습니다. 약 이름이나 시간을 다시 알려주시면 확인해드리겠습니다."
 
         ocr_meds = self._extract_ocr_medications_from_text(text)
         if ocr_meds:
             return "OCR에서 읽힌 처방 약 이름은 " + ", ".join(ocr_meds) + "입니다. 처방전 기록으로 저장했습니다."
 
         if "아침" in text and "점심" in text and "저녁" in text and prescription_meds:
+            med_text = self._friendly_medication_label(prescription_meds)
             return (
-                "아침에는 아스피린장용정, 점심에는 오메프라졸캡슐, 저녁에는 와파린정과 로사르탄정을 기준으로 확인하세요. "
-                "와파린과 아스피린 조합은 출혈 위험이 커질 수 있어 특히 주의가 필요합니다."
+                f"현재 저장된 처방 약은 {med_text}입니다. "
+                "아침, 점심, 저녁 중 어느 때 복용할지는 약봉투나 처방전의 복용 시점이 확인된 경우에만 확정할 수 있습니다. "
+                "약봉투에 적힌 시간과 횟수를 먼저 확인해 주세요."
             )
 
         if "dur 기준" in lowered and prescription_meds:
+            med_text = self._friendly_medication_label(prescription_meds)
+            checked_labels = self._dur_result_labels(execution_results)
+            checked_text = (
+                " 확인한 항목은 " + ", ".join(checked_labels) + "입니다."
+                if checked_labels
+                else ""
+            )
             return (
-                "와파린과 아스피린은 병용 시 출혈 위험이 커질 수 있어 주의가 필요합니다. "
-                "노인주의, 특정연령대 금기, 용량주의, 투여기간주의, 효능군중복, 서방정 분할주의, 임부금기 항목도 함께 확인했습니다."
+                f"저장된 약 {med_text} 기준으로 필요한 DUR 정보를 확인했습니다.{checked_text} "
+                "조회 결과는 참고용 안전 정보라서, 처방 변경이나 복용 중단은 의사나 약사와 확인해 주세요."
             )
 
         if "녹용" in text:
+            med_text = self._friendly_medication_label(prescription_meds)
+            med_context = f"현재 저장된 약 {med_text}와 " if prescription_meds else "현재 복용 중인 약이나 "
             return (
-                "현재 저장된 복용 약을 기준으로 확인해보겠습니다. 녹용은 건강식품이나 한약재 성격이 있을 수 있어 "
-                "복용 약과 질환 상태에 따라 주의가 필요합니다. 혈압약을 복용 중이라면 지금 바로 드시기보다 "
+                f"{med_context}기저질환을 기준으로 확인이 필요합니다. 녹용은 건강식품이나 한약재 성격이 있을 수 있어 "
+                "복용 약과 질환 상태에 따라 주의가 필요합니다. 지금 바로 드시기보다 "
                 "약봉투나 처방전을 가지고 의사나 약사에게 먼저 확인하시는 것을 권장드립니다."
             )
 
@@ -730,8 +849,17 @@ class EngineOrchestrator:
             return "네. 저장된 약봉투 기준으로 정해진 시간과 횟수에 맞춰 복용하시는 것이 안전합니다."
 
         if "오메가3" in text or "건강기능식품" in text:
+            interacting_meds = self._medications_matching(
+                prescription_meds,
+                ("와파린", "아스피린"),
+            )
+            med_context = (
+                "저장된 약 중 " + ", ".join(interacting_meds) + "와 함께 드실 때"
+                if interacting_meds
+                else "일부 항응고제나 항혈소판제와 함께 드실 때"
+            )
             return (
-                "오메가3는 와파린이나 아스피린과 함께 드실 때 출혈 위험이 커질 수 있어 주의가 필요합니다. "
+                f"오메가3는 {med_context} 출혈 위험이 커질 수 있어 주의가 필요합니다. "
                 "제품명과 성분표를 약사나 의사에게 보여주고 확인하세요."
             )
 
@@ -978,8 +1106,9 @@ class EngineOrchestrator:
             + "\n"
         )
 
-    @staticmethod
-    def _extract_ocr_medications_from_text(text: str) -> list[str]:
+    def _extract_ocr_medications_from_text(self, text: str) -> list[str]:
+        if hasattr(self.memory, "extract_ocr_medications_from_text"):
+            return self.memory.extract_ocr_medications_from_text(text)
         if "OCR" not in text and "ocr" not in text:
             return []
         if not any(token in text for token in ("결과", "나왔", "읽힌")):
@@ -1034,6 +1163,44 @@ class EngineOrchestrator:
         return match.group(1) if match else ""
 
     @staticmethod
+    def _latest_medication_event_from_execution(
+        execution_results: dict[str, Any],
+    ) -> dict[str, Any]:
+        history = execution_results.get("task_results", {}).get("history", {})
+        if not isinstance(history, dict):
+            return {}
+        events_text = str(history.get("medication_events") or "")
+        events: list[dict[str, Any]] = []
+        for line in events_text.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("- "):
+                continue
+            try:
+                payload = json.loads(stripped[2:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                events.append(payload)
+        return events[-1] if events else {}
+
+    @staticmethod
+    def _display_event_time(time_text: str) -> str:
+        if not time_text or ":" not in time_text:
+            return ""
+        try:
+            hour, minute = [int(part) for part in time_text.split(":", 1)]
+        except ValueError:
+            return ""
+        if 18 <= hour <= 23:
+            label = "밤"
+        elif 12 <= hour < 18:
+            label = "오후"
+        else:
+            label = "오전"
+        display_hour = hour if 1 <= hour <= 12 else hour - 12 if hour > 12 else 12
+        return f"{label} {display_hour}시 {minute}분" if minute else f"{label} {display_hour}시"
+
+    @staticmethod
     def _is_meal_medication_prep_request(text: str) -> bool:
         return "밥" in text and "나중" in text and any(token in text for token in ("뭐 먹", "알려"))
 
@@ -1046,6 +1213,36 @@ class EngineOrchestrator:
         if any("혈압" in med for med in meds):
             return "혈압약"
         return ", ".join(meds[:3]) or "저장된 약"
+
+    @staticmethod
+    def _medications_matching(meds: list[str], stems: tuple[str, ...]) -> list[str]:
+        return [med for med in meds if any(stem in med for stem in stems)]
+
+    @staticmethod
+    def _dur_result_labels(execution_results: dict[str, Any]) -> list[str]:
+        dur_results = execution_results.get("task_results", {}).get("dur", {})
+        if not isinstance(dur_results, dict):
+            return []
+        label_map = {
+            "combination_contraindication": "병용 금기",
+            "elderly_caution": "65세 이상 주의",
+            "dur_product_info": "DUR 품목 정보",
+            "age_contraindication": "특정 연령대 금기",
+            "dosage_caution": "용량 주의",
+            "period_caution": "투여 기간 주의",
+            "efficacy_overlap": "효능군 중복",
+            "sr_tablet_caution": "서방정 분할 주의",
+            "pregnancy_contraindication": "임부 금기",
+        }
+        labels: list[str] = []
+        for result in dur_results.values():
+            if not isinstance(result, dict):
+                continue
+            for key in result:
+                label = label_map.get(str(key))
+                if label and label not in labels:
+                    labels.append(label)
+        return labels
 
     async def _build_core_message(
         self,

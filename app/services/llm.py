@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from time import perf_counter
 from typing import Any, Optional
 
@@ -290,7 +291,7 @@ async def extract_identity_profile_with_llm(
     api_key: Optional[str] = None,
     model: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Extract patient identity fields from the current utterance using Qwen."""
+    """Extract user or managed medication-subject identity fields using Qwen."""
     fallback = _heuristic_identity_extract(current_text)
     url = api_url or settings.internal_llm_api_url
     key = api_key if api_key is not None else settings.internal_llm_api_key
@@ -358,11 +359,12 @@ async def call_external_llm(
                 )
                 r.raise_for_status()
                 data = r.json()
-                return data.get("choices", [{}])[0].get("message", {}).get("content", "") or ""
+                answer = data.get("choices", [{}])[0].get("message", {}).get("content", "") or ""
+                return _strip_reasoning_tags(answer)
 
         return await run_with_engine_queue("external", post_external)
     # 목업
-    return censored_payload[:200] + "\n\n(외부 LLM 미설정 또는 동일 응답)"
+    return "외부 LLM이 설정되지 않아 추가 검토를 생략했습니다."
 
 
 async def run_chat_with_tools(
@@ -525,20 +527,27 @@ def _heuristic_identity_extract(text: str) -> dict[str, Any]:
     profile: dict[str, Any] = {}
     if not text:
         return profile
-    import re
 
-    name_match = re.search(
-        r"(?:제\s*이름은|저는|나는)\s*([가-힣]{2,5}?)(?:이고|고|입니다|이에요|예요|,|\s|$)",
-        text,
-    ) or re.search(
+    name_patterns = [
+        r"(?:제\s*이름은|이름은)\s*([가-힣]{2,5}?)(?:이고|고|입니다|이에요|예요|,|\s|$)",
+        r"(?:저는|나는)\s*([가-힣]{2,5}?)(?:이고|고|입니다|이에요|예요|,|\s|$)",
         r"^\s*([가-힣]{2,5})\s*(?:남자|남성|여자|여성)",
-        text,
-    ) or re.search(
         r"^\s*([가-힣]{2,5})\s*,?\s*\d{1,3}\s*(?:살|세)",
-        text,
-    )
-    if name_match:
-        profile["name"] = name_match.group(1)
+        (
+            r"(?:대상자|아버지|어머니|엄마|아빠|남편|아내|배우자)"
+            r"(?:\s*이름은|\s*성함은|\s*는|\s*가|\s*께서는)?\s*"
+            r"([가-힣]{2,5}?)(?:이고|고|입니다|이에요|예요|,|\s+\d{1,3}\s*(?:살|세)|\s|$)"
+        ),
+    ]
+    for pattern in name_patterns:
+        match = re.search(pattern, text)
+        if not match:
+            continue
+        candidate = match.group(1)
+        if _looks_like_non_name_identity_candidate(candidate):
+            continue
+        profile["name"] = candidate
+        break
     age_match = re.search(r"(\d{1,3})\s*(?:살|세)", text)
     if age_match:
         profile["age"] = age_match.group(1)
@@ -554,6 +563,26 @@ def _heuristic_identity_extract(text: str) -> dict[str, Any]:
     if conditions:
         profile["conditions"] = conditions
     return profile
+
+
+def _looks_like_non_name_identity_candidate(value: str) -> bool:
+    return value in {
+        "고혈압",
+        "당뇨",
+        "천식",
+        "신장질환",
+        "간질환",
+        "심장질환",
+        "임신",
+        "딸",
+        "아들",
+        "보호자",
+        "가족",
+        "엄마",
+        "아빠",
+        "아버지",
+        "어머니",
+    }
 
 
 def _heuristic_identity_conflict(text: str, profile: dict[str, Any]) -> bool:
@@ -590,11 +619,11 @@ def _json_headers(api_key: Optional[str]) -> dict[str, str]:
 
 def _strip_reasoning_tags(content: str) -> str:
     """Remove completed Qwen-style reasoning blocks from user-facing text."""
-    if "<think>" not in content:
+    if "<think" not in content.lower():
         return content
-    if "</think>" not in content:
-        return content.split("<think>", 1)[0].rstrip()
-    return content.split("</think>", 1)[1].lstrip()
+    cleaned = re.sub(r"<think\b[^>]*>.*?</think>\s*", "", content, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r"<think\b[^>]*>.*$", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+    return cleaned.strip()
 
 
 async def _post_chat_once(

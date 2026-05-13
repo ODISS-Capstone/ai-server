@@ -74,6 +74,7 @@ class ToolRegistry:
             handlers if handlers is not None else DEFAULT_TOOL_HANDLERS
         )
         self.schemas: list[dict[str, Any]] = self._load_schemas()
+        self._schema_properties_by_name = self._index_schema_properties()
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
         """Return OpenAI-compatible tool schemas for the LLM `tools` field."""
@@ -102,7 +103,8 @@ class ToolRegistry:
                 "items": [],
             }
 
-        parsed = self._coerce_arguments(arguments)
+        parsed = self._normalize_argument_aliases(self._coerce_arguments(arguments))
+        parsed = self._filter_schema_properties(tool_name, parsed)
         filtered = self._filter_supported_kwargs(handler, parsed)
 
         try:
@@ -147,6 +149,17 @@ class ToolRegistry:
                 logger.warning("Ignoring invalid tool entry in %s", self.schema_path)
         return valid
 
+    def _index_schema_properties(self) -> dict[str, set[str]]:
+        indexed: dict[str, set[str]] = {}
+        for schema in self.schemas:
+            fn = schema.get("function", {}) or {}
+            name = fn.get("name")
+            parameters = fn.get("parameters", {}) or {}
+            properties = parameters.get("properties", {}) or {}
+            if isinstance(name, str) and isinstance(properties, dict):
+                indexed[name] = {str(key) for key in properties}
+        return indexed
+
     @staticmethod
     def _is_valid_tool_schema(tool: Any) -> bool:
         if not isinstance(tool, dict):
@@ -178,6 +191,37 @@ class ToolRegistry:
                 raise ValueError("Tool arguments JSON must decode to an object")
             return decoded
         raise TypeError(f"Unsupported tool arguments type: {type(arguments)!r}")
+
+    @staticmethod
+    def _normalize_argument_aliases(arguments: dict[str, Any]) -> dict[str, Any]:
+        aliases = {
+            "itemName": "item_name",
+            "itemSeq": "item_seq",
+            "pageNo": "page_no",
+            "numOfRows": "num_of_rows",
+            "productName": "product_name",
+            "entpName": "entp_name",
+            "printFront": "print_front",
+            "printBack": "print_back",
+            "drugShape": "drug_shape",
+            "colorClass1": "color_class1",
+            "imgRegistTs": "img_regist_ts",
+        }
+        normalized = dict(arguments)
+        for source, target in aliases.items():
+            if source in normalized and target not in normalized:
+                normalized[target] = normalized[source]
+        return normalized
+
+    def _filter_schema_properties(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        allowed = self._schema_properties_by_name.get(tool_name)
+        if not allowed:
+            return arguments
+        return {key: value for key, value in arguments.items() if key in allowed}
 
     @staticmethod
     def _filter_supported_kwargs(

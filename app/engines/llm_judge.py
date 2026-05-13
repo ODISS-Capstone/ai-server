@@ -18,11 +18,33 @@ logger = logging.getLogger(__name__)
 JUDGE_SYSTEM_PROMPT = DEFAULT_PROMPTS["judge_verify"]["system"]
 
 
+def _supports_temperature(model: str) -> bool:
+    """Return whether Chat Completions should include temperature."""
+    normalized = (model or "").lower().strip()
+    return not normalized.startswith("gpt-5")
+
+
 class LLMJudgeEngine:
     """LLM as a Judge: 팩트 체킹 및 판단 검토."""
 
     def __init__(self):
         self.model = settings.openai_judge_model or settings.openai_model
+
+    def _chat_payload(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        max_tokens: int,
+        temperature: float = 0.1,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+        }
+        if _supports_temperature(self.model):
+            payload["temperature"] = temperature
+        return payload
 
     async def verify_fact(
         self,
@@ -61,12 +83,7 @@ class LLMJudgeEngine:
                             "Authorization": f"Bearer {api_key}",
                             "Content-Type": "application/json",
                         },
-                        json={
-                            "model": self.model,
-                            "messages": messages,
-                            "max_tokens": 256,
-                            "temperature": 0.1,
-                        },
+                        json=self._chat_payload(messages, max_tokens=256),
                     )
                     resp.raise_for_status()
                     return resp.json()
@@ -139,12 +156,7 @@ class LLMJudgeEngine:
                             "Authorization": f"Bearer {api_key}",
                             "Content-Type": "application/json",
                         },
-                        json={
-                            "model": self.model,
-                            "messages": messages,
-                            "max_tokens": 400,
-                            "temperature": 0.1,
-                        },
+                        json=self._chat_payload(messages, max_tokens=400),
                     )
                     resp.raise_for_status()
                     return resp.json()
@@ -211,12 +223,7 @@ class LLMJudgeEngine:
                             "Authorization": f"Bearer {api_key}",
                             "Content-Type": "application/json",
                         },
-                        json={
-                            "model": self.model,
-                            "messages": messages,
-                            "max_tokens": 160,
-                            "temperature": 0.1,
-                        },
+                        json=self._chat_payload(messages, max_tokens=160),
                     )
                     resp.raise_for_status()
                     return resp.json()

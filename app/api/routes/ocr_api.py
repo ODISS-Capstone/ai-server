@@ -32,7 +32,7 @@ class OCRResultInput(BaseModel):
         default_factory=list, description="구조화된 약품 목록"
     )
     confidence: float = Field(0.0, description="OCR 신뢰도 (0~1)")
-    speaker_id: Optional[str] = Field(None, description="환자/화자 ID")
+    speaker_id: Optional[str] = Field(None, description="화자/복약 관리 대상자 ID")
 
 
 class OCRProcessedResponse(BaseModel):
@@ -62,10 +62,9 @@ async def receive_ocr_result(payload: OCRResultInput) -> OCRProcessedResponse:
         med_dicts = [m.model_dump() for m in payload.medications]
         dur_results = await check_dur_for_prescription(med_dicts)
 
-        dur_dicts = [r.get("dur", {}) for r in dur_results]
         await memory_engine.sync_ocr_dur(
             ocr_data,
-            dur_dicts,
+            dur_results,
             speaker_id=payload.speaker_id,
         )
 

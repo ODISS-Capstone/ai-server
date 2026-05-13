@@ -25,6 +25,8 @@ from app.schemas.engine_contracts import (
     MemoryEvidenceBundle,
     MemoryEvidenceRequest,
 )
+from app.services.dur_summary import summarize_dur_result
+from app.services.patient_safety import classify_patient_safety_situation
 from app.tools import llm_search
 
 logger = logging.getLogger(__name__)
@@ -33,6 +35,15 @@ OCR_TYPO_MAP = {
     "타이레롤": "타이레놀",
     "와파린정정": "와파린정",
     "아스피린장용정정": "아스피린장용정",
+}
+COMMON_MEDICATION_NAMES = {
+    "와파린",
+    "아스피린",
+    "로사르탄",
+    "오메프라졸",
+    "인슐린",
+    "메트포르민",
+    "암로디핀",
 }
 
 
@@ -82,10 +93,11 @@ class MemoryEngine:
 
         dur_lines: list[str] = []
         for dur in dur_results:
-            name = dur.get("name", "?")
-            contras = len(dur.get("contraindications", []))
-            cautions = len(dur.get("precautions", []))
-            dur_lines.append(f"- {name}: 금기 {contras}건 / 주의 {cautions}건")
+            summary = summarize_dur_result(dur)
+            dur_lines.append(
+                f"- {summary['name']}: 정보 {summary['info']}건 / "
+                f"금기 {summary['contraindications']}건 / 주의 {summary['precautions']}건"
+            )
 
         content = (
             f"# 처방전 DUR 동기화\n"
@@ -112,10 +124,53 @@ class MemoryEngine:
             speaker_id=speaker_id,
         )
 
+    async def store_ocr_text_result(
+        self,
+        text: str,
+        *,
+        speaker_id: Optional[str] = None,
+        confidence: float = 1.0,
+    ) -> list[str]:
+        """Normalize STT text that reports OCR results into OCR/prescription memory."""
+        med_names = self.extract_ocr_medications_from_text(text)
+        if not med_names:
+            return []
+
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ocr_data = {
+            "source": "stt_text",
+            "raw_text": text,
+            "medications": [{"name": name} for name in med_names],
+        }
+        await self.log_ocr_result(ocr_data, confidence=confidence)
+
+        prescription = (
+            f"# 처방전 OCR 기록\n"
+            f"> 기록 시각: {now}\n"
+            f"> 입력 경로: STT 텍스트 OCR 결과\n\n"
+            "## 약품 목록\n"
+            + "\n".join(f"- {name}" for name in med_names)
+            + "\n\n## 원문\n"
+            + text[:1000]
+            + "\n"
+        )
+        await self.store.save("prescriptions", prescription)
+        await self.store.write_flash(
+            "prescription_log",
+            self._format_prescription_log(med_names, recorded_at=now),
+        )
+        await self.structured_memory.sync_medication_context(
+            med_names=med_names,
+            dur_results=[],
+            recorded_at=now,
+            speaker_id=speaker_id,
+        )
+        return med_names
+
     # ── ME_Context: 사용자 식별 및 컨텍스트 로드 ──
 
     async def load_context(self, speaker_id: Optional[str] = None) -> dict[str, Any]:
-        """현재 대화자의 컨텍스트를 로드. 새 환자이면 프로필 생성."""
+        """현재 대화자의 컨텍스트를 로드. 새 사용자이면 프로필 생성."""
         context: dict[str, Any] = {
             "speaker_id": speaker_id,
             "is_new_user": False,
@@ -338,7 +393,7 @@ class MemoryEngine:
             memory_prompt=memory_prompt,
         )
 
-    # ── ME_Parse: 환자 개인정보 구분 및 주요 정보 로그 파싱 ──
+    # ── ME_Parse: 사용자/복약 대상자 개인정보 구분 및 주요 정보 로그 파싱 ──
 
     async def parse_patient_info(self, raw_data: dict) -> dict:
         return {
@@ -349,7 +404,7 @@ class MemoryEngine:
             "allergies": raw_data.get("allergies", []),
         }
 
-    # ── ME_RAG: 환자 관리 및 관련 이력 검색 ──
+    # ── ME_RAG: 사용자/복약 대상자 관리 및 관련 이력 검색 ──
 
     async def search_history(
         self, query: str, speaker_id: Optional[str] = None,
@@ -369,6 +424,10 @@ class MemoryEngine:
             user_history = await self.store.read_user_file(speaker_id, "history.md")
             if user_history and self._text_relevant(user_history, query):
                 results["user_history"] = user_history
+
+            medication_events = await self.store.read_user_file(speaker_id, "medication_events.md")
+            if medication_events and self._medication_events_relevant(medication_events, query):
+                results["medication_events"] = medication_events
 
         structured_context = await self.structured_memory.build_context(
             query,
@@ -434,6 +493,16 @@ class MemoryEngine:
         await self.store.write_flash("current_requirement", req_content)
 
         if speaker_id:
+            await self.record_safety_incident_from_text(
+                query_text,
+                answer_text=answer_text,
+                speaker_id=speaker_id,
+            )
+            await self.record_medication_event_from_text(
+                query_text,
+                speaker_id=speaker_id,
+            )
+
             profile_update = self._extract_profile_from_text(query_text)
             if profile_update:
                 await self._save_user_profile(speaker_id, profile_update)
@@ -449,10 +518,119 @@ class MemoryEngine:
                 speaker_id, "history.md", existing + entry,
             )
 
+    async def record_safety_incident_from_text(
+        self,
+        text: str,
+        *,
+        answer_text: str = "",
+        speaker_id: Optional[str] = None,
+        now: Optional[datetime] = None,
+    ) -> Optional[dict[str, Any]]:
+        """Append common medication-use mistakes to a speaker safety log."""
+        if not speaker_id:
+            return None
+        situation = classify_patient_safety_situation(text)
+        if not situation or not situation.should_record_incident:
+            return None
+
+        timestamp = (now or datetime.now()).isoformat(timespec="seconds")
+        incident = {
+            "recorded_at": timestamp,
+            "speaker_id": speaker_id,
+            "situation": situation.key,
+            "severity": situation.severity,
+            "source_text": text,
+            "response": answer_text[:500],
+        }
+        existing = await self.store.read_user_file(speaker_id, "safety_incidents.md")
+        content = existing.rstrip()
+        if content:
+            content += "\n"
+        else:
+            content = "# 복약 안전 사건\n\n"
+        content += "- " + json.dumps(incident, ensure_ascii=False, sort_keys=True) + "\n"
+        await self.store.save_user_file(speaker_id, "safety_incidents.md", content)
+        return incident
+
+    async def record_medication_event_from_text(
+        self,
+        text: str,
+        *,
+        speaker_id: Optional[str] = None,
+        now: Optional[datetime] = None,
+    ) -> Optional[dict[str, Any]]:
+        """Extract and persist a typed medication event from a user utterance."""
+        if not speaker_id:
+            return None
+        event = self.extract_medication_event_from_text(text, now=now)
+        if not event:
+            return None
+
+        event["speaker_id"] = speaker_id
+        event["recorded_at"] = (now or datetime.now()).isoformat(timespec="seconds")
+        event["source_text"] = text
+
+        existing = await self.store.read_user_file(speaker_id, "medication_events.md")
+        events = self._parse_medication_events(existing)
+        dedupe_key = (
+            event.get("date"),
+            event.get("time"),
+            event.get("medication"),
+            event.get("action"),
+            event.get("source_text"),
+        )
+        if not any(
+            (
+                item.get("date"),
+                item.get("time"),
+                item.get("medication"),
+                item.get("action"),
+                item.get("source_text"),
+            )
+            == dedupe_key
+            for item in events
+        ):
+            events.append(event)
+
+        content = "# 복약 이벤트\n\n" + "\n".join(
+            "- " + json.dumps(item, ensure_ascii=False, sort_keys=True)
+            for item in events[-50:]
+        )
+        if events:
+            content += "\n"
+        await self.store.save_user_file(speaker_id, "medication_events.md", content)
+        await self.structured_memory.sync_medication_events(
+            speaker_id=speaker_id,
+            events=events[-50:],
+        )
+        return event
+
+    def extract_medication_event_from_text(
+        self,
+        text: str,
+        *,
+        now: Optional[datetime] = None,
+    ) -> dict[str, Any]:
+        """Return a typed medication event when text clearly records a taken dose."""
+        lowered = (text or "").lower()
+        if not any(token in lowered for token in ("복용", "먹었", "먹었다", "드셨")):
+            return {}
+        medication = self._first_medication_from_text(text)
+        if not medication or medication in {"약", "식후약", "처방약"}:
+            return {}
+
+        base = now or datetime.now()
+        return {
+            "date": self._extract_event_date(text, base),
+            "time": self._extract_event_time(text),
+            "medication": medication,
+            "action": "taken",
+        }
+
     async def update_flash_profile(self, speaker_id: str, profile: dict) -> None:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         content = (
-            f"# 현재 환자 프로필\n> 최종 갱신: {now}\n\n"
+            f"# 현재 복약 관리 프로필\n> 최종 갱신: {now}\n\n"
             f"| 항목 | 값 |\n|------|----|\n"
             f"| 이름 | {profile.get('name', '-')} |\n"
             f"| ID | {speaker_id} |\n"
@@ -475,21 +653,26 @@ class MemoryEngine:
 
     def _extract_profile_from_text(self, text: str) -> dict[str, Any]:
         profile: dict[str, Any] = {}
-        name_match = re.search(
+        name_patterns = [
             r"(?:제\s*이름은|이름은)\s*([가-힣]{2,5}?)(?:이고|고|입니다|이에요|예요|,|\s|$)",
-            text,
-        ) or re.search(
             r"(?:저는|나는)\s*([가-힣]{2,5}?)(?:이고|고|입니다|이에요|예요|,|\s|$)",
-            text,
-        ) or re.search(
             r"^\s*([가-힣]{2,5})\s*(?:남자|남성|여자|여성)",
-            text,
-        ) or re.search(
             r"^\s*([가-힣]{2,5})\s*,?\s*\d{1,3}\s*(?:살|세)",
-            text,
-        )
-        if name_match:
-            profile["name"] = name_match.group(1)
+            (
+                r"(?:환자|대상자|아버지|어머니|엄마|아빠|남편|아내|배우자)"
+                r"(?:\s*이름은|\s*성함은|\s*는|\s*가|\s*께서는)?\s*"
+                r"([가-힣]{2,5}?)(?:이고|고|입니다|이에요|예요|,|\s+\d{1,3}\s*(?:살|세)|\s|$)"
+            ),
+        ]
+        for pattern in name_patterns:
+            match = re.search(pattern, text)
+            if not match:
+                continue
+            candidate_name = match.group(1)
+            if self._looks_like_non_name_identity_candidate(candidate_name):
+                continue
+            profile["name"] = candidate_name
+            break
         age_match = re.search(r"(\d{1,3})\s*(?:살|세)", text)
         if age_match:
             profile["age"] = age_match.group(1)
@@ -504,6 +687,28 @@ class MemoryEngine:
         if conditions:
             profile["conditions"] = conditions
         return profile
+
+    @staticmethod
+    def _looks_like_non_name_identity_candidate(value: str) -> bool:
+        return value in {
+            "고혈압",
+            "당뇨",
+            "천식",
+            "신장질환",
+            "간질환",
+            "심장질환",
+            "임신",
+            "딸",
+            "딸이",
+            "아들",
+            "아들이",
+            "보호자",
+            "가족",
+            "엄마",
+            "아빠",
+            "아버지",
+            "어머니",
+        }
 
     async def _register_new_user(self, speaker_id: str) -> None:
         now = datetime.now()
@@ -533,7 +738,7 @@ class MemoryEngine:
         )
 
         registration = (
-            f"# 신규 환자 등록\n"
+            f"# 신규 복약 관리 대상자 등록\n"
             f"> 등록 시각: {now.strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"> ID: {speaker_id}\n"
         )
@@ -694,6 +899,13 @@ class MemoryEngine:
 
     def _extract_query_medications(self, query: str) -> list[str]:
         meds: list[str] = []
+        for match in re.finditer(r"([가-힣A-Za-z0-9]+(?:장용정|정|캡슐|시럽))", query):
+            token = self._normalize_medication_name(match.group(1))
+            if token:
+                meds.append(token)
+        for known_name in COMMON_MEDICATION_NAMES:
+            if known_name in query:
+                meds.append(known_name)
         for token in query.split():
             token = self._normalize_medication_name(token)
             if not token:
@@ -709,6 +921,88 @@ class MemoryEngine:
                 unique.append(med)
         return unique[:5]
 
+    def extract_ocr_medications_from_text(self, text: str) -> list[str]:
+        """Extract medication names from STT text that explicitly reports OCR output."""
+        lowered = (text or "").lower()
+        if "ocr" not in lowered and "처방전" not in text:
+            return []
+        if not any(token in text for token in ("결과", "나왔", "읽힌", "인식")):
+            return []
+
+        candidates = re.findall(
+            r"([가-힣A-Za-z0-9]+(?:장용정|정|캡슐|시럽))",
+            text,
+        )
+        normalized: list[str] = []
+        for item in candidates:
+            name = self._normalize_medication_name(item)
+            if name and name not in normalized:
+                normalized.append(name)
+        return normalized[:8]
+
+    @staticmethod
+    def _format_prescription_log(med_names: list[str], *, recorded_at: str) -> str:
+        return (
+            f"# 현재 복용 약 요약\n> 최종 갱신: {recorded_at}\n\n## 약품 목록\n"
+            + "\n".join(f"- {name}" for name in med_names)
+            + "\n"
+        )
+
+    @staticmethod
+    def _parse_medication_events(content: str) -> list[dict[str, Any]]:
+        events: list[dict[str, Any]] = []
+        for line in (content or "").splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("- "):
+                continue
+            try:
+                payload = json.loads(stripped[2:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                events.append(payload)
+        return events
+
+    def _medication_events_relevant(self, content: str, query: str) -> bool:
+        lowered = (query or "").lower()
+        if any(token in lowered for token in ("어제", "오늘", "그제", "복용", "먹었", "먹었다", "기록", "약")):
+            return True
+        return self._text_relevant(content, query)
+
+    @staticmethod
+    def _extract_event_date(text: str, base: datetime) -> str:
+        match = re.search(r"(\d{4})\s*년\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일", text)
+        if match:
+            year, month, day = (int(part) for part in match.groups())
+            return f"{year:04d}-{month:02d}-{day:02d}"
+        if "어제" in text:
+            return (base - timedelta(days=1)).date().isoformat()
+        if "그제" in text:
+            return (base - timedelta(days=2)).date().isoformat()
+        return base.date().isoformat()
+
+    @staticmethod
+    def _extract_event_time(text: str) -> str:
+        match = re.search(
+            r"(오전|오후|밤|저녁|아침|점심)?\s*(\d{1,2})\s*시(?:\s*(\d{1,2})\s*분)?",
+            text,
+        )
+        if not match:
+            return ""
+        meridiem = match.group(1) or ""
+        hour = int(match.group(2))
+        minute = int(match.group(3) or 0)
+        if meridiem in {"오후", "저녁", "밤"} and hour < 12:
+            hour += 12
+        if meridiem == "오전" and hour == 12:
+            hour = 0
+        return f"{hour:02d}:{minute:02d}"
+
+    @staticmethod
+    def _first_medication_from_text(text: str) -> str:
+        explicit = re.search(r"([가-힣A-Za-z0-9]+(?:장용정|정|캡슐|시럽|약))", text)
+        return explicit.group(1) if explicit else ""
+
     def _format_profile_markdown(
         self,
         speaker_id: str,
@@ -723,7 +1017,7 @@ class MemoryEngine:
         if isinstance(candidate, dict) and candidate:
             candidate_text = json.dumps(candidate, ensure_ascii=False)
         return (
-            "# 환자 프로필\n"
+            "# 복약 관리 프로필\n"
             f"> 등록일: {registered_at}\n\n"
             "| 항목 | 값 |\n|------|----|\n"
             f"| ID | {speaker_id} |\n"

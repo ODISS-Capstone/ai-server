@@ -42,19 +42,29 @@ def client() -> TestClient:
 
 
 def _import_agent_drug_parser():
-    from src.cloud_server.drug_parser import (  # type: ignore[import-not-found]
-        DrugParserConfig,
-        _to_server_ocr_payload,
-    )
+    try:
+        from src.cloud_server.drug_parser import (  # type: ignore[import-not-found]
+            DrugParserConfig,
+            _to_server_ocr_payload,
+        )
+    except ModuleNotFoundError as exc:
+        if exc.name == "src" or not LOCAL_AGENT_ROOT.exists():
+            pytest.skip("local_agent source package is not available in this checkout")
+        raise
 
     return DrugParserConfig, _to_server_ocr_payload
 
 
 def _import_agent_instruction_log():
-    from src.cloud_server.instruction_log import (  # type: ignore[import-not-found]
-        InstructionEntry,
-        InstructionLogConfig,
-    )
+    try:
+        from src.cloud_server.instruction_log import (  # type: ignore[import-not-found]
+            InstructionEntry,
+            InstructionLogConfig,
+        )
+    except ModuleNotFoundError as exc:
+        if exc.name == "src" or not LOCAL_AGENT_ROOT.exists():
+            pytest.skip("local_agent source package is not available in this checkout")
+        raise
 
     return InstructionEntry, InstructionLogConfig
 

@@ -18,4 +18,6 @@ def test_root():
 def test_health():
     r = client.get("/health")
     assert r.status_code == 200
-    assert r.json().get("status") == "ok"
+    data = r.json()
+    assert data.get("status") == "ok"
+    assert data.get("service") == "odiss-medication-guidance"

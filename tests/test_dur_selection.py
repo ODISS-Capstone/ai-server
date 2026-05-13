@@ -82,3 +82,30 @@ def test_reasoning_dur_check_passes_selected_endpoint_keys(monkeypatch):
     assert captured
     assert captured[0][1] == ("dur_product_info", "dosage_caution")
     assert result["task_results"]["dur_endpoint_keys"] == ["dur_product_info", "dosage_caution"]
+
+
+def test_reasoning_extracts_common_medication_names_without_suffix(monkeypatch):
+    captured: list[str] = []
+
+    async def fake_check_dur_for_prescription(medications, endpoint_keys=None):
+        del endpoint_keys
+        captured.extend(medication["name"] for medication in medications)
+        return [
+            {"medication": medication["name"], "dur": {"dur_product_info": {"success": True, "items": []}}}
+            for medication in medications
+        ]
+
+    monkeypatch.setattr(dur_api, "check_dur_for_prescription", fake_check_dur_for_prescription)
+    engine = ReasoningEngine(MemoryEngine(), LLMJudgeEngine())
+
+    result = run(
+        engine.execute_tasks(
+            text="와파린이랑 아스피린 같이 먹으면 출혈 위험이 있는지 알려줘",
+            intent="medication_query",
+            context={},
+            tasks=[ReasoningTask(type="dur_check", priority=1)],
+        )
+    )
+
+    assert captured == ["와파린", "아스피린"]
+    assert set(result["task_results"]["dur"]) == {"와파린", "아스피린"}

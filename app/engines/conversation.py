@@ -88,9 +88,12 @@ class ConversationEngine:
 
     def __init__(self):
         self.system_prompt = (
-            "당신은 만성질환자와 복약 관리가 필요한 사용자를 돕는 따뜻한 AI 도우미입니다.\n"
+            "당신은 나이와 무관하게 복약 관리가 필요한 사용자를 돕는 따뜻한 AI 도우미입니다.\n"
             "- 존댓말을 사용하고, 짧고 쉬운 문장으로 말합니다.\n"
             "- 이름이 있으면 이름을 사용하고, 없으면 '사용자님'이라고 부릅니다.\n"
+            "- 사용자가 직접 말했거나 프로필에 저장된 경우가 아니면 나이, 질환, 호칭을 추측하지 않습니다.\n"
+            "- 보호자가 대신 말하면 사용자 본인 정보와 복약 관리 대상자 정보를 섞지 않습니다.\n"
+            "- 만성질환자나 복약 사용자라는 이유만으로 '어르신'이라고 부르지 않습니다.\n"
             "- 의학 전문 용어를 쉬운 말로 바꿉니다.\n"
             "- 의료 안전 판단이 필요한 경우에만 '정확한 판단은 의사·약사 상담이 필요합니다'를 포함합니다."
         )
@@ -134,7 +137,7 @@ class ConversationEngine:
             return random.choice(SMALLTALK_PATTERNS[smalltalk_type])
         return None
 
-    # ── CE_Tone: 환자 맞춤형 언어 순화 및 최적화 ──
+    # ── CE_Tone: 사용자 맞춤형 언어 순화 및 최적화 ──
 
     def apply_tone(
         self,
@@ -148,11 +151,11 @@ class ConversationEngine:
             return "사용자님, 죄송해요. 지금은 답변을 드리기 어렵습니다. 잠시 후 다시 말씀해 주세요."
 
         text = fact_data.strip()
+        safety_source = text
         del flash_context
 
         honorific = self._honorific(user_profile)
-        if text.startswith("어르신"):
-            text = honorific + text[len("어르신"):]
+        text = self._replace_unconfirmed_elder_honorific(text, honorific)
 
         replacements = {
             "병용 금기": "같이 드시면 안 되는 약",
@@ -161,6 +164,7 @@ class ConversationEngine:
             "부작용": "몸에 안 좋은 반응",
             "용량주의": "드시는 양 주의",
             "투여기간주의": "복용 기간 주의",
+            "복용량": "드시는 양",
             "용량": "드시는 양",
             "효능": "약의 효과",
         }
@@ -171,7 +175,7 @@ class ConversationEngine:
             text = f"{honorific}, {text}" if text else text
 
         should_disclaim = (
-            self._looks_like_medical_safety_answer(text)
+            self._looks_like_medical_safety_answer(f"{safety_source}\n{text}")
             if require_disclaimer is None
             else require_disclaimer
         )
@@ -235,7 +239,7 @@ class ConversationEngine:
         self,
         contract: ConversationComposeRequest,
     ) -> ConversationComposeResponse:
-        """Compose elder-facing output from typed engine contracts.
+        """Compose user-facing output from typed engine contracts.
 
         Runtime policy:
         - Never expose ``<think>`` blocks.
@@ -294,7 +298,7 @@ class ConversationEngine:
         )
         if response_type == "smalltalk":
             return ConversationComposeResponse(
-                response_text=self._ensure_elder_prefix(source, contract.user_profile),
+                response_text=self._ensure_user_prefix(source, contract.user_profile),
                 response_type=response_type,
                 requires_tts=True,
             )
@@ -303,7 +307,7 @@ class ConversationEngine:
             and self._is_memory_ack_or_recall(contract.input_text)
         ):
             return ConversationComposeResponse(
-                response_text=self._ensure_elder_prefix(source, contract.user_profile),
+                response_text=self._ensure_user_prefix(source, contract.user_profile),
                 response_type=response_type,
                 requires_tts=True,
             )
@@ -323,6 +327,8 @@ class ConversationEngine:
 
     def _detect_smalltalk(self, text: str) -> bool:
         text_lower = text.lower().strip()
+        if self._has_medication_or_task_signal(text_lower):
+            return False
         all_keywords = (
             GREETING_KEYWORDS
             + FEELING_BAD_KEYWORDS
@@ -333,6 +339,8 @@ class ConversationEngine:
 
     def _classify_smalltalk(self, text: str) -> Optional[str]:
         text_lower = text.lower().strip()
+        if self._has_medication_or_task_signal(text_lower):
+            return None
         if any(kw in text_lower for kw in GREETING_KEYWORDS):
             return "greeting"
         if any(kw in text_lower for kw in FEELING_BAD_KEYWORDS):
@@ -342,6 +350,39 @@ class ConversationEngine:
         if any(kw in text_lower for kw in THANKS_KEYWORDS):
             return "thanks"
         return None
+
+    @staticmethod
+    def _has_medication_or_task_signal(text: str) -> bool:
+        return any(
+            token in text
+            for token in (
+                "약",
+                "복용",
+                "처방",
+                "먹어도",
+                "먹으면",
+                "같이 먹",
+                "드셔도",
+                "부작용",
+                "금기",
+                "주의",
+                "용량",
+                "식후",
+                "식전",
+                "알림",
+                "기록",
+                "ocr",
+                "사진",
+                "약봉투",
+                "처방전",
+                "촬영",
+                "찍",
+                "와파린",
+                "아스피린",
+                "영양제",
+                "건강기능식품",
+            )
+        )
 
     @staticmethod
     def _filler_category(text: str) -> str:
@@ -370,17 +411,16 @@ class ConversationEngine:
         """Remove training-only longCoT blocks from runtime responses."""
         if not text:
             return ""
-        cleaned = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
-        cleaned = re.sub(r"<think>.*$", "", cleaned, flags=re.DOTALL)
+        cleaned = re.sub(r"<think\b[^>]*>.*?</think>\s*", "", text, flags=re.DOTALL | re.IGNORECASE)
+        cleaned = re.sub(r"<think\b[^>]*>.*$", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
         return cleaned.strip()
 
-    def _ensure_elder_prefix(self, text: str, user_profile: Optional[dict] = None) -> str:
+    def _ensure_user_prefix(self, text: str, user_profile: Optional[dict] = None) -> str:
         text = (text or "").strip()
         if not text:
             return f"{self._honorific(user_profile)}, 듣고 있어요."
         honorific = self._honorific(user_profile)
-        if text.startswith("어르신"):
-            text = honorific + text[len("어르신"):]
+        text = self._replace_unconfirmed_elder_honorific(text, honorific)
         if text.startswith(("어르신", "사용자님", "네,", honorific)):
             return text
         return f"{honorific}, {text}"
@@ -409,6 +449,10 @@ class ConversationEngine:
     def _honorific(user_profile: Optional[dict] = None) -> str:
         name = str((user_profile or {}).get("name") or "").strip()
         return f"{name}님" if name else "사용자님"
+
+    @staticmethod
+    def _replace_unconfirmed_elder_honorific(text: str, honorific: str) -> str:
+        return (text or "").replace("어르신", honorific)
 
     @staticmethod
     def _looks_like_medical_safety_answer(text: str) -> bool:

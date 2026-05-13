@@ -18,6 +18,7 @@ from app.schemas.engine_contracts import (
     ReasoningRouteInput,
     ReasoningTask,
 )
+from app.services.patient_safety import classify_patient_safety_situation
 from app.tools import dur_api, hira_api, health_supplement, llm_search
 
 logger = logging.getLogger(__name__)
@@ -34,16 +35,32 @@ class IntentType:
 
 
 MEDICATION_KEYWORDS = [
-    "약", "복용", "먹어도", "드셔도", "먹고", "처방", "부작용",
+    "약", "복용", "먹어도", "먹으면", "같이 먹", "드셔도", "먹고", "처방", "부작용",
     "금기", "주의", "효과", "효능", "용량", "언제",
+    "와파린", "아스피린", "혈압약", "당뇨약", "인슐린",
 ]
 SUPPLEMENT_KEYWORDS = [
     "비타민", "영양제", "건기식", "건강식품", "유산균", "오메가",
     "칼슘", "철분", "홍삼", "녹용",
 ]
 EMERGENCY_KEYWORDS = [
-    "쓰러", "의식", "호흡", "출혈", "경련", "응급", "119",
-    "심장", "뇌졸중", "마비",
+    "쓰러",
+    "의식이 없",
+    "의식 저하",
+    "의식을 잃",
+    "호흡곤란",
+    "호흡 곤란",
+    "숨이 차",
+    "숨쉬기 힘",
+    "피가 멈추지",
+    "심한 출혈",
+    "경련",
+    "응급",
+    "119",
+    "가슴 통증",
+    "흉통",
+    "뇌졸중",
+    "마비",
 ]
 DRUG_ID_KEYWORDS = ["알약", "낱알", "이거 뭐", "무슨 약", "약 이름"]
 PROFILE_OR_MEMORY_KEYWORDS = [
@@ -55,6 +72,15 @@ DIRECT_MEDICAL_QUERY_KEYWORDS = [
     "효과", "용량", "dur", "복용지도", "복용 계획",
 ]
 MEMORY_RECALL_KEYWORDS = ["아까", "이전", "어제", "다시 말", "뭐였", "읽힌"]
+COMMON_MEDICATION_NAMES = [
+    "와파린",
+    "아스피린",
+    "로사르탄",
+    "오메프라졸",
+    "인슐린",
+    "메트포르민",
+    "암로디핀",
+]
 
 
 class ReasoningEngine:
@@ -72,6 +98,10 @@ class ReasoningEngine:
 
     def classify_intent(self, text: str) -> str:
         text_lower = text.lower().strip()
+
+        safety = classify_patient_safety_situation(text)
+        if safety:
+            return IntentType.EMERGENCY if safety.severity == "emergency" else IntentType.MEDICATION_QUERY
 
         if any(kw in text_lower for kw in EMERGENCY_KEYWORDS):
             return IntentType.EMERGENCY
@@ -189,6 +219,14 @@ class ReasoningEngine:
             )
 
         intent = self.classify_intent(text)
+        safety = classify_patient_safety_situation(text)
+        if safety and safety.severity != "emergency":
+            return ReasoningRouteDecision(
+                mode=ReasoningMode.MEMORY_ONLY,
+                intent=IntentType.MEDICATION_QUERY,
+                rationale=f"deterministic_patient_safety:{safety.key}",
+                tasks=[],
+            )
         if "ocr" in text.lower() and any(token in text for token in ("결과", "나왔")):
             return ReasoningRouteDecision(
                 mode=ReasoningMode.TOOL_FIRST,
@@ -408,7 +446,7 @@ class ReasoningEngine:
             return (
                 "긴급 상황이 감지되었습니다. "
                 "즉시 119에 전화하시거나 가까운 응급실을 방문해 주세요. "
-                "환자의 상태를 주시하면서 도움을 기다려 주세요."
+                "상태를 계속 살피면서 도움을 기다려 주세요."
             )
 
         parts: list[str] = []
@@ -488,15 +526,21 @@ class ReasoningEngine:
                     if name and len(name) > 1:
                         names.append(name)
 
-        words = text.split()
-        for word in words:
-            if (
-                len(word) > 2
-                and ("정" in word or "캡슐" in word or "시럽" in word)
-            ):
-                names.append(word)
+        names.extend(
+            match.group(1)
+            for match in re.finditer(r"([가-힣A-Za-z0-9]+(?:장용정|정|캡슐|시럽))", text)
+        )
+        for known_name in COMMON_MEDICATION_NAMES:
+            if known_name in text:
+                names.append(known_name)
 
-        return names[:5] if names else [text[:20]]
+        unique: list[str] = []
+        for name in names:
+            cleaned = name.strip(".,!?()[]{}")
+            if cleaned and cleaned not in unique:
+                unique.append(cleaned)
+
+        return unique[:5] if unique else [text[:20]]
 
     def _extract_supplement_names(self, text: str) -> list[str]:
         names: list[str] = []

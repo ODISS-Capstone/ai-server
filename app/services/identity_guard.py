@@ -410,7 +410,7 @@ def _confirm_new_identity_question(
     *,
     existing_profile: dict[str, Any] | None = None,
 ) -> str:
-    name = candidate.get("name") or "새 환자"
+    name = candidate.get("name") or "새 대상자"
     details = []
     if candidate.get("age"):
         details.append(f"{candidate['age']}세")
@@ -430,7 +430,7 @@ def _confirm_new_identity_question(
 
 
 def _reverify_question(profile: dict[str, Any], *, conflict: bool) -> str:
-    name = profile.get("name") or "등록된 환자"
+    name = profile.get("name") or "등록된 분"
     if conflict:
         return (
             f"지금 말씀하신 내용이 저장된 {name}님 정보와 조금 달라 보여요. "

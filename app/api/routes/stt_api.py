@@ -29,7 +29,7 @@ class InstructionLogInput(BaseModel):
     text: str = Field(..., description="STT 변환 텍스트")
     timestamp: Optional[float] = Field(None, description="에이전트 측 epoch 초")
     source: str = Field("stt", description="원본 소스 (기본값 stt)")
-    speaker_id: Optional[str] = Field(None, description="화자/환자 ID")
+    speaker_id: Optional[str] = Field(None, description="화자/복약 관리 대상자 ID")
 
 
 class InstructionLogResponse(BaseModel):
