@@ -96,6 +96,8 @@ COMMON_MEDICATION_NAMES = [
     "인슐린",
     "메트포르민",
     "암로디핀",
+    "혈압약",
+    "당뇨약",
 ]
 
 
@@ -143,6 +145,9 @@ class ReasoningEngine:
 
         if self._is_profile_or_lifestyle_context(text_lower):
             return IntentType.SMALLTALK
+
+        if self._is_meal_medication_guidance_request(text):
+            return IntentType.MEDICATION_QUERY
 
         if any(kw in text_lower for kw in DRUG_ID_KEYWORDS):
             return IntentType.DRUG_IDENTIFICATION
@@ -335,6 +340,30 @@ class ReasoningEngine:
                 mode=ReasoningMode.MEMORY_ONLY,
                 intent=IntentType.MEDICATION_QUERY,
                 rationale="medication_record_memory_write",
+                tasks=[],
+            )
+
+        if (
+            intent in {IntentType.MEDICATION_QUERY, IntentType.DRUG_IDENTIFICATION}
+            and self._is_meal_medication_guidance_request(text)
+            and self._context_has_medication(context)
+        ):
+            return ReasoningRouteDecision(
+                mode=ReasoningMode.MEMORY_ONLY,
+                intent=IntentType.MEDICATION_QUERY,
+                rationale="stored_medication_meal_guidance",
+                tasks=[],
+            )
+
+        if (
+            intent in {IntentType.MEDICATION_QUERY, IntentType.DRUG_IDENTIFICATION}
+            and self._is_current_medication_record_recall(text)
+            and self._context_has_medication(context)
+        ):
+            return ReasoningRouteDecision(
+                mode=ReasoningMode.MEMORY_ONLY,
+                intent=IntentType.MEDICATION_QUERY,
+                rationale="stored_medication_record_recall",
                 tasks=[],
             )
 
@@ -695,6 +724,30 @@ class ReasoningEngine:
 
     def _is_memory_recall_query(self, text_lower: str) -> bool:
         return any(kw in text_lower for kw in MEMORY_RECALL_KEYWORDS)
+
+    @staticmethod
+    def _is_meal_medication_guidance_request(text: str) -> bool:
+        compact = re.sub(r"\s+", "", text or "")
+        return (
+            any(token in text for token in ("밥", "식후", "식사"))
+            and "약" in text
+            and any(token in compact for token in ("무슨약", "어떤약", "뭐먹", "먹어야", "먹고난", "먹고나", "먹고왔", "먹었"))
+        )
+
+    @staticmethod
+    def _is_current_medication_record_recall(text: str) -> bool:
+        compact = re.sub(r"\s+", "", text or "")
+        return "기록" in text and any(token in compact for token in ("남아있", "있지않", "먹고있", "복용중"))
+
+    @staticmethod
+    def _context_has_medication(context: dict[str, Any]) -> bool:
+        haystack = "\n".join(
+            str(context.get(key) or "")
+            for key in ("prescription_log", "context_memory", "current_manual", "memory_prompt")
+        )
+        if any(token in haystack for token in ("혈압약", "고혈압약", "당뇨약", "인슐린", "와파린", "아스피린")):
+            return True
+        return bool(re.search(r"-\s*[가-힣A-Za-z0-9]+(?:장용정|정|캡슐|시럽)\b", haystack))
 
     def _is_nonmedical_smalltalk_request(self, text_lower: str) -> bool:
         return any(

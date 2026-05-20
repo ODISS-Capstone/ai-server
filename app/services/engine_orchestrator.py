@@ -37,7 +37,7 @@ from app.services.llm import (
     classify_reasoning_route_with_llm,
     recover_medical_followup_with_llm,
 )
-from app.services.medication_extraction import is_wake_word_only
+from app.services.medication_extraction import is_wake_word_only, strip_wake_words
 from app.services.patient_safety import classify_patient_safety_situation
 
 logger = logging.getLogger(__name__)
@@ -241,6 +241,9 @@ class EngineOrchestrator:
 
         stage_started = perf_counter()
         context = dict(preloaded_context) if preloaded_context is not None else await self.memory.load_context(speaker_id)
+        gate_profile = (identity_gate_info.get("metadata") or {}).get("profile") or {}
+        if gate_profile and not (context.get("user_profile") or {}).get("name"):
+            context["user_profile"] = gate_profile
         trace_engine(
             "ME_Context",
             "MemoryEngine",
@@ -292,11 +295,13 @@ class EngineOrchestrator:
             )
             trace_memory("write", "CurrentManual.md", category="current_manual", path="flash/current_manual.md")
 
+        query_text = self._query_text_without_wake_word(text)
+
         stage_started = perf_counter()
-        llm_route = await self._classify_route_with_local_llm(text=text, context=context)
-        decision = self._decision_from_llm_route(llm_route, text) or self.reasoning.route_execution(
+        llm_route = await self._classify_route_with_local_llm(text=query_text, context=context)
+        decision = self._decision_from_llm_route(llm_route, query_text) or self.reasoning.route_execution(
             ReasoningRouteInput(
-                text=text,
+                text=query_text,
                 speaker_id=speaker_id,
                 is_smalltalk=input_data.get("is_smalltalk", False),
                 context=context,
@@ -321,11 +326,11 @@ class EngineOrchestrator:
             (perf_counter() - stage_started) * 1000,
         )
 
-        if self._should_suppress_turn(text=text, decision=decision, input_data=input_data):
+        if self._should_suppress_turn(text=query_text, decision=decision, input_data=input_data):
             recovery: dict[str, Any] = {}
             if not self._is_llm_ignore_route(decision):
                 recovery = await self._recover_suppressed_medical_followup(
-                    text=text,
+                    text=query_text,
                     context=context,
                 )
             if recovery.get("is_medical_followup") and recovery.get("response"):
@@ -353,10 +358,10 @@ class EngineOrchestrator:
                     context=context,
                     identity_gate=identity_gate_info,
                     decision=recovered_decision,
-                    evidence=self._empty_evidence(text),
+                    evidence=self._empty_evidence(query_text),
                     execution_results={
                         "intent": "medication_query",
-                        "query": text,
+                        "query": query_text,
                         "task_results": {"followup_recovery": recovery},
                         "emergency": False,
                     },
@@ -387,10 +392,10 @@ class EngineOrchestrator:
                 context=context,
                 identity_gate=identity_gate_info,
                 decision=decision,
-                evidence=self._empty_evidence(text),
+                evidence=self._empty_evidence(query_text),
                 execution_results={
                     "intent": decision.intent,
-                    "query": text,
+                    "query": query_text,
                     "task_results": {},
                     "emergency": False,
                     "suppressed": True,
@@ -408,7 +413,7 @@ class EngineOrchestrator:
 
         stage_started = perf_counter()
         if self._skip_evidence_preparation(decision):
-            evidence = self._empty_evidence(text)
+            evidence = self._empty_evidence(query_text)
             trace_engine(
                 "ME_RAG",
                 "MemoryEngine",
@@ -422,7 +427,7 @@ class EngineOrchestrator:
         else:
             evidence = await self.memory.prepare_evidence_bundle(
                 MemoryEvidenceRequest(
-                    query=text,
+                    query=query_text,
                     speaker_id=speaker_id,
                     ocr_payload=None,
                     allow_frontier_fallback=(
@@ -474,14 +479,14 @@ class EngineOrchestrator:
 
         execution_results: dict[str, Any] = {
             "intent": decision.intent,
-            "query": text,
+            "query": query_text,
             "task_results": {},
             "emergency": False,
         }
         if decision.mode == ReasoningMode.TOOL_FIRST:
             stage_started = perf_counter()
             execution_results = await self.reasoning.execute_tasks(
-                text=text,
+                text=query_text,
                 intent=decision.intent,
                 context=context,
                 tasks=decision.tasks,
@@ -493,7 +498,7 @@ class EngineOrchestrator:
                 result_keys=sorted(execution_results.get("task_results", {}).keys()),
             )
             tool_trace.extend(self._tool_trace_from_execution(decision.tasks, execution_results))
-            if "복용지도를 계획" in text:
+            if "복용지도를 계획" in query_text:
                 tool_trace.append(
                     ToolTraceEvent(
                         tool_id="reuse_previous_DUR_results_or_T4_if_missing",
@@ -534,7 +539,7 @@ class EngineOrchestrator:
             )
         elif decision.mode == ReasoningMode.MEMORY_ONLY:
             stage_started = perf_counter()
-            history = await self.memory.search_history(text, speaker_id=speaker_id)
+            history = await self.memory.search_history(query_text, speaker_id=speaker_id)
             execution_results["task_results"]["history"] = history
             trace_engine(
                 "ME_RAG",
@@ -560,14 +565,14 @@ class EngineOrchestrator:
 
         stage_started = perf_counter()
         core_message = self._deterministic_core_message(
-            text=text,
+            text=query_text,
             decision=decision,
             context=context,
             execution_results=execution_results,
         )
         if not core_message:
             core_message = await self._build_core_message(
-                text=text,
+                text=query_text,
                 decision_mode=decision.mode,
                 execution_results=execution_results,
                 evidence=evidence,
@@ -586,18 +591,18 @@ class EngineOrchestrator:
 
         judge_review: dict[str, Any] = {}
         reviewed_message = core_message
-        skip_llm_polish = self._skip_llm_polish(text=text, decision=decision)
+        skip_llm_polish = self._skip_llm_polish(text=query_text, decision=decision)
         should_run_judge = (
             include_judge
             and core_message
             and not skip_llm_polish
-            and self._requires_frontier_final_review(text, decision, core_message)
+            and self._requires_frontier_final_review(query_text, decision, core_message)
         )
         if should_run_judge:
             stage_started = perf_counter()
             judge_review = await self.llm_judge.review_final_answer(
                 core_message=core_message,
-                original_query=text,
+                original_query=query_text,
                 additional_context=self._build_review_context(context, execution_results),
             )
             reviewed_message = judge_review.get("reviewed_text") or core_message
@@ -620,16 +625,16 @@ class EngineOrchestrator:
             include_delivery_llm
             and reviewed_message
             and not skip_llm_polish
-            and not self._requires_medical_disclaimer(text, decision, reviewed_message)
+            and not self._requires_medical_disclaimer(query_text, decision, reviewed_message)
         )
         if should_run_delivery:
             stage_started = perf_counter()
             delivery_message = await call_local_delivery_llm(
-                original_query=text,
+                original_query=query_text,
                 reviewed_message=reviewed_message,
                 user_profile=context.get("user_profile"),
                 conversation_context=context.get("context_memory", ""),
-                require_disclaimer=self._requires_medical_disclaimer(text, decision, reviewed_message),
+                require_disclaimer=self._requires_medical_disclaimer(query_text, decision, reviewed_message),
             )
             trace_engine(
                 "DeliveryLLM",
@@ -646,7 +651,7 @@ class EngineOrchestrator:
         stage_started = perf_counter()
         conversation = self.conversation.compose_from_contract(
             ConversationComposeRequest(
-                input_text=text,
+                input_text=query_text,
                 user_profile=context.get("user_profile", {}) or {},
                 decision=decision,
                 evidence=evidence,
@@ -697,6 +702,11 @@ class EngineOrchestrator:
     @staticmethod
     def _skip_evidence_preparation(decision: Any) -> bool:
         return decision.mode == ReasoningMode.ASK_USER_CLARIFY or decision.intent == "emergency"
+
+    @staticmethod
+    def _query_text_without_wake_word(text: str) -> str:
+        cleaned = strip_wake_words(text)
+        return cleaned or (text or "").strip()
 
     @staticmethod
     def _should_suppress_turn(*, text: str, decision: Any, input_data: dict[str, Any]) -> bool:
@@ -1009,7 +1019,7 @@ class EngineOrchestrator:
     ) -> str:
         lowered = text.lower()
         profile = context.get("user_profile") or {}
-        prescription_meds = self._medications_from_prescription_log(context.get("prescription_log", ""))
+        prescription_meds = self._medications_from_context(context)
         effective_text = self._augment_followup_with_recent_subject(text, context)
 
         if decision.intent == "emergency":
@@ -1087,18 +1097,30 @@ class EngineOrchestrator:
             med = self._first_medication_from_text(text) or "해당 약"
             return f"복용 기록 저장 완료. 날짜: {date_text}. 시간: {time_text}. 약: {med}."
 
-        if self._is_meal_medication_prep_request(text) and prescription_meds:
+        if self._is_current_medication_record_recall(text):
+            if prescription_meds:
+                med_text = self._friendly_medication_label(prescription_meds)
+                return (
+                    f"맞아요. 현재 기록에 {med_text}이 남아 있습니다. "
+                    "앞으로 식후 복약 질문을 하시면 이 기록을 먼저 기준으로 안내드릴게요."
+                )
             return (
-                "식후에 복용해야 하는 약이 저장되어 있습니다. "
-                "밥을 드신 뒤에 다시 말씀해 주시면 어떤 약을 먹어야 하는지 알려드리겠습니다."
+                "제가 확인한 현재 복약 기록에는 약 이름이 보이지 않습니다. "
+                "약 이름을 다시 말씀해 주시면 바로 기록해두겠습니다."
+            )
+
+        if self._is_meal_medication_prep_request(text) and prescription_meds:
+            med_text = self._friendly_medication_label(prescription_meds)
+            return (
+                f"현재 기록에는 {med_text}이 저장되어 있습니다. "
+                "밥을 드신 뒤 복용할 약을 물어보시면 이 기록을 먼저 기준으로 안내드리겠습니다."
             )
 
         if self._is_after_meal_medication_request(text) and prescription_meds:
             med_text = self._friendly_medication_label(prescription_meds)
             return (
-                f"확인해보겠습니다. 지금 식후 복용 약을 드셔야 합니다. "
-                f"저장된 정보 기준으로는 {med_text}을 복용하시면 됩니다. "
-                "다만 실제 약 이름과 복용량은 약봉투에 적힌 내용과 반드시 한 번 더 확인해 주세요."
+                f"현재 기록 기준으로는 식후에 {med_text}을 복용하시면 됩니다. "
+                "복용량과 횟수는 약봉투에 적힌 내용과 한 번 더 맞춰봐 주세요."
             )
 
         if "어제" in text and any(token in text for token in ("기록", "먹", "복용")):
@@ -1472,6 +1494,31 @@ class EngineOrchestrator:
                     meds.append(name)
         return meds
 
+    @classmethod
+    def _medications_from_context(cls, context: dict[str, Any]) -> list[str]:
+        meds = cls._medications_from_prescription_log(context.get("prescription_log", ""))
+        text_parts: list[str] = [
+            str(context.get("prescription_log") or ""),
+            str(context.get("context_memory") or ""),
+            str(context.get("current_manual") or ""),
+            str(context.get("memory_prompt") or ""),
+        ]
+        for brief in context.get("memory_briefs") or []:
+            text_parts.append(str(brief or ""))
+        for item in context.get("relevant_memories") or []:
+            if isinstance(item, dict):
+                text_parts.append(str(item.get("body") or ""))
+                text_parts.append(str(item.get("description") or ""))
+        haystack = "\n".join(text_parts)
+        for token in ("혈압약", "고혈압약", "당뇨약", "인슐린", "와파린", "아스피린"):
+            if token in haystack and token not in meds:
+                meds.append("혈압약" if token == "고혈압약" else token)
+        for match in re.finditer(r"([가-힣A-Za-z0-9]+(?:장용정|정|캡슐|시럽))", haystack):
+            name = match.group(1).strip()
+            if name and name not in meds:
+                meds.append(name)
+        return meds[:8]
+
     @staticmethod
     def _is_lifestyle_memory_text(text: str) -> bool:
         return "산책" in text and "보리차" in text
@@ -1547,7 +1594,17 @@ class EngineOrchestrator:
 
     @staticmethod
     def _is_after_meal_medication_request(text: str) -> bool:
-        return "밥" in text and any(token in text for token in ("먹고 왔", "먹었", "식후")) and "약" in text
+        compact = re.sub(r"\s+", "", text or "")
+        return (
+            any(token in text for token in ("밥", "식후", "식사"))
+            and "약" in text
+            and any(token in compact for token in ("먹고왔", "먹었", "먹고난", "먹고나", "무슨약", "어떤약", "뭐먹", "먹어야"))
+        )
+
+    @staticmethod
+    def _is_current_medication_record_recall(text: str) -> bool:
+        compact = re.sub(r"\s+", "", text or "")
+        return "기록" in text and any(token in compact for token in ("남아있", "있지않", "먹고있", "복용중"))
 
     @staticmethod
     def _friendly_medication_label(meds: list[str]) -> str:
