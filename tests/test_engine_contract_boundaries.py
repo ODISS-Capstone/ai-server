@@ -40,10 +40,12 @@ def test_reasoning_route_execution_modes_are_contractual():
     assert tool_first.mode == ReasoningMode.TOOL_FIRST
     assert tool_first.tasks
 
-    frontier = engine.route_execution(
+    out_of_scope = engine.route_execution(
         ReasoningRouteInput(text="오늘 뉴스 요약해줘", is_smalltalk=False, context={})
     )
-    assert frontier.mode == ReasoningMode.FRONTIER_FIRST
+    assert out_of_scope.mode == ReasoningMode.MEMORY_ONLY
+    assert out_of_scope.intent == IntentType.UNKNOWN
+    assert out_of_scope.rationale == "out_of_scope_smalltalk_suppressed"
 
 
 def test_conversation_contract_never_exposes_think_token():

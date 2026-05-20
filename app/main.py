@@ -21,6 +21,7 @@ from app.api.routes import agent_ws, ocr_api, stt_api
 from app.core.config import settings
 from app.core.logging_config import configure_logging
 from app.database.md_store import md_store
+from app.engines.memory import MemoryEngine
 from app.services import turboquant_runtime
 
 configure_logging()
@@ -49,6 +50,9 @@ async def lifespan(app: FastAPI):
 
     await md_store.initialize()
     logger.info("MD Database Layer 초기화 완료 (%s)", settings.md_database_path)
+
+    await MemoryEngine().bootstrap_flash_from_permanent()
+    logger.info("Flash Memory bootstrap 완료 (no active dialogue)")
 
     turboquant_runtime.install()
 

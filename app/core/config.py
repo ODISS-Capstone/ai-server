@@ -57,6 +57,9 @@ class Settings(BaseSettings):
     llm_tools_path: str = "./app/prompts/llm_tools.json"
     internal_llm_timeout_seconds: float = 6.0
     local_delivery_llm_timeout_seconds: float = 4.0
+    internal_llm_temperature: float = 0.1
+    internal_llm_route_temperature: float = 0.0
+    internal_llm_delivery_temperature: float = 0.1
     llm_engine_max_concurrency_internal: int = 1
     llm_engine_max_concurrency_external: int = 1
     llm_engine_max_concurrency_judge: int = 1

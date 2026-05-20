@@ -141,6 +141,8 @@ class ReminderService:
                     text=stripped,
                     user_profile=user_profile,
                 )
+            if self._is_wait_ack(stripped):
+                return None
             return "복약 알림 설정을 계속할까요? 계속하려면 '네', 취소하려면 '아니'라고 말씀해 주세요."
 
         if self.is_taken_recall(stripped):
@@ -277,8 +279,10 @@ class ReminderService:
     ) -> str:
         now = self._now()
         prompt = self._last_prompt.get(speaker_id, {})
-        meal = self._meal_from_text(text) or prompt.get("meal") or "식후"
-        medication_label = self._medication_from_text(text) or prompt.get("medication_label")
+        explicit_medication = self._medication_from_text(text)
+        bare_confirmation = self._is_bare_taken_confirmation(text)
+        meal = self._meal_from_text(text) or (prompt.get("meal") if bare_confirmation else "") or "식후"
+        medication_label = explicit_medication or (prompt.get("medication_label") if bare_confirmation else "")
         if not medication_label:
             medication_label = self._active.get(speaker_id, ReminderSchedule(speaker_id, {})).medication_label
         if not medication_label:
@@ -344,14 +348,25 @@ class ReminderService:
     @staticmethod
     def is_taken_confirmation(text: str) -> bool:
         stripped = text.strip().lower()
-        if stripped in {"먹었어", "먹었어요", "먹었습니다", "복용했어", "복용했어요"}:
+        normalized = ReminderService._normalize_short_reply(stripped)
+        if normalized in {"먹었어", "먹었어요", "먹었습니다", "복용했어", "복용했어요"}:
             return True
-        return any(token in stripped for token in ("약 먹었어", "약 먹었어요", "복용했어", "혈압약 먹었어"))
+        return any(
+            token in stripped
+            for token in (
+                "약 먹었어",
+                "약 먹었어요",
+                "복용했어",
+                "복용했어요",
+                "혈압약 먹었어",
+                "혈압약 먹었어요",
+            )
+        )
 
     @staticmethod
     def is_taken_recall(text: str) -> bool:
         lowered = text.lower()
-        return any(token in lowered for token in ("약 먹었나", "복용했나", "먹었는지", "먹었나?"))
+        return any(token in lowered for token in ("약 먹었나", "복용했나", "먹었는지", "먹었나?", "아까 약", "아까 먹"))
 
     @staticmethod
     def extract_time_overrides(text: str) -> dict[str, str]:
@@ -495,6 +510,11 @@ class ReminderService:
     def _is_affirmative(text: str) -> bool:
         return any(token in text.strip().lower() for token in ("네", "예", "응", "그래", "괜찮", "좋아", "맞아"))
 
+    @staticmethod
+    def _is_wait_ack(text: str) -> bool:
+        lowered = text.strip().lower()
+        return any(token in lowered for token in ("알았어", "알겠습니다", "기다려", "잠시", "나중에"))
+
     def _is_pending_expired(self, speaker_id: str) -> bool:
         started_at = self._pending_started_at.get(speaker_id)
         if not started_at:
@@ -505,6 +525,20 @@ class ReminderService:
     def _is_rejection(text: str) -> bool:
         lowered = text.strip().lower()
         return any(token in lowered for token in ("아니", "아냐", "취소", "하지 마", "하지마", "싫", "필요 없어", "안 해"))
+
+    @staticmethod
+    def _is_bare_taken_confirmation(text: str) -> bool:
+        return ReminderService._normalize_short_reply(text) in {
+            "먹었어",
+            "먹었어요",
+            "먹었습니다",
+            "복용했어",
+            "복용했어요",
+        }
+
+    @staticmethod
+    def _normalize_short_reply(text: str) -> str:
+        return re.sub(r"[\s.?!,，。~]+", "", (text or "").strip().lower())
 
     @staticmethod
     def _medication_label_from_context(prescription_log: str) -> str:

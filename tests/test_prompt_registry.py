@@ -90,6 +90,7 @@ def test_configured_prompts_keep_conversation_guardrails():
             "local_delivery",
             "identity_conflict_judge",
             "identity_profile_extract",
+            "prior_conversation_judge",
         )
     )
 

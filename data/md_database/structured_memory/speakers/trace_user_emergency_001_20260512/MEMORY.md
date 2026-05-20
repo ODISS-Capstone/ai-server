@@ -1,2 +1,0 @@
-- [최신 복약 및 DUR 요약](current_medication.md) - 최근 OCR 처방 약품: 아스피린장용정
-- [환자 프로필](patient_profile.md) - trace_user_emergency_001_20260512 환자 기본 프로필

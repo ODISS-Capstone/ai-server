@@ -26,6 +26,12 @@ from app.schemas.engine_contracts import (
     MemoryEvidenceRequest,
 )
 from app.services.dur_summary import summarize_dur_result
+from app.services.medication_extraction import (
+    extract_medication_suffix_tokens,
+    filter_drug_name_candidates,
+    is_non_medication_token,
+    strip_wake_words,
+)
 from app.services.patient_safety import classify_patient_safety_situation
 from app.tools import llm_search
 
@@ -57,6 +63,52 @@ class MemoryEngine:
     async def initialize(self) -> None:
         await self.store.initialize()
         await self.structured_memory.initialize()
+
+    async def bootstrap_flash_from_permanent(
+        self,
+        speaker_id: Optional[str] = None,
+    ) -> None:
+        """Rebuild volatile flash memory from permanent memory when no dialogue is active.
+
+        Runtime policy:
+        - Server/session startup may rebuild flash from permanent memory.
+        - During an active user dialogue, use current flash and only refresh after
+          explicit writes in that same turn.
+        """
+        await self.initialize()
+        if speaker_id and await self.store.user_exists(speaker_id):
+            profile = self._parse_profile(
+                await self.store.read_user_file(speaker_id, "profile.md")
+            )
+            await self.update_flash_profile(speaker_id, profile)
+            history = await self.store.read_user_file(speaker_id, "history.md")
+            medication_events = await self.store.read_user_file(speaker_id, "medication_events.md")
+            await self.store.write_flash(
+                "current_manual",
+                self._format_patient_special_notes(profile, history, medication_events),
+            )
+
+        latest_prescriptions = await self.store.read_latest("prescriptions", n=1)
+        if latest_prescriptions:
+            med_names = self._extract_medications_from_markdown(
+                latest_prescriptions[0].get("content", "")
+            )
+            if med_names:
+                await self.store.write_flash(
+                    "prescription_log",
+                    self._format_prescription_log(
+                        med_names,
+                        recorded_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    ),
+                )
+
+        latest_logs = await self.store.read_latest("medication_log", n=1)
+        if latest_logs:
+            content = latest_logs[0].get("content", "")
+            await self.store.write_flash(
+                "context_memory",
+                self._format_context_memory_from_latest_log(content),
+            )
 
     # ── OCR_Logging: 처방전 OCR 로깅 ──
 
@@ -212,13 +264,18 @@ class MemoryEngine:
             await self._register_new_user(speaker_id)
         profile_md = await self.store.read_user_file(speaker_id, "profile.md")
         profile = self._parse_profile(profile_md)
+        flash_profile = self._parse_flash_current_user_profile(
+            await self.store.read_flash("current_user_profile")
+        )
         return {
             "speaker_id": speaker_id,
             "exists": exists,
             "profile": profile,
+            "flash_profile": flash_profile,
             "profile_text": profile_md,
             "pending_identity_action": profile.get("pending_identity_action", ""),
             "pending_identity_candidate": profile.get("pending_identity_candidate", {}),
+            "pending_identity_since": profile.get("pending_identity_since", ""),
             "last_seen_at": profile.get("last_seen_at", ""),
             "verified_at": profile.get("verified_at", ""),
         }
@@ -235,13 +292,22 @@ class MemoryEngine:
     ) -> dict[str, Any]:
         """Merge identity fields into the patient profile markdown."""
         current = self._parse_profile(await self.store.read_user_file(speaker_id, "profile.md"))
+        profile_update = self._normalize_profile_update(profile_update)
         merged = {**current, **{key: value for key, value in profile_update.items() if value}}
         timestamp = (now or datetime.now()).isoformat(timespec="seconds")
         if mark_seen:
             merged["last_seen_at"] = timestamp
         if mark_verified:
             merged["verified_at"] = timestamp
+        previous_pending = current.get("pending_identity_action", "")
         merged["pending_identity_action"] = pending_identity_action
+        if pending_identity_action:
+            if pending_identity_action != previous_pending or not current.get("pending_identity_since"):
+                merged["pending_identity_since"] = timestamp
+            else:
+                merged["pending_identity_since"] = current.get("pending_identity_since", "")
+        else:
+            merged.pop("pending_identity_since", None)
         if "pending_identity_candidate" in profile_update:
             merged["pending_identity_candidate"] = profile_update["pending_identity_candidate"]
         elif not pending_identity_action:
@@ -258,6 +324,24 @@ class MemoryEngine:
             },
         )
         return merged
+
+    def _normalize_profile_update(self, profile_update: dict[str, Any]) -> dict[str, Any]:
+        normalized = dict(profile_update or {})
+        if "name" in normalized:
+            name = self._normalize_korean_person_name(str(normalized.get("name") or "").strip())
+            if not name or self._looks_like_non_name_identity_candidate(name):
+                normalized.pop("name", None)
+            else:
+                normalized["name"] = name
+        return normalized
+
+    @staticmethod
+    def _normalize_korean_person_name(name: str) -> str:
+        if len(name) >= 3 and name.endswith(("이가", "이는", "이야")):
+            return name[:-2]
+        if len(name) >= 4 and name[-1:] in {"가", "은", "는", "야"}:
+            return name[:-1]
+        return name
 
     async def mark_identity_pending(self, speaker_id: str, action: str) -> dict[str, Any]:
         return await self.save_identity_profile(
@@ -503,11 +587,6 @@ class MemoryEngine:
                 speaker_id=speaker_id,
             )
 
-            profile_update = self._extract_profile_from_text(query_text)
-            if profile_update:
-                await self._save_user_profile(speaker_id, profile_update)
-                await self.update_flash_profile(speaker_id, profile_update)
-
             existing = await self.store.read_user_file(speaker_id, "history.md")
             entry = (
                 f"\n---\n### {now} ({resp_type})\n"
@@ -639,6 +718,12 @@ class MemoryEngine:
             f"| 기저질환 | {', '.join(profile.get('conditions', []))} |\n"
         )
         await self.store.write_flash("current_user_profile", content)
+        history = await self.store.read_user_file(speaker_id, "history.md")
+        medication_events = await self.store.read_user_file(speaker_id, "medication_events.md")
+        await self.store.write_flash(
+            "current_manual",
+            self._format_patient_special_notes(profile, history, medication_events),
+        )
         await self.structured_memory.sync_patient_profile(speaker_id, profile)
 
     # ── 내부 유틸 ──
@@ -655,9 +740,13 @@ class MemoryEngine:
         profile: dict[str, Any] = {}
         name_patterns = [
             r"(?:제\s*이름은|이름은)\s*([가-힣]{2,5}?)(?:이고|고|입니다|이에요|예요|,|\s|$)",
-            r"(?:저는|나는)\s*([가-힣]{2,5}?)(?:이고|고|입니다|이에요|예요|,|\s|$)",
+            r"(?:저는|나는|난)\s*([가-힣]{2,5})(?:이야|야)(?:\.|$|\s)",
+            r"(?:저는|나는|난)\s*([가-힣]{2,5}?)(?:이고|고|입니다|이에요|예요|,|\s|$)",
+            r"(?:^|\s)([가-힣]{2,5})\s*,?\s*(?:\d{1,3}|[가-힣]{2,8})\s*(?:살|세)\s*(?:남자|남성|여자|여성)?",
+            r"(?:^|\s)([가-힣]{2,5})\s*(?:남자|남성|여자|여성)\s*,?\s*\d{1,3}\s*(?:살|세)?",
+            r"^\s*([가-힣]{2,5})(?:야|요|입니다|이에요|예요)(?:\.|$|\s)",
             r"^\s*([가-힣]{2,5})\s*(?:남자|남성|여자|여성)",
-            r"^\s*([가-힣]{2,5})\s*,?\s*\d{1,3}\s*(?:살|세)",
+            r"^\s*([가-힣]{2,5})\s*,?\s*(?:\d{1,3}|[가-힣]{2,8})\s*(?:살|세)",
             (
                 r"(?:환자|대상자|아버지|어머니|엄마|아빠|남편|아내|배우자)"
                 r"(?:\s*이름은|\s*성함은|\s*는|\s*가|\s*께서는)?\s*"
@@ -676,17 +765,73 @@ class MemoryEngine:
         age_match = re.search(r"(\d{1,3})\s*(?:살|세)", text)
         if age_match:
             profile["age"] = age_match.group(1)
+        else:
+            korean_age_match = re.search(r"([가-힣]{2,8})\s*(?:살|세)", text)
+            if korean_age_match:
+                age = self._parse_korean_age(korean_age_match.group(1))
+                if age:
+                    profile["age"] = str(age)
         if "남자" in text or "남성" in text:
             profile["gender"] = "남성"
         elif "여자" in text or "여성" in text:
             profile["gender"] = "여성"
         conditions = []
-        for token in ("고혈압", "당뇨", "천식", "신장질환", "간질환", "심장질환", "임신 가능성", "임신"):
+        for token in ("고혈압", "당뇨", "천식", "통풍", "신장질환", "간질환", "심장질환", "임신 가능성", "임신"):
             if token in text:
                 conditions.append(token)
         if conditions:
             profile["conditions"] = conditions
         return profile
+
+    @staticmethod
+    def _parse_korean_age(text: str) -> int:
+        compact = re.sub(r"\s+", "", text or "")
+        direct = {
+            "스무": 20,
+            "스물": 20,
+            "서른": 30,
+            "마흔": 40,
+            "쉰": 50,
+            "예순": 60,
+            "일흔": 70,
+            "여든": 80,
+            "아흔": 90,
+        }
+        if compact in direct:
+            return direct[compact]
+        tens = {
+            "스물": 20,
+            "서른": 30,
+            "마흔": 40,
+            "쉰": 50,
+            "예순": 60,
+            "일흔": 70,
+            "여든": 80,
+            "아흔": 90,
+        }
+        ones = {
+            "한": 1,
+            "하나": 1,
+            "두": 2,
+            "둘": 2,
+            "세": 3,
+            "셋": 3,
+            "네": 4,
+            "넷": 4,
+            "다섯": 5,
+            "여섯": 6,
+            "일곱": 7,
+            "여덟": 8,
+            "아홉": 9,
+        }
+        for ten_text, ten_value in tens.items():
+            if compact.startswith(ten_text):
+                rest = compact[len(ten_text):]
+                if not rest:
+                    return ten_value
+                if rest in ones:
+                    return ten_value + ones[rest]
+        return 0
 
     @staticmethod
     def _looks_like_non_name_identity_candidate(value: str) -> bool:
@@ -698,6 +843,10 @@ class MemoryEngine:
             "간질환",
             "심장질환",
             "임신",
+        "남자고",
+        "여자고",
+        "남성이고",
+        "여성이고",
             "딸",
             "딸이",
             "아들",
@@ -708,6 +857,11 @@ class MemoryEngine:
             "아빠",
             "아버지",
             "어머니",
+            "먹어",
+            "먹고",
+            "먹었",
+            "알려",
+            "나중에",
         }
 
     async def _register_new_user(self, speaker_id: str) -> None:
@@ -719,8 +873,9 @@ class MemoryEngine:
                 "gender": "",
                 "age": "",
                 "conditions": [],
-                "pending_identity_action": "registration",
+                "pending_identity_action": "prior_conversation_check",
                 "pending_identity_candidate": {},
+                "pending_identity_since": now.isoformat(timespec="seconds"),
                 "last_seen_at": "",
                 "verified_at": "",
             },
@@ -755,6 +910,7 @@ class MemoryEngine:
             "최종대화": "last_seen_at",
             "최종확인": "verified_at",
             "신원확인상태": "pending_identity_action",
+            "신원확인시작": "pending_identity_since",
             "신원후보": "pending_identity_candidate",
         }
         for line in profile_md.split("\n"):
@@ -779,6 +935,18 @@ class MemoryEngine:
                                 parsed_candidate = {}
                             result[canonical_key] = parsed_candidate if isinstance(parsed_candidate, dict) else {}
         return result
+
+    def _parse_flash_current_user_profile(self, profile_md: str) -> dict[str, Any]:
+        profile = self._parse_profile(profile_md or "")
+        if not profile:
+            return {}
+        normalized = self._normalize_profile_update(profile)
+        conditions = profile.get("conditions")
+        if isinstance(conditions, list):
+            normalized["conditions"] = conditions
+        if normalized.get("name") and (normalized.get("age") or normalized.get("gender")):
+            return normalized
+        return {}
 
     def _text_relevant(self, text: str, query: str) -> bool:
         if not text or not query:
@@ -898,28 +1066,20 @@ class MemoryEngine:
         return " | ".join(parts[:5])
 
     def _extract_query_medications(self, query: str) -> list[str]:
-        meds: list[str] = []
-        for match in re.finditer(r"([가-힣A-Za-z0-9]+(?:장용정|정|캡슐|시럽))", query):
-            token = self._normalize_medication_name(match.group(1))
-            if token:
-                meds.append(token)
+        cleaned_query = strip_wake_words(query)
+        if not cleaned_query:
+            return []
+        meds: list[str] = list(extract_medication_suffix_tokens(cleaned_query))
         for known_name in COMMON_MEDICATION_NAMES:
-            if known_name in query:
+            if known_name in cleaned_query:
                 meds.append(known_name)
-        for token in query.split():
+        for token in cleaned_query.split():
             token = self._normalize_medication_name(token)
-            if not token:
-                continue
-            if len(token) < 2:
+            if not token or is_non_medication_token(token):
                 continue
             if "정" in token or "캡슐" in token or "시럽" in token:
                 meds.append(token)
-        # keep uniqueness
-        unique: list[str] = []
-        for med in meds:
-            if med not in unique:
-                unique.append(med)
-        return unique[:5]
+        return filter_drug_name_candidates(meds)[:5]
 
     def extract_ocr_medications_from_text(self, text: str) -> list[str]:
         """Extract medication names from STT text that explicitly reports OCR output."""
@@ -947,6 +1107,85 @@ class MemoryEngine:
             + "\n".join(f"- {name}" for name in med_names)
             + "\n"
         )
+
+    def _format_patient_special_notes(
+        self,
+        profile: dict[str, Any],
+        history: str,
+        medication_events: str,
+    ) -> str:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        name = profile.get("name") or "등록 전"
+        age = profile.get("age") or "-"
+        gender = profile.get("gender") or "-"
+        conditions = self._normalize_conditions(profile.get("conditions"))
+        notes: list[str] = [
+            f"- 대상자: {name}",
+            f"- 연령/성별: {age} / {gender}",
+            f"- 기저질환: {', '.join(conditions) if conditions else '-'}",
+        ]
+        recent_history = self._latest_history_excerpt(history)
+        if recent_history:
+            notes.append(f"- 최근 상담 특이사항: {recent_history}")
+        latest_event = self._latest_medication_event_summary(medication_events)
+        if latest_event:
+            notes.append(f"- 최근 복약 이력: {latest_event}")
+        return (
+            f"# 현재 환자 특이 이력사항\n> 최종 갱신: {now}\n\n"
+            + "\n".join(notes)
+            + "\n"
+        )
+
+    @staticmethod
+    def _format_context_memory_from_latest_log(content: str) -> str:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        question = ""
+        answer = ""
+        if "## 질문" in content:
+            question = content.split("## 질문", 1)[1].split("## 응답", 1)[0].strip()
+        if "## 응답" in content:
+            answer = content.split("## 응답", 1)[1].strip()
+        return (
+            f"# 대화 컨텍스트 메모리\n> 최종 갱신: {now}\n\n"
+            "## 최근 대화 요약\n"
+            f"- 질문: {question[:100]}\n"
+            f"- 핵심 응답: {answer[:200]}\n"
+        )
+
+    @staticmethod
+    def _latest_history_excerpt(history: str) -> str:
+        if not history.strip():
+            return ""
+        chunks = [chunk.strip() for chunk in history.split("---") if chunk.strip()]
+        return re.sub(r"\s+", " ", chunks[-1])[:180] if chunks else ""
+
+    def _latest_medication_event_summary(self, content: str) -> str:
+        events = self._parse_medication_events(content)
+        if not events:
+            return ""
+        event = events[-1]
+        return " ".join(
+            str(part)
+            for part in (
+                event.get("date"),
+                event.get("time"),
+                event.get("medication"),
+                event.get("action"),
+            )
+            if part
+        )
+
+    def _extract_medications_from_markdown(self, content: str) -> list[str]:
+        names: list[str] = []
+        for line in (content or "").splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("- "):
+                continue
+            candidate = stripped[2:].split(":", 1)[0].strip()
+            candidate = self._normalize_medication_name(candidate)
+            if candidate and candidate not in names and not is_non_medication_token(candidate):
+                names.append(candidate)
+        return names[:10]
 
     @staticmethod
     def _parse_medication_events(content: str) -> list[dict[str, Any]]:
@@ -1012,6 +1251,7 @@ class MemoryEngine:
     ) -> str:
         conditions = self._normalize_conditions(profile.get("conditions"))
         pending = profile.get("pending_identity_action", "")
+        pending_since = profile.get("pending_identity_since", "")
         candidate = profile.get("pending_identity_candidate") or {}
         candidate_text = "-"
         if isinstance(candidate, dict) and candidate:
@@ -1028,6 +1268,7 @@ class MemoryEngine:
             f"| 최종대화 | {profile.get('last_seen_at') or '-'} |\n"
             f"| 최종확인 | {profile.get('verified_at') or '-'} |\n"
             f"| 신원확인상태 | {pending or '-'} |\n"
+            f"| 신원확인시작 | {pending_since or '-'} |\n"
             f"| 신원후보 | {candidate_text} |\n"
         )
 

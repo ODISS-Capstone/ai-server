@@ -12,6 +12,7 @@
 import json
 import logging
 import asyncio
+import re
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -23,7 +24,9 @@ from app.engines.reasoning import ReasoningEngine
 from app.engines.llm_judge import LLMJudgeEngine
 from app.services.engine_orchestrator import EngineOrchestrator
 from app.services.identity_guard import evaluate_identity_gate
+from app.services.llm import extract_ocr_medication_candidates_with_llm, refine_ocr_medication_candidates_with_context
 from app.services.reminders import ReminderService
+from app.tools import llm_search
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -40,8 +43,16 @@ engine_orchestrator = EngineOrchestrator(
 )
 reminder_service = ReminderService()
 _pending_ocr_by_speaker: dict[str, dict[str, Any]] = {}
+_queued_ocr_request_by_speaker: dict[str, dict[str, Any]] = {}
+_bootstrapped_speakers: set[str] = set()
 OCR_PENDING_TTL = timedelta(minutes=5)
 ANONYMOUS_OCR_KEY = "__anonymous__"
+WEBSOCKET_IDLE_TIMEOUT_SEC = 65.0
+MEDICATION_PROGRESS_FILLERS = (
+    "복용 안전 확인이 필요해서 조금 더 살펴볼게요.",
+    "복용 중인 약 기준으로 같이 먹어도 되는지 확인하고 있어요.",
+    "처방을 바꾸라는 뜻은 아니고, 주의할 조합이 있는지만 확인 중이에요.",
+)
 
 
 @router.websocket("/ws/chat")
@@ -66,7 +77,21 @@ async def websocket_chat(websocket: WebSocket):
         await memory_engine.initialize()
 
         while True:
-            raw = await websocket.receive_text()
+            try:
+                raw = await asyncio.wait_for(
+                    websocket.receive_text(),
+                    timeout=WEBSOCKET_IDLE_TIMEOUT_SEC,
+                )
+            except asyncio.TimeoutError:
+                await websocket.send_json(
+                    {
+                        "type": "session_closed",
+                        "reason": "idle_timeout",
+                        "requires_tts": False,
+                    }
+                )
+                logger.info("WebSocket idle timeout; closing session")
+                break
             try:
                 message = json.loads(raw)
             except json.JSONDecodeError:
@@ -77,7 +102,9 @@ async def websocket_chat(websocket: WebSocket):
 
             msg_type = message.get("type", "")
 
-            if msg_type == "stt_result":
+            if msg_type in {"stt_result", "identity_confirmed"}:
+                if msg_type == "identity_confirmed" and not message.get("text"):
+                    message["text"] = "네, 본인 맞습니다."
                 await _handle_stt(websocket, message, active_speakers)
             elif msg_type == "ocr_result":
                 await _handle_ocr(websocket, message)
@@ -114,7 +141,21 @@ async def _handle_stt(websocket: WebSocket, message: dict, active_speakers: set[
         )
         return
 
+    if _is_incomplete_or_noise_utterance(text):
+        await websocket.send_json(
+            {
+                "type": "ignored",
+                "reason": "incomplete_or_noise_utterance",
+                "requires_tts": False,
+            }
+        )
+        return
+
     if speaker_id:
+        if speaker_id not in _bootstrapped_speakers:
+            await memory_engine.bootstrap_flash_from_permanent(speaker_id)
+            _bootstrapped_speakers.add(speaker_id)
+
         async def send_reminder(payload: dict[str, Any]) -> None:
             await websocket.send_json(payload)
 
@@ -122,12 +163,35 @@ async def _handle_stt(websocket: WebSocket, message: dict, active_speakers: set[
         active_speakers.add(speaker_id)
         await reminder_service.restore_for_speaker(memory_engine, speaker_id)
 
+    pending_ocr_confirmation = _has_pending_ocr_confirmation(speaker_id)
+    queued_ocr_reason = ""
+    if not pending_ocr_confirmation:
+        if _is_ocr_recapture_reply(text):
+            queued_ocr_reason = "user_requested_recapture"
+        elif _is_direct_ocr_capture_request(text):
+            queued_ocr_reason = "direct_ocr_capture_request"
+        if queued_ocr_reason:
+            _queue_ocr_request(speaker_id, queued_ocr_reason)
+
     identity_gate = await evaluate_identity_gate(
         memory_engine=memory_engine,
         text=text,
         speaker_id=speaker_id,
     )
     if not identity_gate.allowed:
+        if identity_gate.response_type == "ignored" and not identity_gate.response_text:
+            await websocket.send_json(
+                {
+                    "type": "ignored",
+                    "reason": identity_gate.reason,
+                    "requires_tts": False,
+                    "identity_gate": {
+                        "reason": identity_gate.reason,
+                        "metadata": identity_gate.metadata or {},
+                    },
+                }
+            )
+            return
         response = conversation_engine.build_response(
             {
                 "text": identity_gate.response_text,
@@ -147,10 +211,17 @@ async def _handle_stt(websocket: WebSocket, message: dict, active_speakers: set[
         )
         return
 
-    context = await memory_engine.load_context(speaker_id)
+    if queued_ocr_reason:
+        await _send_queued_ocr_request_if_ready(websocket, speaker_id)
+        return
 
     if await _handle_pending_ocr_confirmation(websocket, text, speaker_id):
         return
+
+    if await _send_queued_ocr_request_if_ready(websocket, speaker_id):
+        return
+
+    context = await memory_engine.load_context(speaker_id)
 
     reminder_text = await reminder_service.handle_user_text(
         memory_engine=memory_engine,
@@ -185,22 +256,43 @@ async def _handle_stt(websocket: WebSocket, message: dict, active_speakers: set[
     if pre_filler:
         await websocket.send_json({"type": "filler", "text": pre_filler})
 
-    turn = await engine_orchestrator.run_turn(
-        text=text,
-        speaker_id=speaker_id,
-        include_judge=True,
-        include_delivery_llm=True,
-        allow_frontier_memory_fallback=True,
-        preloaded_context=context,
+    progress_task = asyncio.create_task(
+        _send_progress_fillers(websocket, text, initial_sent=bool(pre_filler))
     )
+    try:
+        turn = await engine_orchestrator.run_turn(
+            text=text,
+            speaker_id=speaker_id,
+            include_judge=True,
+            include_delivery_llm=True,
+            allow_frontier_memory_fallback=True,
+            preloaded_context=context,
+        )
+    finally:
+        progress_task.cancel()
+        try:
+            await progress_task
+        except asyncio.CancelledError:
+            pass
 
     if turn.filler_text and not pre_filler:
         await websocket.send_json({"type": "filler", "text": turn.filler_text})
+
+    if not turn.conversation.requires_tts and not turn.conversation.response_text:
+        await websocket.send_json(
+            {
+                "type": "ignored",
+                "reason": turn.decision.rationale,
+                "requires_tts": False,
+            }
+        )
+        return
 
     # OCR 요청이 필요한 경우
     if turn.execution_results.get("task_results", {}).get("ocr_requested"):
         ocr_request = reasoning_engine.request_ocr()
         await websocket.send_json({"type": "ocr_request", **ocr_request})
+        return
 
     synthesis = {
         "text": turn.conversation.response_text,
@@ -226,6 +318,109 @@ async def _handle_stt(websocket: WebSocket, message: dict, active_speakers: set[
         await memory_engine.mark_identity_seen(speaker_id, verified=True)
 
 
+async def _send_progress_fillers(
+    websocket: WebSocket,
+    text: str,
+    *,
+    initial_sent: bool,
+) -> None:
+    """Send short spoken progress updates while slow medication reasoning runs."""
+    lowered = text.lower()
+    if not any(token in lowered for token in ("약", "복용", "같이 먹", "먹어도", "녹용", "영양제", "건강기능식품", "비타민", "오메가3", "dur")):
+        return
+    delays = (2.5, 6.0, 9.5) if initial_sent else (0.4, 3.5, 7.0)
+    try:
+        for delay, filler in zip(delays, MEDICATION_PROGRESS_FILLERS):
+            await asyncio.sleep(delay)
+            await websocket.send_json({"type": "filler", "text": filler})
+    except WebSocketDisconnect:
+        raise
+
+
+def _is_incomplete_or_noise_utterance(text: str) -> bool:
+    raw = (text or "").strip()
+    if not raw:
+        return True
+    compact = re.sub(r"[\s.?!,，。~]+", "", raw)
+    if compact in {"이오디오는", "이오는", "한국어음성입니다", "이오디오는한국어음성입니다"}:
+        return True
+    if compact in {
+        "어",
+        "음",
+        "음음",
+        "어어",
+        "네",
+        "딸깍",
+        "찰칵",
+        "흠",
+        "흐음",
+        "으음",
+        "아",
+        "네어그",
+        "음나이거",
+        "나이거그",
+        "나이거그서번서번",
+    }:
+        return True
+    tokens = raw.split()
+    filler_tokens = {"어", "음", "그", "저", "이거", "그거", "아", "흠", "흐음", "으음", "네", "나"}
+    if tokens and all(token in filler_tokens for token in tokens):
+        return True
+    if 2 <= len(tokens) <= 5 and tokens[-1] in {"그", "저", "이거", "그거"}:
+        return not _has_actionable_signal(raw)
+    return False
+
+
+def _has_actionable_signal(text: str) -> bool:
+    return any(
+        token in text
+        for token in (
+            "약",
+            "처방",
+            "사진",
+            "찍",
+            "촬영",
+            "알림",
+            "먹었",
+            "복용",
+            "이름",
+            "살",
+            "세",
+            "남성",
+            "여성",
+            "남자",
+            "여자",
+            "고혈압",
+            "녹용",
+            "비타민",
+            "누구",
+            "안녕",
+            "고마",
+        )
+    )
+
+
+def _is_direct_ocr_capture_request(text: str) -> bool:
+    lowered = (text or "").lower()
+    return (
+        any(token in lowered for token in ("처방전", "약봉투", "약 사진", "약사진", "ocr"))
+        and any(token in lowered for token in ("찍", "촬영", "켜", "등록", "저장", "보여", "읽"))
+    ) or (
+        "카메라" in lowered
+        and any(token in lowered for token in ("켜", "찍", "촬영"))
+    )
+
+
+def _redact_ocr_context(text: str) -> str:
+    redacted = text or ""
+    redacted = re.sub(r"\d{6}-?\d{7}", "[주민등록번호]", redacted)
+    redacted = re.sub(r"\b01[016789]-?\d{3,4}-?\d{4}\b", "[전화번호]", redacted)
+    redacted = re.sub(r"\b0\d{1,2}-?\d{3,4}-?\d{4}\b", "[전화번호]", redacted)
+    redacted = re.sub(r"(성명\s*[|:]\s*)[가-힣]{2,5}", r"\1[성명]", redacted)
+    redacted = re.sub(r"(환자\s*(?:명|성명)?\s*[|:]\s*)[가-힣]{2,5}", r"\1[성명]", redacted)
+    return redacted
+
+
 async def _handle_ocr(websocket: WebSocket, message: dict) -> None:
     """OCR 결과를 받아 메모리에 저장 및 DUR 동기화."""
     ocr_data = message.get("data", {})
@@ -237,19 +432,31 @@ async def _handle_ocr(websocket: WebSocket, message: dict) -> None:
         )
         return
 
-    medications = ocr_data.get("medications", [])
+    medications = await _normalize_ocr_medications(ocr_data)
+    if medications:
+        ocr_data["medications"] = medications
     if _is_uncertain_ocr_result(ocr_data):
+        message_text = (
+            "죄송합니다. 이번 사진에서는 약 이름 일부가 흐리게 인식되었습니다. "
+            "복약 정보는 정확해야 하므로 추측해서 저장하지 않겠습니다. "
+            "약봉투를 조금 더 가까이 보여주시고, 글자가 빛에 반사되지 않게 다시 촬영해 주세요."
+        )
         await websocket.send_json(
             {
                 "type": "ocr_processed",
-                "message": (
-                    "죄송합니다. 이번 사진에서는 약 이름 일부가 흐리게 인식되었습니다. "
-                    "복약 정보는 정확해야 하므로 추측해서 저장하지 않겠습니다. "
-                    "약봉투를 조금 더 가까이 보여주시고, 글자가 빛에 반사되지 않게 다시 촬영해 주세요."
-                ),
+                "message": message_text,
                 "medication_count": len(medications or []),
                 "needs_recapture": True,
                 "pending_confirmation": False,
+            }
+        )
+        recapture_request = reasoning_engine.request_ocr()
+        await websocket.send_json(
+            {
+                "type": "ocr_request",
+                **recapture_request,
+                "reason": "uncertain_ocr_result",
+                "requires_tts": False,
             }
         )
         return
@@ -261,6 +468,12 @@ async def _handle_ocr(websocket: WebSocket, message: dict) -> None:
             "created_at": datetime.now(),
         }
         summary = _format_ocr_summary(ocr_data)
+        if _needs_ocr_symptom_clarification(ocr_data):
+            question = str(
+                ocr_data.get("clarification_question")
+                or "어떤 증상으로 처방받은 약인지도 함께 알려주시면 더 안전하게 기록하겠습니다."
+            ).strip()
+            summary += f" 다만 용법이나 처방 목적이 흐릿합니다. {question}"
         await websocket.send_json(
             {
             "type": "ocr_processed",
@@ -270,15 +483,25 @@ async def _handle_ocr(websocket: WebSocket, message: dict) -> None:
             }
         )
     else:
+        message_text = (
+            "죄송합니다. 이번 사진에서는 약 이름을 확인하기 어렵습니다. "
+            "약봉투를 조금 더 가까이 보여주시고 다시 촬영해 주세요."
+        )
         await websocket.send_json(
             {
             "type": "ocr_processed",
-            "message": (
-                "죄송합니다. 이번 사진에서는 약 이름을 확인하기 어렵습니다. "
-                "약봉투를 조금 더 가까이 보여주시고 다시 촬영해 주세요."
-            ),
+            "message": message_text,
             "medication_count": 0,
             "needs_recapture": True,
+            }
+        )
+        recapture_request = reasoning_engine.request_ocr()
+        await websocket.send_json(
+            {
+                "type": "ocr_request",
+                **recapture_request,
+                "reason": "empty_ocr_medications",
+                "requires_tts": False,
             }
         )
 
@@ -307,12 +530,55 @@ async def _handle_pending_ocr_confirmation(
 
     if _is_ocr_save_rejection(text):
         _pending_ocr_by_speaker.pop(key, None)
-        response_text = (
-            "알겠습니다. 방금 인식한 처방전 정보는 저장하지 않았습니다. "
-            "다시 촬영하거나 약 이름을 말해주시면 새로 확인하겠습니다."
-        )
+        recapture = _is_ocr_recapture_reply(text)
+        response_text = "알겠습니다. 방금 인식한 처방전 정보는 저장하지 않았습니다."
+        if not recapture:
+            response_text += " 다시 촬영하거나 약 이름을 말해주시면 새로 확인하겠습니다."
         response = conversation_engine.build_response(
             {"text": response_text, "type": "ocr_cancelled", "requires_tts": True}
+        )
+        await websocket.send_json({"type": "response", **response})
+        if recapture:
+            ocr_request = reasoning_engine.request_ocr()
+            await websocket.send_json(
+                {
+                    "type": "ocr_request",
+                    **ocr_request,
+                    "reason": "user_requested_recapture",
+                    "requires_tts": False,
+                }
+            )
+        return True
+
+    if _is_ocr_symptom_or_purpose_answer(text):
+        ocr_data = _pending_ocr_data(pending)
+        medications = ocr_data.get("medications", [])
+        refined = await refine_ocr_medication_candidates_with_context(
+            raw_text=str(ocr_data.get("raw_text") or ocr_data.get("text") or ""),
+            current_medications=medications,
+            user_text=text,
+        )
+        refined_meds = _normalize_refined_medications(refined)
+        if refined_meds:
+            ocr_data["medications"] = refined_meds
+            ocr_data["symptom_context"] = text
+            if refined.get("clarification_question"):
+                ocr_data["clarification_question"] = str(refined["clarification_question"])
+            pending["data"] = ocr_data
+            names = ", ".join(_medication_names(refined_meds))
+            response_text = (
+                f"말씀하신 증상까지 반영해서 {names} 후보로 다시 확인했습니다. "
+                "이 정보로 복약 정보에 저장할까요?"
+            )
+        else:
+            ocr_data["symptom_context"] = text
+            pending["data"] = ocr_data
+            response_text = (
+                "말씀하신 증상은 기록해 두겠습니다. 다만 약 이름 보정은 아직 확실하지 않습니다. "
+                "현재 인식한 정보로 저장할까요, 아니면 다시 촬영할까요?"
+            )
+        response = conversation_engine.build_response(
+            {"text": response_text, "type": "ocr_refined_confirmation", "requires_tts": True}
         )
         await websocket.send_json({"type": "response", **response})
         return True
@@ -332,7 +598,14 @@ async def _handle_pending_ocr_confirmation(
     medications = ocr_data.get("medications", [])
     await memory_engine.log_ocr_result(ocr_data)
     await _store_ocr_prescription_baseline(ocr_data, medications)
-    asyncio.create_task(_sync_ocr_dur_background(ocr_data, medications, speaker_id))
+    asyncio.create_task(
+        _enrich_ocr_medication_background(
+            ocr_data=ocr_data,
+            medications=medications,
+            speaker_id=speaker_id,
+            user_text=text,
+        )
+    )
 
     response_text = (
         "알겠습니다. 복약 정보에 저장했습니다. "
@@ -378,6 +651,75 @@ async def _store_ocr_prescription_baseline(
     )
 
 
+async def _enrich_ocr_medication_background(
+    *,
+    ocr_data: dict[str, Any],
+    medications: list[dict[str, Any]],
+    speaker_id: str | None,
+    user_text: str = "",
+) -> None:
+    """Enrich OCR meds in background so WebSocket response stays fast."""
+    try:
+        await _sync_ocr_search_background(ocr_data, medications, speaker_id, user_text)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Background OCR LLM search enrichment failed: %s", exc)
+    await _sync_ocr_dur_background(ocr_data, medications, speaker_id)
+
+
+async def _sync_ocr_search_background(
+    ocr_data: dict[str, Any],
+    medications: list[dict[str, Any]],
+    speaker_id: str | None,
+    user_text: str = "",
+) -> None:
+    names = _medication_names(medications)
+    if not names:
+        return
+    query = (
+        "다음 처방전 OCR에서 추출한 약 이름 후보를 확인하고, 일반적인 약물 정보와 "
+        "복약 기록에 저장할 짧은 요약을 작성해 주세요. 환자 이름, 주민등록번호, 병원 전화번호 등 "
+        "개인정보는 쓰지 마세요. 약 이름: "
+        + ", ".join(names)
+    )
+    context = _redact_ocr_context(
+        "\n".join(
+            part
+            for part in (
+                f"사용자 발화: {user_text}" if user_text else "",
+                str(ocr_data.get("raw_text") or ocr_data.get("text") or ""),
+            )
+            if part
+        )
+    )
+    result = await llm_search.llm_search(query, context=context[:1500])
+    answer = str(result.get("answer") or "").strip()
+    if not result.get("success") or not answer:
+        return
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    content = (
+        "# OCR 약물 LLM 보강\n"
+        f"> 기록 시각: {now}\n\n"
+        "## 약품 후보\n"
+        + "\n".join(f"- {name}" for name in names)
+        + "\n\n## LLM Search 요약\n"
+        + answer[:1500]
+        + "\n"
+    )
+    await memory_engine.store.save("medication_log", content)
+    await memory_engine.store.write_flash(
+        "context_memory",
+        (
+            "# 대화 컨텍스트 메모리\n"
+            f"> 최종 갱신: {now}\n\n"
+            "## OCR 약물 보강\n"
+            + "\n".join(f"- {name}" for name in names)
+            + "\n"
+            + answer[:700]
+            + "\n"
+        ),
+    )
+
+
 async def _sync_ocr_dur_background(
     ocr_data: dict[str, Any],
     medications: list[dict[str, Any]],
@@ -394,6 +736,32 @@ async def _sync_ocr_dur_background(
 
 def _pending_ocr_key(speaker_id: str | None) -> str:
     return speaker_id or ANONYMOUS_OCR_KEY
+
+
+def _has_pending_ocr_confirmation(speaker_id: str | None) -> bool:
+    pending = _pending_ocr_by_speaker.get(_pending_ocr_key(speaker_id))
+    return bool(pending and not _is_pending_ocr_expired(pending))
+
+
+def _queue_ocr_request(speaker_id: str | None, reason: str) -> None:
+    key = _pending_ocr_key(speaker_id)
+    _queued_ocr_request_by_speaker[key] = {"reason": reason, "created_at": datetime.now()}
+
+
+async def _send_queued_ocr_request_if_ready(websocket: WebSocket, speaker_id: str | None) -> bool:
+    key = _pending_ocr_key(speaker_id)
+    queued = _queued_ocr_request_by_speaker.pop(key, None)
+    if not queued:
+        return False
+    ocr_request = reasoning_engine.request_ocr()
+    await websocket.send_json(
+        {
+            "type": "ocr_request",
+            **ocr_request,
+            "reason": queued.get("reason") or "queued_ocr_request",
+        }
+    )
+    return True
 
 
 def _pending_ocr_data(pending: dict[str, Any]) -> dict[str, Any]:
@@ -436,6 +804,69 @@ def _is_ocr_save_rejection(text: str) -> bool:
     )
 
 
+def _is_ocr_recapture_reply(text: str) -> bool:
+    lowered = text.strip().lower()
+    return any(
+        token in lowered
+        for token in (
+            "재촬영",
+            "다시 찍",
+            "새로 찍",
+            "한번 더 찍",
+            "한 번 더 찍",
+            "사진 다시",
+            "다시 촬영",
+        )
+    )
+
+
+def _is_ocr_symptom_or_purpose_answer(text: str) -> bool:
+    lowered = text.strip().lower()
+    if len(lowered) < 4:
+        return False
+    return any(
+        token in lowered
+        for token in (
+            "때문",
+            "처방",
+            "증상",
+            "통풍",
+            "감기",
+            "알레르기",
+            "염증",
+            "통증",
+            "두통",
+            "복통",
+            "기침",
+            "가려움",
+            "먹는 약",
+            "약이야",
+        )
+    )
+
+
+def _normalize_refined_medications(refined: dict[str, Any]) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for item in refined.get("medications", []) or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        normalized.append(
+            {
+                "name": name,
+                "dosage": str(item.get("dosage") or "").strip(),
+                "frequency": str(item.get("frequency") or "").strip(),
+                "timing": str(item.get("timing") or "").strip(),
+                "purpose_or_symptom": str(item.get("purpose_or_symptom") or "").strip(),
+                "correction_reason": str(item.get("correction_reason") or "").strip(),
+                "source": str(refined.get("source") or "frontier_context_refine"),
+            }
+        )
+    return normalized[:8]
+
+
 def _is_uncertain_ocr_result(ocr_data: dict[str, Any]) -> bool:
     confidence = float(ocr_data.get("confidence") or ocr_data.get("text_confidence_score") or 0.0)
     raw_text = str(ocr_data.get("raw_text") or ocr_data.get("text") or "")
@@ -448,13 +879,70 @@ def _is_uncertain_ocr_result(ocr_data: dict[str, Any]) -> bool:
         return True
     if 0 < confidence < 0.65:
         return True
-    return any(
+    if any(
         not name
         or len(name) < 2
         or "?" in name
         or any(token in name for token in ("불명", "미상", "흐림"))
         for name in names
-    ) or any(token in raw_text for token in ("흐림", "불명확", "인식 실패"))
+    ):
+        return True
+    # If a concrete medication name was found, partial unclear fields like dosage/timing
+    # should become a clarification question, not a full recapture failure.
+    return any(token in raw_text for token in ("인식 실패", "약 이름 확인 불가", "약품명 확인 불가"))
+
+
+async def _normalize_ocr_medications(ocr_data: dict[str, Any]) -> list[dict[str, Any]]:
+    medications = ocr_data.get("medications") or []
+    normalized: list[dict[str, Any]] = []
+    for med in medications:
+        if isinstance(med, dict):
+            name = str(med.get("name") or "").strip()
+            if name:
+                normalized.append(med)
+        elif str(med).strip():
+            normalized.append({"name": str(med).strip()})
+    if normalized:
+        return normalized
+
+    raw_text = str(ocr_data.get("raw_text") or ocr_data.get("text") or "")
+    llm_candidates = await extract_ocr_medication_candidates_with_llm(raw_text)
+    for item in llm_candidates.get("medications", []):
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        normalized.append(
+            {
+                "name": name,
+                "dosage": str(item.get("dosage") or "").strip(),
+                "frequency": str(item.get("frequency") or "").strip(),
+                "timing": str(item.get("timing") or "").strip(),
+                "purpose_or_symptom": str(item.get("purpose_or_symptom") or "").strip(),
+                "source": str(llm_candidates.get("source") or "frontier_llm"),
+            }
+        )
+    if normalized:
+        if llm_candidates.get("clarification_question"):
+            ocr_data["clarification_question"] = str(llm_candidates["clarification_question"])
+        return normalized[:8]
+
+    return []
+
+
+def _needs_ocr_symptom_clarification(ocr_data: dict[str, Any]) -> bool:
+    if ocr_data.get("clarification_question"):
+        return True
+    raw_text = str(ocr_data.get("raw_text") or ocr_data.get("text") or "")
+    if any(token in raw_text for token in ("용법 | [불명확]", "용법|[불명확]", "용법", "[불명확]")):
+        return True
+    medications = ocr_data.get("medications") or []
+    return any(
+        isinstance(med, dict)
+        and not any(str(med.get(key) or "").strip() for key in ("timing", "frequency", "dosage"))
+        for med in medications
+    )
 
 
 def _format_ocr_summary(ocr_data: dict[str, Any]) -> str:

@@ -1,1 +1,1 @@
-- [최신 복약 및 DUR 요약](current_medication.md) - 최근 OCR 처방 약품: 혈압약A, 당뇨약B
+- [복약 관리 프로필](patient_profile.md) - speaker-contract-ws 사용자/복약 관리 대상자 기본 프로필

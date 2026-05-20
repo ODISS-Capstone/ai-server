@@ -117,6 +117,8 @@ class ConversationEngine:
         if input_data.get("is_smalltalk"):
             return None
         text = str(input_data.get("text") or "")
+        if self._filler_category(text) == "general":
+            return None
         category = self._filler_category(text)
         if category == "ocr":
             return random.choice(OCR_FILLERS)
@@ -271,6 +273,12 @@ class ConversationEngine:
             or contract.core_message.strip()
         )
         source = self._strip_think_tags(source)
+        if self._is_profile_recall_text(contract.input_text):
+            return ConversationComposeResponse(
+                response_text=self._profile_recall_response(contract.user_profile),
+                response_type="profile_recall",
+                requires_tts=True,
+            )
 
         if not source:
             fallback = "사용자님, 현재 기록만으로는 정확한 판단이 어렵습니다."
@@ -326,6 +334,11 @@ class ConversationEngine:
     # ── 내부 유틸 ──
 
     def _detect_smalltalk(self, text: str) -> bool:
+        from app.services.medication_extraction import is_wake_word_only
+
+        if is_wake_word_only(text):
+            return True
+
         text_lower = text.lower().strip()
         if self._has_medication_or_task_signal(text_lower):
             return False
@@ -427,8 +440,11 @@ class ConversationEngine:
 
     def _is_memory_ack_or_recall(self, text: str) -> bool:
         lowered = text.lower()
+        compact = re.sub(r"\s+", "", lowered)
         if "ocr" in lowered or "읽힌 처방 약 이름" in text:
             return False
+        if self._is_profile_recall_text(text):
+            return True
         return any(
             token in lowered
             for token in (
@@ -444,6 +460,33 @@ class ConversationEngine:
                 "저장",
             )
         )
+
+    @staticmethod
+    def _is_profile_recall_text(text: str) -> bool:
+        compact = re.sub(r"\s+", "", (text or "").lower())
+        return any(
+            token in compact
+            for token in ("누군지", "누구인지", "내가누구", "나누구", "내이름", "내프로필")
+        )
+
+    def _profile_recall_response(self, user_profile: Optional[dict]) -> str:
+        profile = user_profile or {}
+        name = str(profile.get("name") or "").strip()
+        if not name:
+            return "아직 등록된 이름이 없어요. 이름, 성별, 나이를 말씀해 주시면 기억하겠습니다."
+        details: list[str] = []
+        gender = str(profile.get("gender") or "").strip()
+        age = str(profile.get("age") or "").strip()
+        if gender:
+            details.append(gender)
+        if age:
+            details.append(f"{age}세")
+        conditions = profile.get("conditions") or []
+        if conditions:
+            details.append("기저질환 " + ", ".join(str(item) for item in conditions))
+        if details:
+            return f"{name}님이십니다. 저장된 정보는 {', '.join(details)}입니다."
+        return f"{name}님이십니다."
 
     @staticmethod
     def _honorific(user_profile: Optional[dict] = None) -> str:

@@ -41,6 +41,17 @@ def client() -> TestClient:
     return TestClient(app)
 
 
+@pytest.fixture(autouse=True)
+def clear_agent_ws_state():
+    from app.api.routes import agent_ws
+
+    agent_ws._pending_ocr_by_speaker.clear()
+    agent_ws._queued_ocr_request_by_speaker.clear()
+    yield
+    agent_ws._pending_ocr_by_speaker.clear()
+    agent_ws._queued_ocr_request_by_speaker.clear()
+
+
 def _import_agent_drug_parser():
     try:
         from src.cloud_server.drug_parser import (  # type: ignore[import-not-found]
@@ -204,6 +215,111 @@ def test_agent_ws_ocr_result_contract(client: TestClient) -> None:
     assert "DUR" in reply["message"] or reply["medication_count"] == 2
 
 
+def test_agent_ws_uncertain_ocr_requests_recapture(client: TestClient) -> None:
+    with client.websocket_connect("/ws/chat") as ws:
+        ws.send_text(
+            json.dumps(
+                {
+                    "type": "ocr_result",
+                    "speaker_id": "speaker-contract-ws",
+                    "data": {
+                        "raw_text": "흐림 [불명확] 약 이름 확인 불가",
+                        "confidence": 0.3,
+                        "medications": [{"name": "불명확"}],
+                    },
+                }
+            )
+        )
+        first = ws.receive_json()
+        second = ws.receive_json()
+
+    assert first["type"] == "ocr_processed"
+    assert first["needs_recapture"] is True
+    assert first["pending_confirmation"] is False
+    assert second["type"] == "ocr_request"
+    assert second["reason"] == "uncertain_ocr_result"
+    assert second["requires_tts"] is False
+
+
+def test_agent_ws_ocr_does_not_regex_guess_when_frontier_llm_finds_no_medication(
+    client: TestClient,
+    monkeypatch,
+) -> None:
+    from app.api.routes import agent_ws
+
+    async def fake_extract(raw_text: str):
+        return {"medications": [], "clarification_question": ""}
+
+    monkeypatch.setattr(agent_ws, "extract_ocr_medication_candidates_with_llm", fake_extract)
+    raw_text = (
+        "### 2. 처방 의약품 목록 | 처방 의약품의 명칭 | 1회 투약량 | 1일 투여횟수 | "
+        "총 투약일수 | 용법 | | 664704210 무브록정40mg | 1 | 1 | 30 | [불명확] |"
+    )
+    with client.websocket_connect("/ws/chat") as ws:
+        ws.send_text(
+            json.dumps(
+                {
+                    "type": "ocr_result",
+                    "speaker_id": "speaker-contract-ws",
+                    "data": {
+                        "raw_text": raw_text,
+                        "confidence": 0.95,
+                        "medications": [],
+                    },
+                }
+            )
+        )
+        first = ws.receive_json()
+        second = ws.receive_json()
+
+    assert first["type"] == "ocr_processed"
+    assert first["medication_count"] == 0
+    assert first["needs_recapture"] is True
+    assert second["type"] == "ocr_request"
+
+
+def test_agent_ws_ocr_uses_llm_candidates_and_question(client: TestClient, monkeypatch) -> None:
+    from app.api.routes import agent_ws
+
+    async def fake_extract(raw_text: str):
+        assert "처방 의약품" in raw_text
+        return {
+            "medications": [
+                {
+                    "name": "무브록정40mg",
+                    "dosage": "1",
+                    "frequency": "1일 1회",
+                    "timing": "",
+                    "purpose_or_symptom": "",
+                }
+            ],
+            "clarification_question": "통증이나 염증 때문에 처방받으신 약인가요?",
+        }
+
+    monkeypatch.setattr(agent_ws, "extract_ocr_medication_candidates_with_llm", fake_extract)
+    with client.websocket_connect("/ws/chat") as ws:
+        ws.send_text(
+            json.dumps(
+                {
+                    "type": "ocr_result",
+                    "speaker_id": "speaker-contract-ws",
+                    "data": {
+                        "raw_text": "### 처방 의약품 목록 | 664704210 무브록정40mg | 1 | 1 | 30 | [불명확] |",
+                        "confidence": 0.95,
+                        "medications": [],
+                    },
+                }
+            )
+        )
+        reply = ws.receive_json()
+
+    assert reply["type"] == "ocr_processed"
+    assert reply["medication_count"] == 1
+    assert "무브록정40mg" in reply["message"]
+    assert "통증이나 염증 때문에 처방받으신 약인가요?" in reply["message"]
+    assert reply["pending_confirmation"] is True
+
+
 def test_agent_ws_unknown_message_returns_error(client: TestClient) -> None:
     with client.websocket_connect("/ws/chat") as ws:
         ws.send_text(json.dumps({"type": "what_is_this"}))
@@ -211,3 +327,141 @@ def test_agent_ws_unknown_message_returns_error(client: TestClient) -> None:
 
     assert reply["type"] == "error"
     assert "Unknown type" in reply["message"]
+
+
+def test_agent_ws_accepts_identity_confirmed_compat_event(client: TestClient) -> None:
+    with client.websocket_connect("/ws/chat") as ws:
+        ws.send_text(
+            json.dumps(
+                {
+                    "type": "identity_confirmed",
+                    "speaker_id": "speaker-contract-ws",
+                    "text": "어 난 김영수가 맞아",
+                }
+            )
+        )
+        reply = ws.receive_json()
+
+    assert reply["type"] != "error"
+    assert "Unknown type" not in json.dumps(reply, ensure_ascii=False)
+
+
+def test_agent_ws_ocr_capture_request_waits_for_identity_gate(monkeypatch, client: TestClient) -> None:
+    from app.api.routes import agent_ws
+
+    async def fake_identity_gate(**kwargs):
+        from app.services.identity_guard import IdentityGateResult
+
+        return IdentityGateResult(
+            allowed=False,
+            reason="needs_registration",
+            response_text="먼저 신원 확인이 필요합니다.",
+        )
+
+    monkeypatch.setattr(agent_ws, "evaluate_identity_gate", fake_identity_gate)
+
+    with client.websocket_connect("/ws/chat") as ws:
+        ws.send_text(
+            json.dumps(
+                {
+                    "type": "stt_result",
+                    "speaker_id": "speaker-contract-ws",
+                    "text": "처방전을 찍어야 되는데 켜 줄래",
+                }
+            )
+        )
+        reply = ws.receive_json()
+
+    assert reply["type"] == "response"
+    assert reply["identity_gate"]["reason"] == "needs_registration"
+    assert agent_ws._queued_ocr_request_by_speaker[agent_ws._pending_ocr_key("speaker-contract-ws")]["reason"] == (
+        "direct_ocr_capture_request"
+    )
+
+
+def test_agent_ws_camera_ocr_request_is_detected(monkeypatch, client: TestClient) -> None:
+    from app.api.routes import agent_ws
+
+    async def fake_identity_gate(**kwargs):
+        from app.services.identity_guard import IdentityGateResult
+
+        return IdentityGateResult(allowed=True, reason="identity_verified")
+
+    monkeypatch.setattr(agent_ws, "evaluate_identity_gate", fake_identity_gate)
+
+    with client.websocket_connect("/ws/chat") as ws:
+        ws.send_text(
+            json.dumps(
+                {
+                    "type": "stt_result",
+                    "speaker_id": "speaker-contract-ws",
+                    "text": "처방전 등록을 해야 되는데 한번 사진 찍게 카메라 좀 켜 줄래?",
+                }
+            )
+        )
+        reply = ws.receive_json()
+
+    assert reply["type"] == "ocr_request"
+    assert reply["action"] == "request_ocr"
+
+
+def test_agent_ws_queued_ocr_request_runs_after_identity_passes(monkeypatch, client: TestClient) -> None:
+    from app.api.routes import agent_ws
+
+    key = agent_ws._pending_ocr_key("speaker-contract-ws")
+    agent_ws._queued_ocr_request_by_speaker[key] = {
+        "reason": "direct_ocr_capture_request",
+        "created_at": "test",
+    }
+
+    async def fake_identity_gate(**kwargs):
+        from app.services.identity_guard import IdentityGateResult
+
+        return IdentityGateResult(allowed=True, reason="identity_verified")
+
+    monkeypatch.setattr(agent_ws, "evaluate_identity_gate", fake_identity_gate)
+
+    with client.websocket_connect("/ws/chat") as ws:
+        ws.send_text(
+            json.dumps(
+                {
+                    "type": "stt_result",
+                    "speaker_id": "speaker-contract-ws",
+                    "text": "김영수 72세 남성",
+                }
+            )
+        )
+        reply = ws.receive_json()
+
+    assert reply["type"] == "ocr_request"
+    assert reply["reason"] == "direct_ocr_capture_request"
+    assert key not in agent_ws._queued_ocr_request_by_speaker
+
+
+def test_agent_ws_recapture_reply_bypasses_identity_gate(monkeypatch, client: TestClient) -> None:
+    from app.api.routes import agent_ws
+
+    async def fake_identity_gate(**kwargs):
+        from app.services.identity_guard import IdentityGateResult
+
+        return IdentityGateResult(allowed=False, reason="needs_registration", response_text="신원 확인 필요")
+
+    monkeypatch.setattr(agent_ws, "evaluate_identity_gate", fake_identity_gate)
+
+    with client.websocket_connect("/ws/chat") as ws:
+        ws.send_text(
+            json.dumps(
+                {
+                    "type": "stt_result",
+                    "speaker_id": "speaker-contract-ws",
+                    "text": "다시 찍자",
+                }
+            )
+        )
+        reply = ws.receive_json()
+
+    assert reply["type"] == "response"
+    assert reply["identity_gate"]["reason"] == "needs_registration"
+    assert agent_ws._queued_ocr_request_by_speaker[agent_ws._pending_ocr_key("speaker-contract-ws")]["reason"] == (
+        "user_requested_recapture"
+    )

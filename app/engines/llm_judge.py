@@ -40,8 +40,11 @@ class LLMJudgeEngine:
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
-            "max_tokens": max_tokens,
         }
+        if (self.model or "").lower().strip().startswith("gpt-5"):
+            payload["max_completion_tokens"] = max_tokens
+        else:
+            payload["max_tokens"] = max_tokens
         if _supports_temperature(self.model):
             payload["temperature"] = temperature
         return payload

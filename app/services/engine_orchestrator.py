@@ -23,10 +23,21 @@ from app.schemas.engine_contracts import (
     ReasoningMode,
     ReasoningRouteDecision,
     ReasoningRouteInput,
+    ReasoningTask,
     ToolTraceEvent,
 )
-from app.services.identity_guard import evaluate_identity_gate
-from app.services.llm import call_local_delivery_llm
+from app.services.identity_guard import (
+    evaluate_identity_gate,
+    has_identity_core,
+    has_profile_identity,
+    is_profile_recall_query,
+)
+from app.services.llm import (
+    call_local_delivery_llm,
+    classify_reasoning_route_with_llm,
+    recover_medical_followup_with_llm,
+)
+from app.services.medication_extraction import is_wake_word_only
 from app.services.patient_safety import classify_patient_safety_situation
 
 logger = logging.getLogger(__name__)
@@ -166,10 +177,12 @@ class EngineOrchestrator:
                 trace_memory("read", "Patient.md", category="patients", path=f"patients/{speaker_id}/profile.md")
                 if not identity_gate.allowed and identity_gate.reason in {
                     "identity_registered",
+                    "identity_recognized",
                     "identity_candidate_registered",
                     "confirm_new_identity",
                     "identity_conflict",
                     "needs_registration",
+                    "prior_conversation_check",
                 }:
                     trace_memory("write", "Patient.md", category="patients", path=f"patients/{speaker_id}/profile.md")
                 if not identity_gate.allowed and identity_gate.reason in {
@@ -251,39 +264,37 @@ class EngineOrchestrator:
             (perf_counter() - stage_started) * 1000,
         )
 
-        profile_update = (
-            self.memory.extract_identity_from_text(text)
-            if speaker_id and hasattr(self.memory, "extract_identity_from_text")
-            else {}
-        )
-        if speaker_id and profile_update:
-            saved_profile = await self.memory.save_identity_profile(
-                speaker_id,
-                profile_update,
-                mark_verified=True,
-            )
-            await self.memory.update_flash_profile(speaker_id, saved_profile)
-            context["user_profile"] = saved_profile
-            trace_memory("write", "Patient.md", category="patients", path=f"patients/{speaker_id}/profile.md")
-            trace_memory("write", "CurrentUserProfile.md", category="current_user_profile", path="flash/current_user_profile.md")
-
         ocr_medications = self._extract_ocr_medications_from_text(text)
         if ocr_medications:
             if hasattr(self.memory, "store_ocr_text_result"):
                 await self.memory.store_ocr_text_result(text, speaker_id=speaker_id)
             else:
                 await self._store_ocr_prescription_context(ocr_medications)
-            context["prescription_log"] = self._format_prescription_log(ocr_medications)
+            context = await self._refresh_context_from_flash(
+                speaker_id=speaker_id,
+                context=context,
+                trace_engine=trace_engine,
+                trace_memory=trace_memory,
+                reason="ocr_prescription_update",
+            )
             trace_memory("write", "OCRHistory.md", category="ocr_history", path="permanent/ocr_history/*/*.md")
             trace_memory("write", "Prescription.md", category="prescriptions", path="permanent/prescriptions/*/*.md")
             trace_memory("write", "PrescriptionLog.md", category="prescription_log", path="flash/prescription_log.md")
 
         if self._is_lifestyle_memory_text(text) and hasattr(self.memory, "store"):
             await self.memory.store.write_flash("current_manual", self._format_lifestyle_manual(text))
+            context = await self._refresh_context_from_flash(
+                speaker_id=speaker_id,
+                context=context,
+                trace_engine=trace_engine,
+                trace_memory=trace_memory,
+                reason="current_manual_update",
+            )
             trace_memory("write", "CurrentManual.md", category="current_manual", path="flash/current_manual.md")
 
         stage_started = perf_counter()
-        decision = self.reasoning.route_execution(
+        llm_route = await self._classify_route_with_local_llm(text=text, context=context)
+        decision = self._decision_from_llm_route(llm_route, text) or self.reasoning.route_execution(
             ReasoningRouteInput(
                 text=text,
                 speaker_id=speaker_id,
@@ -298,6 +309,8 @@ class EngineOrchestrator:
             mode=decision.mode.value,
             intent=decision.intent,
             task_types=[task.type for task in decision.tasks],
+            source="local_llm" if llm_route.get("usable") else "deterministic_fallback",
+            route_label=llm_route.get("route_label", ""),
         )
         logger.info(
             "[ReasoningEngine] route_decided mode=%s intent=%s tasks=%d rationale=%s elapsed_ms=%.1f",
@@ -307,6 +320,91 @@ class EngineOrchestrator:
             decision.rationale,
             (perf_counter() - stage_started) * 1000,
         )
+
+        if self._should_suppress_turn(text=text, decision=decision, input_data=input_data):
+            recovery: dict[str, Any] = {}
+            if not self._is_llm_ignore_route(decision):
+                recovery = await self._recover_suppressed_medical_followup(
+                    text=text,
+                    context=context,
+                )
+            if recovery.get("is_medical_followup") and recovery.get("response"):
+                response_text = str(recovery.get("response") or "").strip()
+                trace_engine(
+                    "LLM_Followup_Recovery",
+                    "LocalLLM",
+                    "recover_medical_followup",
+                    recovered=True,
+                    source=recovery.get("source", ""),
+                )
+                recovered_decision = ReasoningRouteDecision(
+                    mode=ReasoningMode.MEMORY_ONLY,
+                    intent="medication_query",
+                    rationale="local_llm_medical_followup_recovery",
+                    tasks=[],
+                )
+                conversation = ConversationComposeResponse(
+                    response_text=response_text,
+                    response_type="medication_query",
+                    requires_tts=True,
+                )
+                return EnginePipelineResult(
+                    input_data=input_data,
+                    context=context,
+                    identity_gate=identity_gate_info,
+                    decision=recovered_decision,
+                    evidence=self._empty_evidence(text),
+                    execution_results={
+                        "intent": "medication_query",
+                        "query": text,
+                        "task_results": {"followup_recovery": recovery},
+                        "emergency": False,
+                    },
+                    filler_text=filler_text,
+                    core_message=response_text,
+                    judge_review={},
+                    reviewed_message=response_text,
+                    delivery_message=response_text,
+                    conversation=conversation,
+                    engine_trace=engine_trace,
+                    memory_trace=memory_trace,
+                    tool_trace=tool_trace,
+                )
+            trace_engine(
+                "CE_Response",
+                "ConversationEngine",
+                "suppress_out_of_scope_turn",
+                response_type="ignored",
+                requires_tts=False,
+            )
+            conversation = ConversationComposeResponse(
+                response_text="",
+                response_type="ignored",
+                requires_tts=False,
+            )
+            return EnginePipelineResult(
+                input_data=input_data,
+                context=context,
+                identity_gate=identity_gate_info,
+                decision=decision,
+                evidence=self._empty_evidence(text),
+                execution_results={
+                    "intent": decision.intent,
+                    "query": text,
+                    "task_results": {},
+                    "emergency": False,
+                    "suppressed": True,
+                },
+                filler_text="",
+                core_message="",
+                judge_review={},
+                reviewed_message="",
+                delivery_message="",
+                conversation=conversation,
+                engine_trace=engine_trace,
+                memory_trace=memory_trace,
+                tool_trace=tool_trace,
+            )
 
         stage_started = perf_counter()
         if self._skip_evidence_preparation(decision):
@@ -409,6 +507,18 @@ class EngineOrchestrator:
                 execution_results.get("emergency", False),
                 (perf_counter() - stage_started) * 1000,
             )
+            if await self._sync_tool_results_to_flash(
+                speaker_id=speaker_id,
+                execution_results=execution_results,
+                trace_memory=trace_memory,
+            ):
+                context = await self._refresh_context_from_flash(
+                    speaker_id=speaker_id,
+                    context=context,
+                    trace_engine=trace_engine,
+                    trace_memory=trace_memory,
+                    reason="tool_result_flash_sync",
+                )
         elif decision.intent == "emergency":
             execution_results["emergency"] = True
             execution_results["task_results"]["emergency"] = {
@@ -589,6 +699,200 @@ class EngineOrchestrator:
         return decision.mode == ReasoningMode.ASK_USER_CLARIFY or decision.intent == "emergency"
 
     @staticmethod
+    def _should_suppress_turn(*, text: str, decision: Any, input_data: dict[str, Any]) -> bool:
+        if is_wake_word_only(text):
+            return True
+        if getattr(decision, "rationale", "") == "out_of_scope_smalltalk_suppressed":
+            return True
+        if (
+            decision.intent == "unknown"
+            and decision.mode == ReasoningMode.MEMORY_ONLY
+            and not input_data.get("is_smalltalk")
+        ):
+            return True
+        return False
+
+    @staticmethod
+    def _is_llm_ignore_route(decision: Any) -> bool:
+        return str(getattr(decision, "rationale", "") or "") in {
+            "local_llm_route:non_actionable_ack",
+            "local_llm_route:noise_fragment",
+            "local_llm_route:unknown",
+        }
+
+    async def _recover_suppressed_medical_followup(
+        self,
+        *,
+        text: str,
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        conversation_context = "\n\n".join(
+            part
+            for part in (
+                str(context.get("context_memory") or "").strip(),
+                str(context.get("current_requirement") or "").strip(),
+                str(context.get("current_manual") or "").strip(),
+                str(context.get("prescription_log") or "").strip(),
+            )
+            if part
+        )
+        if not conversation_context:
+            return {"is_medical_followup": False, "response": "", "source": "no_context"}
+        return await recover_medical_followup_with_llm(
+            current_text=text,
+            conversation_context=conversation_context,
+            user_profile=context.get("user_profile") or {},
+        )
+
+    async def _classify_route_with_local_llm(
+        self,
+        *,
+        text: str,
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        if is_wake_word_only(text):
+            return {"usable": False, "source": "wake_word_only"}
+        conversation_context = "\n\n".join(
+            part
+            for part in (
+                str(context.get("context_memory") or "").strip(),
+                str(context.get("current_requirement") or "").strip(),
+                str(context.get("current_manual") or "").strip(),
+                str(context.get("prescription_log") or "").strip(),
+            )
+            if part
+        )
+        return await classify_reasoning_route_with_llm(
+            current_text=text,
+            conversation_context=conversation_context,
+            user_profile=context.get("user_profile") or {},
+        )
+
+    @staticmethod
+    def _decision_from_llm_route(route: dict[str, Any], text: str = "") -> ReasoningRouteDecision | None:
+        if not route.get("usable"):
+            return None
+        route_label = str(route.get("route_label") or "unknown")
+        if route_label in {"non_actionable_ack", "noise_fragment", "unknown"}:
+            return ReasoningRouteDecision(
+                mode=ReasoningMode.MEMORY_ONLY,
+                intent="unknown",
+                rationale="local_llm_route:" + route_label,
+                tasks=[],
+            )
+        mode_map = {
+            "MEMORY_ONLY": ReasoningMode.MEMORY_ONLY,
+            "TOOL_FIRST": ReasoningMode.TOOL_FIRST,
+            "FRONTIER_FIRST": ReasoningMode.FRONTIER_FIRST,
+            "ASK_USER_CLARIFY": ReasoningMode.ASK_USER_CLARIFY,
+        }
+        safety = classify_patient_safety_situation(text)
+        if safety:
+            if safety.severity == "emergency":
+                mode = ReasoningMode.FRONTIER_FIRST
+                normalized_task_types = []
+            else:
+                mode = ReasoningMode.MEMORY_ONLY
+                normalized_task_types = []
+        elif route_label in {"meal_medication_prep", "after_meal_medication", "medication_record", "medication_taken_recall"}:
+            mode = ReasoningMode.MEMORY_ONLY
+            normalized_task_types: list[str] = []
+        else:
+            mode = mode_map.get(str(route.get("mode") or "").upper())
+            normalized_task_types = list(route.get("task_types") or [])
+        if not mode:
+            return None
+        task_priorities = {
+            "request_ocr": 1,
+            "search_history": 1,
+            "supplement_lookup": 1,
+            "hira_lookup": 2,
+            "dur_product_info": 2,
+            "dur_check": 2,
+            "llm_judge_verify": 3,
+        }
+        task_descriptions = {
+            "request_ocr": "약봉투/처방전 OCR 촬영 요청",
+            "search_history": "관련 이력 검색",
+            "supplement_lookup": "건강기능식품 조회",
+            "hira_lookup": "의약품 낱알식별 API 조회",
+            "dur_product_info": "DUR 품목정보 확인",
+            "dur_check": "질문 의도에 맞는 DUR 항목 선택 조회",
+            "llm_judge_verify": "LLM as a Judge 팩트 체킹",
+        }
+        tasks = [
+            ReasoningTask(
+                type=task_type,
+                priority=task_priorities.get(task_type, index + 1),
+                description=task_descriptions.get(task_type, task_type),
+            )
+            for index, task_type in enumerate(normalized_task_types)
+        ]
+        return ReasoningRouteDecision(
+            mode=mode,
+            intent=str(route.get("intent") or "unknown"),
+            rationale="local_llm_route:" + route_label,
+            tasks=tasks,
+        )
+
+    async def _refresh_context_from_flash(
+        self,
+        *,
+        speaker_id: Optional[str],
+        context: dict[str, Any],
+        trace_engine: Any,
+        trace_memory: Any,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Reload volatile memory after a permanent/flash write in the same turn."""
+        refreshed = await self.memory.load_context(speaker_id)
+        merged = {**context, **refreshed}
+        trace_engine(
+            "ME_Context",
+            "MemoryEngine",
+            "reload_flash_context",
+            reason=reason,
+            speaker_id=speaker_id,
+        )
+        if speaker_id:
+            trace_memory(
+                "read",
+                "CurrentUserProfile.md",
+                category="current_user_profile",
+                path="flash/current_user_profile.md",
+                reason=reason,
+            )
+        for logical, category, path in (
+            ("PrescriptionLog.md", "prescription_log", "flash/prescription_log.md"),
+            ("ContextMemory.md", "context_memory", "flash/context_memory.md"),
+            ("CurrentRequirement.md", "current_requirement", "flash/current_requirement.md"),
+            ("CurrentManual.md", "current_manual", "flash/current_manual.md"),
+        ):
+            trace_memory("read", logical, category=category, path=path, reason=reason)
+        return merged
+
+    async def _sync_tool_results_to_flash(
+        self,
+        *,
+        speaker_id: Optional[str],
+        execution_results: dict[str, Any],
+        trace_memory: Any,
+    ) -> bool:
+        task_results = execution_results.get("task_results") or {}
+        ocr_payload = task_results.get("ocr")
+        dur_results = task_results.get("dur") or task_results.get("dur_results")
+        if isinstance(ocr_payload, dict) and dur_results:
+            await self.memory.sync_ocr_dur(
+                ocr_payload,
+                dur_results if isinstance(dur_results, list) else [dur_results],
+                speaker_id=speaker_id,
+            )
+            trace_memory("write", "PrescriptionLog.md", category="prescription_log", path="flash/prescription_log.md")
+            trace_memory("write", "Prescription.md", category="prescriptions", path="permanent/prescriptions/*/*.md")
+            return True
+        return False
+
+    @staticmethod
     def _empty_evidence(text: str) -> MemoryEvidenceBundle:
         return MemoryEvidenceBundle(
             normalized_query=" ".join(str(text or "").strip().split()),
@@ -706,6 +1010,7 @@ class EngineOrchestrator:
         lowered = text.lower()
         profile = context.get("user_profile") or {}
         prescription_meds = self._medications_from_prescription_log(context.get("prescription_log", ""))
+        effective_text = self._augment_followup_with_recent_subject(text, context)
 
         if decision.intent == "emergency":
             safety = classify_patient_safety_situation(text)
@@ -736,12 +1041,17 @@ class EngineOrchestrator:
                 detail_text += f", 기저질환은 {conditions}"
             return f"{name}님이십니다. 현재 저장된 정보는 {detail_text}입니다."
 
+        if decision.intent == "smalltalk":
+            return self.conversation.generate_smalltalk(
+                self.conversation.receive_input(text)
+            ) or ""
+
         profile_update = (
             self.memory.extract_identity_from_text(text)
             if hasattr(self.memory, "extract_identity_from_text")
             else {}
         )
-        if profile_update:
+        if profile_update and decision.intent not in {"medication_query", "supplement_query"}:
             name = profile_update.get("name") or profile.get("name") or "사용자"
             age = profile_update.get("age") or profile.get("age") or ""
             gender = profile_update.get("gender") or profile.get("gender") or ""
@@ -757,25 +1067,25 @@ class EngineOrchestrator:
             return "프로필을 등록했습니다: " + ", ".join(parts) + "."
 
         if self._is_lifestyle_memory_text(text):
-            return "오늘 생활 루틴을 기억해둘게요. 오전 7시 산책, 20분 활동, 보리차를 마신 내용을 저장했습니다."
+            return f"생활 루틴 저장 완료. 사용자 원문: {text}"
 
         if "안부만" in lowered or "짧게 응원" in lowered or "긴 설명 말고" in lowered:
-            return "많이 불안하셨겠어요. 지금은 천천히 숨 고르시고, 제가 옆에서 계속 도와드릴게요."
+            return "사용자가 짧은 정서적 지지를 요청함. 불안을 인정하고 짧게 안심시키되 과장하지 말 것."
 
         if "그냥 인사" in lowered or ("안녕" in lowered and decision.intent == "smalltalk"):
-            return "안녕하세요. 오늘은 편하게 인사만 나눠도 괜찮아요."
+            return "사용자가 가벼운 인사를 함. 짧고 자연스럽게 인사만 응답할 것."
 
         if "오늘 아침에 뭐" in text:
             history_text = str(execution_results.get("task_results", {}).get("history", ""))
             if "보리차" in history_text or "산책" in history_text:
-                return "오늘 아침에는 오전 7시에 20분 산책했고, 커피 대신 보리차를 마셨다고 하셨어요."
-            return "오늘 아침에는 오전 7시에 20분 산책했고, 보리차를 마신 생활 루틴을 기억하고 있어요."
+                return "기억 조회 결과: 오늘 아침 오전 7시에 20분 산책했고 커피 대신 보리차를 마셨음."
+            return "기억 조회 결과: 오늘 아침 생활 루틴으로 오전 7시 20분 산책과 보리차 음용 기록이 있음."
 
         if self._is_medication_record_text(text):
             date_text = self._extract_korean_date(text) or "해당 날짜"
             time_text = "밤 9시" if "밤 9시" in text else "기록된 시간"
             med = self._first_medication_from_text(text) or "해당 약"
-            return f"{date_text} {time_text}에 {med}을 복용했다고 기록했습니다."
+            return f"복용 기록 저장 완료. 날짜: {date_text}. 시간: {time_text}. 약: {med}."
 
         if self._is_meal_medication_prep_request(text) and prescription_meds:
             return (
@@ -822,11 +1132,11 @@ class EngineOrchestrator:
                 else ""
             )
             return (
-                f"저장된 약 {med_text} 기준으로 필요한 DUR 정보를 확인했습니다.{checked_text} "
-                "조회 결과는 참고용 안전 정보라서, 처방 변경이나 복용 중단은 의사나 약사와 확인해 주세요."
+                f"저장된 약 {med_text} 기준으로 복용 안전 정보를 확인했습니다.{checked_text} "
+                "이 결과만으로 처방을 바꾸거나 복용을 중단하지 말고, 의사나 약사와 확인해 주세요."
             )
 
-        if "녹용" in text:
+        if "녹용" in effective_text:
             med_text = self._friendly_medication_label(prescription_meds)
             med_context = f"현재 저장된 약 {med_text}와 " if prescription_meds else "현재 복용 중인 약이나 "
             return (
@@ -863,6 +1173,14 @@ class EngineOrchestrator:
                 "제품명과 성분표를 약사나 의사에게 보여주고 확인하세요."
             )
 
+        if self._is_generic_supplement_question(text):
+            supplement = self._first_supplement_from_text(text)
+            if supplement:
+                return (
+                    f"{supplement}에 대해 물어보신 거죠. 제품마다 성분과 함량이 달라서 "
+                    "드시는 약이 있다면 제품명이나 성분표를 함께 확인하는 게 좋습니다."
+                )
+
         if "읽힌 처방 약 이름" in text and prescription_meds:
             return "OCR에서 읽힌 처방 약 이름은 " + ", ".join(prescription_meds) + "입니다."
 
@@ -871,9 +1189,11 @@ class EngineOrchestrator:
     @staticmethod
     def _skip_llm_polish(*, text: str, decision: Any) -> bool:
         lowered = text.lower()
-        if decision.mode in {ReasoningMode.MEMORY_ONLY, ReasoningMode.ASK_USER_CLARIFY}:
+        if decision.mode == ReasoningMode.ASK_USER_CLARIFY:
             return True
         if decision.intent == "emergency":
+            return True
+        if is_profile_recall_query(text):
             return True
         return any(
             token in lowered
@@ -884,13 +1204,8 @@ class EngineOrchestrator:
                 "복용 계획",
                 "복약 계획",
                 "복약 안내",
-                "오늘 약",
-                "식후 약",
                 "약 알림",
-                "저장",
-                "기록",
                 "읽힌 처방",
-                "건강기능식품",
             )
         )
 
@@ -926,6 +1241,32 @@ class EngineOrchestrator:
                 "아스피린",
             )
         )
+
+    @staticmethod
+    def _is_generic_supplement_question(text: str) -> bool:
+        return any(token in text for token in ("비타민", "유산균", "칼슘", "철분", "마그네슘", "루테인"))
+
+    @staticmethod
+    def _first_supplement_from_text(text: str) -> str:
+        for token in ("비타민", "유산균", "칼슘", "철분", "마그네슘", "루테인", "오메가3", "녹용"):
+            if token in text:
+                return token
+        return ""
+
+    @staticmethod
+    def _augment_followup_with_recent_subject(text: str, context: dict[str, Any]) -> str:
+        if "녹용" in text:
+            return text
+        compact = re.sub(r"\s+", "", text or "")
+        if not any(token in compact for token in ("그래서", "그럼", "같이먹어도", "먹어도돼", "안먹어도돼")):
+            return text
+        recent_context = "\n".join(
+            str(context.get(key) or "")
+            for key in ("context_memory", "current_requirement")
+        )
+        if "녹용" in recent_context:
+            return f"{text} (직전 상담 주제: 녹용)"
+        return text
 
     @staticmethod
     def _requires_medical_disclaimer(text: str, decision: Any, reviewed_message: str) -> bool:
@@ -1146,7 +1487,7 @@ class EngineOrchestrator:
 
     @staticmethod
     def _is_profile_recall(text: str) -> bool:
-        return any(token in text for token in ("내 이름", "내 프로필", "기저질환", "내가 누구", "누구인지"))
+        return is_profile_recall_query(text)
 
     @staticmethod
     def _is_medication_record_text(text: str) -> bool:

@@ -1,2 +1,0 @@
-- [최신 복약 및 DUR 요약](current_medication.md) - 최근 OCR 처방 약품: 타이레놀정, 이부프로펜정
-- [환자 프로필](patient_profile.md) - trace_user_smalltalk_med_context_001_20260512 환자 기본 프로필

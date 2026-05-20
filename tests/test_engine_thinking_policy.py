@@ -101,6 +101,131 @@ def test_internal_reasoning_llm_does_not_force_no_think(monkeypatch):
     assert answer == "핵심"
 
 
+def test_identity_conflict_judge_uses_local_llm(monkeypatch):
+    captured: list[dict] = []
+
+    def fake_client(**kwargs):
+        return _FakeAsyncClient(captured=captured, content="TRUE", **kwargs)
+
+    monkeypatch.setattr(settings, "internal_llm_api_url", "http://local/v1/chat/completions")
+    monkeypatch.setattr(settings, "internal_llm_api_key", None)
+    monkeypatch.setattr(settings, "internal_llm_model", "qwen3-4b")
+    monkeypatch.setattr(llm_service.httpx, "AsyncClient", fake_client)
+
+    result = asyncio.run(
+        llm_service.judge_identity_conflict(
+            current_text="나는 최서연이고 스물네 살 여성이야",
+            patient_profile={"name": "박민준", "age": "68", "gender": "남성"},
+        )
+    )
+
+    assert captured
+    assert captured[0]["url"] == "http://local/v1/chat/completions"
+    assert captured[0]["json"]["model"] == "qwen3-4b"
+    assert captured[0]["json"].get("chat_template_kwargs") == {"enable_thinking": False}
+    assert captured[0]["json"]["temperature"] == 0.0
+    assert result == {"conflict": True, "source": "local_llm", "raw": "TRUE"}
+
+
+def test_route_classifier_uses_zero_temperature(monkeypatch):
+    captured: list[dict] = []
+
+    def fake_client(**kwargs):
+        return _FakeAsyncClient(
+            captured=captured,
+            content='{"route_label":"noise_fragment","mode":"MEMORY_ONLY","intent":"unknown","task_types":[],"rationale":"test"}',
+            **kwargs,
+        )
+
+    monkeypatch.setattr(settings, "internal_llm_api_url", "http://local/v1/chat/completions")
+    monkeypatch.setattr(settings, "internal_llm_api_key", None)
+    monkeypatch.setattr(settings, "internal_llm_model", "qwen3-4b")
+    monkeypatch.setattr(llm_service.httpx, "AsyncClient", fake_client)
+
+    result = asyncio.run(
+        llm_service.classify_reasoning_route_with_llm(
+            current_text="스읍",
+            conversation_context="",
+        )
+    )
+
+    assert result["route_label"] == "noise_fragment"
+    assert captured[0]["json"]["temperature"] == 0.0
+    assert captured[0]["json"].get("chat_template_kwargs") == {"enable_thinking": False}
+
+
+def test_identity_conflict_judge_does_not_fallback_to_keyword_heuristic(monkeypatch):
+    monkeypatch.setattr(settings, "internal_llm_api_url", None)
+
+    result = asyncio.run(
+        llm_service.judge_identity_conflict(
+            current_text="나는 최서연이고 스물네 살 여성이야",
+            patient_profile={"name": "박민준", "age": "68", "gender": "남성"},
+        )
+    )
+
+    assert result["conflict"] is False
+    assert result["source"] == "local_llm_not_configured"
+
+
+def test_ocr_medication_extraction_uses_frontier_openai(monkeypatch):
+    captured: list[dict] = []
+
+    def fake_client(**kwargs):
+        return _FakeAsyncClient(
+            captured=captured,
+            content='{"medications":[{"name":"무브록정40mg"}],"clarification_question":"증상을 알려주세요."}',
+            **kwargs,
+        )
+
+    monkeypatch.setattr(settings, "openai_api_key", "test-key")
+    monkeypatch.setattr(settings, "openai_model", "gpt-test")
+    monkeypatch.setattr(settings, "google_ai_api_key", None)
+    monkeypatch.setattr(llm_service.httpx, "AsyncClient", fake_client)
+
+    result = asyncio.run(
+        llm_service.extract_ocr_medication_candidates_with_llm(
+            "처방 의약품 목록 | 무브록정40mg | 용법 [불명확]"
+        )
+    )
+
+    assert captured
+    assert captured[0]["url"] == "https://api.openai.com/v1/chat/completions"
+    assert captured[0]["json"]["model"] == "gpt-test"
+    assert result["source"] == "frontier_openai"
+    assert result["medications"][0]["name"] == "무브록정40mg"
+
+
+def test_ocr_medication_refinement_uses_frontier_openai(monkeypatch):
+    captured: list[dict] = []
+
+    def fake_client(**kwargs):
+        return _FakeAsyncClient(
+            captured=captured,
+            content='{"medications":[{"name":"페브릭정","purpose_or_symptom":"통풍"}],"clarification_question":""}',
+            **kwargs,
+        )
+
+    monkeypatch.setattr(settings, "openai_api_key", "test-key")
+    monkeypatch.setattr(settings, "openai_model", "gpt-test")
+    monkeypatch.setattr(settings, "google_ai_api_key", None)
+    monkeypatch.setattr(llm_service.httpx, "AsyncClient", fake_client)
+
+    result = asyncio.run(
+        llm_service.refine_ocr_medication_candidates_with_context(
+            raw_text="처방 의약품 | 페니라민정 | 록소나정 60mg",
+            current_medications=[{"name": "페니라민정"}, {"name": "록소나정 60mg"}],
+            user_text="통풍 때문에 처방받은 약이야",
+        )
+    )
+
+    assert captured
+    assert captured[0]["url"] == "https://api.openai.com/v1/chat/completions"
+    assert "통풍 때문에 처방받은 약이야" in captured[0]["json"]["messages"][1]["content"]
+    assert result["source"] == "frontier_openai_context_refine"
+    assert result["medications"][0]["name"] == "페브릭정"
+
+
 def test_reasoning_tag_stripper_removes_embedded_and_trailing_think_blocks():
     content = 'Visible answer. <think data-source="qwen">late reasoning</think>\nNext sentence.<THINK>unfinished'
 

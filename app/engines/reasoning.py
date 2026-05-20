@@ -18,6 +18,12 @@ from app.schemas.engine_contracts import (
     ReasoningRouteInput,
     ReasoningTask,
 )
+from app.services.medication_extraction import (
+    extract_medication_suffix_tokens,
+    filter_drug_name_candidates,
+    is_wake_word_only,
+    strip_wake_words,
+)
 from app.services.patient_safety import classify_patient_safety_situation
 from app.tools import dur_api, hira_api, health_supplement, llm_search
 
@@ -64,8 +70,18 @@ EMERGENCY_KEYWORDS = [
 ]
 DRUG_ID_KEYWORDS = ["알약", "낱알", "이거 뭐", "무슨 약", "약 이름"]
 PROFILE_OR_MEMORY_KEYWORDS = [
-    "제 이름", "저는", "처음 왔", "기억해", "기억하고", "생활습관",
-    "산책", "안부", "격려",
+    "제 이름",
+    "저는",
+    "처음 왔",
+    "기억해",
+    "기억하고",
+    "생활습관",
+    "산책",
+    "안부",
+    "격려",
+    "내가 누구",
+    "누구인지",
+    "내 프로필",
 ]
 DIRECT_MEDICAL_QUERY_KEYWORDS = [
     "먹어도", "같이 먹", "드셔도", "부작용", "금기", "주의", "효능",
@@ -97,6 +113,9 @@ class ReasoningEngine:
     # ── RE_Intent: 의도 파악 및 태스크 설계 ──
 
     def classify_intent(self, text: str) -> str:
+        if is_wake_word_only(text):
+            return IntentType.SMALLTALK
+
         text_lower = text.lower().strip()
 
         safety = classify_patient_safety_situation(text)
@@ -218,6 +237,15 @@ class ReasoningEngine:
                 tasks=[],
             )
 
+        profile = context.get("user_profile") or {}
+        if self._is_profile_identity_recall(text, profile):
+            return ReasoningRouteDecision(
+                mode=ReasoningMode.MEMORY_ONLY,
+                intent=IntentType.SMALLTALK,
+                rationale="profile_identity_recall",
+                tasks=[],
+            )
+
         intent = self.classify_intent(text)
         safety = classify_patient_safety_situation(text)
         if safety and safety.severity != "emergency":
@@ -265,6 +293,14 @@ class ReasoningEngine:
                 tasks=[],
             )
 
+        if intent == IntentType.SMALLTALK:
+            return ReasoningRouteDecision(
+                mode=ReasoningMode.MEMORY_ONLY,
+                intent=IntentType.UNKNOWN,
+                rationale="out_of_scope_smalltalk_suppressed",
+                tasks=[],
+            )
+
         if intent == IntentType.EMERGENCY:
             return ReasoningRouteDecision(
                 mode=ReasoningMode.FRONTIER_FIRST,
@@ -282,10 +318,16 @@ class ReasoningEngine:
         lowered = text.lower()
         if self._is_missing_ocr_image_request(lowered):
             return ReasoningRouteDecision(
-                mode=ReasoningMode.ASK_USER_CLARIFY,
+                mode=ReasoningMode.TOOL_FIRST,
                 intent=IntentType.MEDICATION_QUERY,
-                rationale="ocr_requested_without_image",
-                tasks=[],
+                rationale="ocr_capture_requested",
+                tasks=[
+                    ReasoningTask(
+                        type="request_ocr",
+                        priority=1,
+                        description="약봉투/처방전 OCR 촬영 요청",
+                    )
+                ],
             )
 
         if self._is_medication_record_request(lowered):
@@ -311,7 +353,7 @@ class ReasoningEngine:
             )
 
         prescription_log = str(context.get("prescription_log", "")).strip()
-        if prescription_log:
+        if prescription_log and intent != IntentType.SMALLTALK:
             return ReasoningRouteDecision(
                 mode=ReasoningMode.MEMORY_ONLY,
                 intent=intent,
@@ -471,15 +513,19 @@ class ReasoningEngine:
                     parts.append(
                         f"{name}: {item.get('RAWMTR_NM', '성분 정보 없음')}"
                     )
+                else:
+                    parts.append(
+                        f"{name}: 제품마다 성분과 함량이 달라 제품명이나 성분표 확인이 필요합니다."
+                    )
 
         history_data = task_results.get("history", {})
-        if history_data:
+        if history_data and intent not in {IntentType.SUPPLEMENT_QUERY, IntentType.SMALLTALK}:
             structured = history_data.get("structured_memory", {})
             briefs = structured.get("briefs", []) if isinstance(structured, dict) else []
             for brief in briefs[:2]:
                 parts.append(brief)
-            if not briefs:
-                parts.append("과거 상담 이력을 참고하였습니다.")
+            if not briefs and not self._is_profile_identity_recall(query, {"name": "_"}):
+                parts.append("이전 기록에서 바로 답할 핵심 내용을 찾지 못했습니다.")
 
         if not parts:
             search_result = await llm_search.llm_search(query)
@@ -515,6 +561,7 @@ class ReasoningEngine:
     def _extract_drug_names(
         self, text: str, context: dict
     ) -> list[str]:
+        query = strip_wake_words(text)
         names: list[str] = []
         prescription_log = context.get("prescription_log", "")
         if prescription_log:
@@ -526,21 +573,13 @@ class ReasoningEngine:
                     if name and len(name) > 1:
                         names.append(name)
 
-        names.extend(
-            match.group(1)
-            for match in re.finditer(r"([가-힣A-Za-z0-9]+(?:장용정|정|캡슐|시럽))", text)
-        )
+        names.extend(extract_medication_suffix_tokens(query))
         for known_name in COMMON_MEDICATION_NAMES:
-            if known_name in text:
+            if known_name in query:
                 names.append(known_name)
 
-        unique: list[str] = []
-        for name in names:
-            cleaned = name.strip(".,!?()[]{}")
-            if cleaned and cleaned not in unique:
-                unique.append(cleaned)
-
-        return unique[:5] if unique else [text[:20]]
+        filtered = filter_drug_name_candidates(names)
+        return filtered[:5]
 
     def _extract_supplement_names(self, text: str) -> list[str]:
         names: list[str] = []
@@ -551,7 +590,7 @@ class ReasoningEngine:
         for kw in known:
             if kw in text:
                 names.append(kw)
-        return names if names else [text[:20]]
+        return filter_drug_name_candidates(names)
 
     def _summarize_dur(
         self, drug_name: str, dur_result: dict
@@ -566,7 +605,9 @@ class ReasoningEngine:
             if not items:
                 continue
 
-            endpoint_desc = result.get("endpoint", check_type)
+            endpoint_desc = self._friendly_dur_endpoint_label(
+                str(result.get("endpoint") or check_type)
+            )
             for item in items[:3]:
                 if isinstance(item, dict):
                     name = (
@@ -584,8 +625,25 @@ class ReasoningEngine:
                         summaries.append(f"{name} ({endpoint_desc}): {note[:100]}")
 
         if summaries:
-            return f"{drug_name} DUR 확인 결과: " + "; ".join(summaries)
+            return f"{drug_name} 안전 확인 결과: " + "; ".join(summaries)
         return ""
+
+    @staticmethod
+    def _friendly_dur_endpoint_label(label: str) -> str:
+        cleaned = re.sub(r"\s*\(T\d+\)", "", label or "")
+        replacements = {
+            "병용 금기 정보조회": "함께 먹으면 안 되는 조합",
+            "병용금기정보조회": "함께 먹으면 안 되는 조합",
+            "노인주의 정보조회": "고령자 복용 주의",
+            "DUR 품목정보 조회": "약 기본 정보",
+            "특정연령대 금기 정보조회": "연령별 복용 금기",
+            "용량주의 정보조회": "복용량 주의",
+            "투여기간주의 정보조회": "복용 기간 주의",
+            "효능군중복 정보조회": "비슷한 효과 약 중복 주의",
+            "서방정분할주의 정보조회": "쪼개 먹으면 안 되는 약 주의",
+            "임부금기 정보조회": "임신 중 복용 금기",
+        }
+        return replacements.get(cleaned, cleaned or "주의 정보")
 
     def _select_dur_endpoint_keys(
         self,
@@ -625,6 +683,16 @@ class ReasoningEngine:
             return False
         return not any(kw in text_lower for kw in DIRECT_MEDICAL_QUERY_KEYWORDS)
 
+    @staticmethod
+    def _is_profile_identity_recall(text: str, profile: dict[str, Any]) -> bool:
+        if not profile.get("name"):
+            return False
+        compact = re.sub(r"\s+", "", text)
+        return any(token in text for token in ("내가 누구", "누구인지", "내 이름", "내 프로필")) or any(
+            token in compact
+            for token in ("내가누구", "누군지", "누구인지", "내이름", "내프로필", "나누구")
+        )
+
     def _is_memory_recall_query(self, text_lower: str) -> bool:
         return any(kw in text_lower for kw in MEMORY_RECALL_KEYWORDS)
 
@@ -653,6 +721,7 @@ class ReasoningEngine:
     def _is_missing_ocr_image_request(self, text_lower: str) -> bool:
         return (
             any(token in text_lower for token in ("처방전", "약봉투", "약 사진", "약사진", "사진", "ocr"))
-            and any(token in text_lower for token in ("읽어서", "읽어", "ocr", "찍", "촬영", "보여"))
+            and any(token in text_lower for token in ("읽어서", "읽어", "ocr", "찍", "촬영", "보여", "등록", "저장"))
             and not any(token in text_lower for token in ("결과", "나왔", "인식"))
         )
+
