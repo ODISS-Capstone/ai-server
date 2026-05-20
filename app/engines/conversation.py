@@ -139,6 +139,14 @@ class ConversationEngine:
             return random.choice(SMALLTALK_PATTERNS[smalltalk_type])
         return None
 
+    def build_wake_word_response(self, user_profile: Optional[dict] = None) -> str:
+        """Return a deterministic wake-word acknowledgement.
+
+        Wake-word-only turns should never go through LLM generation because they
+        are not medical questions. Keep the response short and profile-aware.
+        """
+        return f"네, {self._honorific(user_profile)}. 말씀하세요."
+
     # ── CE_Tone: 사용자 맞춤형 언어 순화 및 최적화 ──
 
     def apply_tone(
@@ -157,7 +165,7 @@ class ConversationEngine:
         del flash_context
 
         honorific = self._honorific(user_profile)
-        text = self._replace_unconfirmed_elder_honorific(text, honorific)
+        text = self._replace_generic_honorific(text, honorific)
 
         replacements = {
             "병용 금기": "같이 드시면 안 되는 약",
@@ -402,13 +410,16 @@ class ConversationEngine:
         lowered = text.lower()
         if any(token in lowered for token in ("사진", "ocr", "약봉투", "처방전", "촬영", "찍")):
             return "ocr"
-        if any(token in lowered for token in ("알림", "예약", "몇 시", "시간 바꿔", "시간 변경")):
+        if any(token in lowered for token in ("알림", "예약", "몇 시", "시간 바꿔", "시간 변경")) or (
+            any(meal in lowered for meal in ("아침", "점심", "저녁"))
+            and re.search(r"\d{1,2}\s*시", lowered)
+        ):
             return "reminder"
         if any(token in lowered for token in ("먹었어", "먹었나", "복용했", "기록")):
             return "record"
         if any(token in lowered for token in ("같이 먹", "병용", "상호작용", "두 번", "더 빨리", "녹용", "오메가3", "건강기능식품", "영양제", "dur")):
             return "dur"
-        if any(token in lowered for token in ("약", "복용", "처방", "식후", "식전", "아침", "점심", "저녁")):
+        if any(token in lowered for token in ("약", "복용", "처방", "식후", "식전", "밥", "아침", "점심", "저녁")):
             return "medication"
         return "general"
 
@@ -433,7 +444,7 @@ class ConversationEngine:
         if not text:
             return f"{self._honorific(user_profile)}, 듣고 있어요."
         honorific = self._honorific(user_profile)
-        text = self._replace_unconfirmed_elder_honorific(text, honorific)
+        text = self._replace_generic_honorific(text, honorific)
         if text.startswith(("어르신", "사용자님", "네,", honorific)):
             return text
         return f"{honorific}, {text}"
@@ -495,7 +506,14 @@ class ConversationEngine:
 
     @staticmethod
     def _replace_unconfirmed_elder_honorific(text: str, honorific: str) -> str:
-        return (text or "").replace("어르신", honorific)
+        return ConversationEngine._replace_generic_honorific(text, honorific)
+
+    @staticmethod
+    def _replace_generic_honorific(text: str, honorific: str) -> str:
+        cleaned = (text or "").replace("어르신", honorific)
+        if honorific and honorific != "사용자님":
+            cleaned = cleaned.replace("사용자님", honorific)
+        return cleaned
 
     @staticmethod
     def _looks_like_medical_safety_answer(text: str) -> bool:

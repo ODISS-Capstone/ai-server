@@ -843,6 +843,100 @@ def test_meal_medication_guidance_uses_llm_route_without_ocr(tmp_path, monkeypat
     assert not after_meal.execution_results.get("task_results", {}).get("ocr_requested")
 
 
+def test_after_meal_question_with_wake_word_uses_stored_medication_first(tmp_path, monkeypatch):
+    memory = make_memory(tmp_path)
+    speaker_id = "meal-memory-user"
+    run(
+        memory.save_identity_profile(
+            speaker_id,
+            {"name": "김영수", "gender": "남성", "age": "72"},
+            mark_verified=True,
+        )
+    )
+    run(
+        memory.store.write_flash(
+            "prescription_log",
+            "# 현재 복용 약 요약\n\n## 약품 목록\n- 혈압약\n",
+        )
+    )
+
+    async def fake_classify_route(**kwargs):
+        return {"usable": False, "source": "test_no_local_route"}
+
+    monkeypatch.setattr(
+        "app.services.engine_orchestrator.classify_reasoning_route_with_llm",
+        fake_classify_route,
+    )
+
+    orchestrator = make_orchestrator(memory)
+    result = run(
+        orchestrator.run_turn(
+            text="오디스 내가 밥을 먹고 난후 무슨 약을 먹어야 하는지 알려줘",
+            speaker_id=speaker_id,
+            include_judge=False,
+            include_delivery_llm=False,
+            run_identity_gate=True,
+        )
+    )
+
+    answer = result.conversation.response_text
+    assert result.decision.rationale == "stored_medication_meal_guidance"
+    assert result.decision.tasks == []
+    assert "김영수님" in answer
+    assert "혈압약" in answer
+    assert "현재 기록" in answer
+    assert "어르신" not in answer
+    assert "사용자님" not in answer
+    assert "구체적인 정보" not in answer
+    assert "아직 기록" not in answer
+
+
+def test_medication_record_challenge_confirms_existing_record(tmp_path, monkeypatch):
+    memory = make_memory(tmp_path)
+    speaker_id = "record-challenge-user"
+    run(
+        memory.save_identity_profile(
+            speaker_id,
+            {"name": "김영수", "gender": "남성", "age": "72"},
+            mark_verified=True,
+        )
+    )
+    run(
+        memory.store.write_flash(
+            "prescription_log",
+            "# 현재 복용 약 요약\n\n## 약품 목록\n- 혈압약\n",
+        )
+    )
+
+    async def fake_classify_route(**kwargs):
+        return {"usable": False, "source": "test_no_local_route"}
+
+    monkeypatch.setattr(
+        "app.services.engine_orchestrator.classify_reasoning_route_with_llm",
+        fake_classify_route,
+    )
+
+    orchestrator = make_orchestrator(memory)
+    result = run(
+        orchestrator.run_turn(
+            text="나 혈압약 먹고 있다고 했는데 기록 남아있지 않나?",
+            speaker_id=speaker_id,
+            include_judge=False,
+            include_delivery_llm=False,
+            run_identity_gate=True,
+        )
+    )
+
+    answer = result.conversation.response_text
+    assert result.decision.rationale == "stored_medication_record_recall"
+    assert "김영수님" in answer
+    assert "맞아요" in answer
+    assert "혈압약" in answer
+    assert "어르신" not in answer
+    assert "사용자님" not in answer
+    assert "아직 기록" not in answer
+
+
 def test_llm_routed_noise_and_ack_are_ignored_without_tts(tmp_path, monkeypatch):
     memory = make_memory(tmp_path)
     run(

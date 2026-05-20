@@ -52,6 +52,15 @@ def clear_agent_ws_state():
     agent_ws._queued_ocr_request_by_speaker.clear()
 
 
+def _receive_ocr_filler_then_payload(ws):
+    filler = ws.receive_json()
+    assert filler["type"] == "filler"
+    assert filler["stage"] == "ocr_processing"
+    assert filler["requires_tts"] is True
+    assert "사진" in filler["text"]
+    return filler, ws.receive_json()
+
+
 def _import_agent_drug_parser():
     try:
         from src.cloud_server.drug_parser import (  # type: ignore[import-not-found]
@@ -208,7 +217,7 @@ def test_agent_ws_ocr_result_contract(client: TestClient) -> None:
                 }
             )
         )
-        reply = ws.receive_json()
+        _, reply = _receive_ocr_filler_then_payload(ws)
 
     assert reply["type"] == "ocr_processed"
     assert reply["medication_count"] == 2
@@ -230,7 +239,7 @@ def test_agent_ws_uncertain_ocr_requests_recapture(client: TestClient) -> None:
                 }
             )
         )
-        first = ws.receive_json()
+        _, first = _receive_ocr_filler_then_payload(ws)
         second = ws.receive_json()
 
     assert first["type"] == "ocr_processed"
@@ -269,7 +278,7 @@ def test_agent_ws_ocr_does_not_regex_guess_when_frontier_llm_finds_no_medication
                 }
             )
         )
-        first = ws.receive_json()
+        _, first = _receive_ocr_filler_then_payload(ws)
         second = ws.receive_json()
 
     assert first["type"] == "ocr_processed"
@@ -311,7 +320,7 @@ def test_agent_ws_ocr_uses_llm_candidates_and_question(client: TestClient, monke
                 }
             )
         )
-        reply = ws.receive_json()
+        _, reply = _receive_ocr_filler_then_payload(ws)
 
     assert reply["type"] == "ocr_processed"
     assert reply["medication_count"] == 1

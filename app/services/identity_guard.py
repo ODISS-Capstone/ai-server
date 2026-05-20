@@ -257,6 +257,18 @@ async def evaluate_identity_gate(
                 reason="identity_verified",
                 metadata={"speaker_id": speaker_id, "profile": saved},
             )
+        if pending_action == "identity_conflict" and _is_name_only_profile_mismatch(identity_update, profile):
+            saved = await memory_engine.mark_identity_pending(speaker_id, "registration")
+            return IdentityGateResult(
+                allowed=False,
+                reason="identity_rejected_needs_registration",
+                response_text=_identity_rejected_registration_question(profile),
+                metadata={
+                    "speaker_id": speaker_id,
+                    "profile": saved,
+                    "pending_identity_judge": {"decision": "different_person", "source": "name_only_fast_path"},
+                },
+            )
         pending_reply = await judge_pending_identity_reply_with_llm(
             current_text=text,
             patient_profile=profile,

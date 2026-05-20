@@ -25,6 +25,7 @@ from app.engines.llm_judge import LLMJudgeEngine
 from app.services.engine_orchestrator import EngineOrchestrator
 from app.services.identity_guard import evaluate_identity_gate
 from app.services.llm import extract_ocr_medication_candidates_with_llm, refine_ocr_medication_candidates_with_context
+from app.services.medication_extraction import is_wake_word_only
 from app.services.reminders import ReminderService
 from app.tools import llm_search
 
@@ -52,6 +53,27 @@ MEDICATION_PROGRESS_FILLERS = (
     "복용 안전 확인이 필요해서 조금 더 살펴볼게요.",
     "복용 중인 약 기준으로 같이 먹어도 되는지 확인하고 있어요.",
     "처방을 바꾸라는 뜻은 아니고, 주의할 조합이 있는지만 확인 중이에요.",
+)
+REMINDER_PROGRESS_FILLERS = (
+    "알림 시간을 확인하고 있어요.",
+    "복약 알림이 헷갈리지 않도록 시간을 맞춰보고 있어요.",
+    "설정한 알림을 기록에 저장하고 있어요.",
+)
+RECORD_PROGRESS_FILLERS = (
+    "복용 기록을 확인하고 있어요.",
+    "방금 말씀하신 복용 내용을 기록과 맞춰보고 있어요.",
+    "나중에 다시 확인하실 수 있게 정리하고 있어요.",
+)
+GENERAL_PROGRESS_FILLERS = (
+    "말씀하신 내용을 확인하고 있어요.",
+    "필요한 기록을 찾아보고 있어요.",
+    "답변을 정리하고 있어요.",
+)
+OCR_PROCESSING_FILLER = "사진을 확인하고 있습니다. 잠시만 기다려주세요."
+OCR_PROGRESS_FILLERS = (
+    "사진 속 글자가 제대로 읽혔는지 확인하고 있어요.",
+    "약 이름을 추측하지 않도록 인식 결과를 한 번 더 살펴보고 있어요.",
+    "복약 기록에 저장해도 되는 정보인지 정리하고 있어요.",
 )
 
 
@@ -215,51 +237,80 @@ async def _handle_stt(websocket: WebSocket, message: dict, active_speakers: set[
         await _send_queued_ocr_request_if_ready(websocket, speaker_id)
         return
 
+    if is_wake_word_only(text):
+        profile = (identity_gate.metadata or {}).get("profile") or {}
+        if not profile:
+            context = await memory_engine.load_context(speaker_id)
+            profile = context.get("user_profile", {})
+        response_text = conversation_engine.build_wake_word_response(profile)
+        response = conversation_engine.build_response(
+            {
+                "text": response_text,
+                "type": "wake_word_ack",
+                "requires_tts": True,
+            }
+        )
+        await websocket.send_json({"type": "response", **response})
+        if speaker_id:
+            await memory_engine.mark_identity_seen(speaker_id, verified=True)
+        return
+
     if await _handle_pending_ocr_confirmation(websocket, text, speaker_id):
         return
 
     if await _send_queued_ocr_request_if_ready(websocket, speaker_id):
         return
 
-    context = await memory_engine.load_context(speaker_id)
-
-    reminder_text = await reminder_service.handle_user_text(
-        memory_engine=memory_engine,
-        speaker_id=speaker_id,
-        text=text,
-        user_profile=context.get("user_profile", {}),
-        prescription_log=context.get("prescription_log", ""),
-    )
-    if reminder_text:
-        response = conversation_engine.build_response(
-            {
-                "text": reminder_text,
-                "type": "reminder",
-                "requires_tts": True,
-            }
+    immediate_filler = _immediate_filler_for_text(text)
+    progress_task: asyncio.Task | None = None
+    if immediate_filler:
+        await _send_runtime_filler(websocket, immediate_filler, stage=_processing_stage_for_text(text))
+        progress_task = asyncio.create_task(
+            _send_progress_fillers(websocket, text, initial_sent=True)
         )
-        await websocket.send_json({"type": "response", **response})
-        await memory_engine.update_and_compress(
-            {
-                "query": text,
-                "answer": reminder_text,
-                "type": "reminder",
-            },
-            speaker_id=speaker_id,
-        )
-        if speaker_id:
-            await memory_engine.mark_identity_seen(speaker_id, verified=True)
-        return
-
-    preview_input = conversation_engine.receive_input(text, speaker_id)
-    pre_filler = conversation_engine.generate_filler(preview_input)
-    if pre_filler:
-        await websocket.send_json({"type": "filler", "text": pre_filler})
-
-    progress_task = asyncio.create_task(
-        _send_progress_fillers(websocket, text, initial_sent=bool(pre_filler))
-    )
     try:
+        context = await memory_engine.load_context(speaker_id)
+        gate_profile = (identity_gate.metadata or {}).get("profile") or {}
+        if gate_profile and not (context.get("user_profile") or {}).get("name"):
+            context["user_profile"] = gate_profile
+
+        reminder_text = await reminder_service.handle_user_text(
+            memory_engine=memory_engine,
+            speaker_id=speaker_id,
+            text=text,
+            user_profile=context.get("user_profile", {}),
+            prescription_log=context.get("prescription_log", ""),
+        )
+        if reminder_text:
+            response = conversation_engine.build_response(
+                {
+                    "text": reminder_text,
+                    "type": "reminder",
+                    "requires_tts": True,
+                }
+            )
+            await websocket.send_json({"type": "response", **response})
+            await memory_engine.update_and_compress(
+                {
+                    "query": text,
+                    "answer": reminder_text,
+                    "type": "reminder",
+                },
+                speaker_id=speaker_id,
+            )
+            if speaker_id:
+                await memory_engine.mark_identity_seen(speaker_id, verified=True)
+            return
+
+        preview_input = conversation_engine.receive_input(text, speaker_id)
+        pre_filler = "" if immediate_filler else conversation_engine.generate_filler(preview_input)
+        if pre_filler:
+            await _send_runtime_filler(websocket, pre_filler, stage=_processing_stage_for_text(text))
+
+        if progress_task is None:
+            progress_task = asyncio.create_task(
+                _send_progress_fillers(websocket, text, initial_sent=bool(pre_filler))
+            )
         turn = await engine_orchestrator.run_turn(
             text=text,
             speaker_id=speaker_id,
@@ -269,14 +320,10 @@ async def _handle_stt(websocket: WebSocket, message: dict, active_speakers: set[
             preloaded_context=context,
         )
     finally:
-        progress_task.cancel()
-        try:
-            await progress_task
-        except asyncio.CancelledError:
-            pass
+        await _cancel_progress_task(progress_task)
 
-    if turn.filler_text and not pre_filler:
-        await websocket.send_json({"type": "filler", "text": turn.filler_text})
+    if turn.filler_text and not immediate_filler and not pre_filler:
+        await _send_runtime_filler(websocket, turn.filler_text, stage=_processing_stage_for_text(text))
 
     if not turn.conversation.requires_tts and not turn.conversation.response_text:
         await websocket.send_json(
@@ -318,23 +365,129 @@ async def _handle_stt(websocket: WebSocket, message: dict, active_speakers: set[
         await memory_engine.mark_identity_seen(speaker_id, verified=True)
 
 
+async def _send_runtime_filler(websocket: WebSocket, text: str, *, stage: str) -> None:
+    await websocket.send_json(
+        {
+            "type": "filler",
+            "text": text,
+            "requires_tts": True,
+            "stage": stage,
+        }
+    )
+
+
+def _immediate_filler_for_text(text: str) -> str:
+    if not _should_send_immediate_filler(text):
+        return ""
+    stage = _processing_stage_for_text(text)
+    preview = conversation_engine.receive_input(text)
+    generated = conversation_engine.generate_filler(preview)
+    if generated:
+        return generated
+    if stage == "reminder":
+        return "복약 알림을 확인하고 있어요."
+    if stage == "record":
+        return "복용 기록을 확인하고 있어요."
+    if stage == "dur":
+        return "복용 안전 정보를 확인하고 있어요."
+    if stage == "medication":
+        return "저장된 복약 정보를 확인하고 있어요."
+    return "말씀하신 내용을 확인하고 있어요."
+
+
+def _should_send_immediate_filler(text: str) -> bool:
+    raw = (text or "").strip()
+    if not raw or is_wake_word_only(raw):
+        return False
+    if _is_direct_ocr_capture_request(raw) or _is_ocr_recapture_reply(raw):
+        return False
+    preview = conversation_engine.receive_input(raw)
+    return not bool(preview.get("is_smalltalk"))
+
+
+def _processing_stage_for_text(text: str) -> str:
+    lowered = (text or "").lower()
+    compact = re.sub(r"\s+", "", lowered)
+    if any(token in lowered for token in ("사진", "ocr", "약봉투", "처방전", "촬영", "찍")):
+        return "ocr"
+    if any(token in lowered for token in ("알림", "예약", "시간 바꿔", "시간 변경")) or (
+        any(meal in lowered for meal in ("아침", "점심", "저녁"))
+        and re.search(r"\d{1,2}\s*시", lowered)
+    ):
+        return "reminder"
+    if any(token in lowered for token in ("먹었어", "먹었나", "복용했", "기록")):
+        return "record"
+    if any(token in lowered for token in ("같이 먹", "병용", "상호작용", "두 번", "더 빨리", "녹용", "오메가3", "건강기능식품", "영양제", "dur")):
+        return "dur"
+    if any(token in lowered for token in ("약", "복용", "처방", "식후", "식전", "밥", "무슨약", "어떤약")) or any(
+        token in compact for token in ("뭐먹", "먹어야", "먹고왔", "먹고난")
+    ):
+        return "medication"
+    return "general"
+
+
 async def _send_progress_fillers(
     websocket: WebSocket,
     text: str,
     *,
     initial_sent: bool,
 ) -> None:
-    """Send short spoken progress updates while slow medication reasoning runs."""
-    lowered = text.lower()
-    if not any(token in lowered for token in ("약", "복용", "같이 먹", "먹어도", "녹용", "영양제", "건강기능식품", "비타민", "오메가3", "dur")):
+    """Send short spoken progress updates while slow runtime work runs."""
+    stage = _processing_stage_for_text(text)
+    if stage == "general":
         return
+    if stage == "reminder":
+        fillers = REMINDER_PROGRESS_FILLERS
+    elif stage == "record":
+        fillers = RECORD_PROGRESS_FILLERS
+    elif stage in {"dur", "medication"}:
+        fillers = MEDICATION_PROGRESS_FILLERS
+    else:
+        fillers = GENERAL_PROGRESS_FILLERS
     delays = (2.5, 6.0, 9.5) if initial_sent else (0.4, 3.5, 7.0)
     try:
-        for delay, filler in zip(delays, MEDICATION_PROGRESS_FILLERS):
+        for delay, filler in zip(delays, fillers):
             await asyncio.sleep(delay)
-            await websocket.send_json({"type": "filler", "text": filler})
+            await _send_runtime_filler(websocket, filler, stage=stage)
     except WebSocketDisconnect:
         raise
+
+
+async def _send_ocr_processing_filler(websocket: WebSocket) -> None:
+    await websocket.send_json(
+        {
+            "type": "filler",
+            "text": OCR_PROCESSING_FILLER,
+            "requires_tts": True,
+            "stage": "ocr_processing",
+        }
+    )
+
+
+async def _send_ocr_progress_fillers(websocket: WebSocket) -> None:
+    try:
+        for delay, filler in zip((2.5, 6.0, 10.0), OCR_PROGRESS_FILLERS):
+            await asyncio.sleep(delay)
+            await websocket.send_json(
+                {
+                    "type": "filler",
+                    "text": filler,
+                    "requires_tts": True,
+                    "stage": "ocr_processing",
+                }
+            )
+    except WebSocketDisconnect:
+        raise
+
+
+async def _cancel_progress_task(task: asyncio.Task | None) -> None:
+    if not task:
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
 
 
 def _is_incomplete_or_noise_utterance(text: str) -> bool:
@@ -432,78 +585,83 @@ async def _handle_ocr(websocket: WebSocket, message: dict) -> None:
         )
         return
 
-    medications = await _normalize_ocr_medications(ocr_data)
-    if medications:
-        ocr_data["medications"] = medications
-    if _is_uncertain_ocr_result(ocr_data):
-        message_text = (
-            "죄송합니다. 이번 사진에서는 약 이름 일부가 흐리게 인식되었습니다. "
-            "복약 정보는 정확해야 하므로 추측해서 저장하지 않겠습니다. "
-            "약봉투를 조금 더 가까이 보여주시고, 글자가 빛에 반사되지 않게 다시 촬영해 주세요."
-        )
-        await websocket.send_json(
-            {
-                "type": "ocr_processed",
-                "message": message_text,
-                "medication_count": len(medications or []),
-                "needs_recapture": True,
-                "pending_confirmation": False,
-            }
-        )
-        recapture_request = reasoning_engine.request_ocr()
-        await websocket.send_json(
-            {
-                "type": "ocr_request",
-                **recapture_request,
-                "reason": "uncertain_ocr_result",
-                "requires_tts": False,
-            }
-        )
-        return
+    await _send_ocr_processing_filler(websocket)
+    progress_task = asyncio.create_task(_send_ocr_progress_fillers(websocket))
+    try:
+        medications = await _normalize_ocr_medications(ocr_data)
+        if medications:
+            ocr_data["medications"] = medications
+        if _is_uncertain_ocr_result(ocr_data):
+            message_text = (
+                "죄송합니다. 이번 사진에서는 약 이름 일부가 흐리게 인식되었습니다. "
+                "복약 정보는 정확해야 하므로 추측해서 저장하지 않겠습니다. "
+                "약봉투를 조금 더 가까이 보여주시고, 글자가 빛에 반사되지 않게 다시 촬영해 주세요."
+            )
+            await websocket.send_json(
+                {
+                    "type": "ocr_processed",
+                    "message": message_text,
+                    "medication_count": len(medications or []),
+                    "needs_recapture": True,
+                    "pending_confirmation": False,
+                }
+            )
+            recapture_request = reasoning_engine.request_ocr()
+            await websocket.send_json(
+                {
+                    "type": "ocr_request",
+                    **recapture_request,
+                    "reason": "uncertain_ocr_result",
+                    "requires_tts": False,
+                }
+            )
+            return
 
-    if medications:
-        key = _pending_ocr_key(speaker_id)
-        _pending_ocr_by_speaker[key] = {
-            "data": ocr_data,
-            "created_at": datetime.now(),
-        }
-        summary = _format_ocr_summary(ocr_data)
-        if _needs_ocr_symptom_clarification(ocr_data):
-            question = str(
-                ocr_data.get("clarification_question")
-                or "어떤 증상으로 처방받은 약인지도 함께 알려주시면 더 안전하게 기록하겠습니다."
-            ).strip()
-            summary += f" 다만 용법이나 처방 목적이 흐릿합니다. {question}"
-        await websocket.send_json(
-            {
-            "type": "ocr_processed",
-            "message": summary + " 이 정보를 복약 정보로 저장할까요?",
-            "medication_count": len(medications),
-            "pending_confirmation": True,
+        if medications:
+            key = _pending_ocr_key(speaker_id)
+            _pending_ocr_by_speaker[key] = {
+                "data": ocr_data,
+                "created_at": datetime.now(),
             }
-        )
-    else:
-        message_text = (
-            "죄송합니다. 이번 사진에서는 약 이름을 확인하기 어렵습니다. "
-            "약봉투를 조금 더 가까이 보여주시고 다시 촬영해 주세요."
-        )
-        await websocket.send_json(
-            {
-            "type": "ocr_processed",
-            "message": message_text,
-            "medication_count": 0,
-            "needs_recapture": True,
-            }
-        )
-        recapture_request = reasoning_engine.request_ocr()
-        await websocket.send_json(
-            {
-                "type": "ocr_request",
-                **recapture_request,
-                "reason": "empty_ocr_medications",
-                "requires_tts": False,
-            }
-        )
+            summary = _format_ocr_summary(ocr_data)
+            if _needs_ocr_symptom_clarification(ocr_data):
+                question = str(
+                    ocr_data.get("clarification_question")
+                    or "어떤 증상으로 처방받은 약인지도 함께 알려주시면 더 안전하게 기록하겠습니다."
+                ).strip()
+                summary += f" 다만 용법이나 처방 목적이 흐릿합니다. {question}"
+            await websocket.send_json(
+                {
+                    "type": "ocr_processed",
+                    "message": summary + " 이 정보를 복약 정보로 저장할까요?",
+                    "medication_count": len(medications),
+                    "pending_confirmation": True,
+                }
+            )
+        else:
+            message_text = (
+                "죄송합니다. 이번 사진에서는 약 이름을 확인하기 어렵습니다. "
+                "약봉투를 조금 더 가까이 보여주시고 다시 촬영해 주세요."
+            )
+            await websocket.send_json(
+                {
+                    "type": "ocr_processed",
+                    "message": message_text,
+                    "medication_count": 0,
+                    "needs_recapture": True,
+                }
+            )
+            recapture_request = reasoning_engine.request_ocr()
+            await websocket.send_json(
+                {
+                    "type": "ocr_request",
+                    **recapture_request,
+                    "reason": "empty_ocr_medications",
+                    "requires_tts": False,
+                }
+            )
+    finally:
+        await _cancel_progress_task(progress_task)
 
 
 async def _handle_pending_ocr_confirmation(
