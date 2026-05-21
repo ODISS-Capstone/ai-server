@@ -48,8 +48,112 @@ def strip_wake_words(text: str) -> str:
 
 def is_wake_word_only(text: str) -> bool:
     """True when the utterance is only a wake word (optionally with punctuation)."""
-    normalized = strip_wake_words(text)
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    if not any(wake and wake in raw for wake in WAKE_WORDS):
+        return False
+    normalized = strip_wake_words(raw)
     return not normalized
+
+
+OCR_CAPTURE_OBJECT_TOKENS: tuple[str, ...] = (
+    "처방전",
+    "약봉투",
+    "약봉지",
+    "약 사진",
+    "약사진",
+    "사진",
+    "카메라",
+    "ocr",
+)
+
+OCR_CAPTURE_ACTION_TOKENS: tuple[str, ...] = (
+    "읽어서",
+    "읽어",
+    "읽혀",
+    "찍",
+    "촬영",
+    "보여",
+    "등록",
+    "저장",
+    "켜",
+    "준비",
+    "대",
+    "ocr",
+)
+
+OCR_CAPTURE_RESULT_TOKENS: tuple[str, ...] = (
+    "결과",
+    "인식",
+    "읽힌",
+    "읽혔",
+    "추출",
+)
+
+NEW_MEDICATION_CAPTURE_PATTERNS: tuple[str, ...] = (
+    "새약받",
+    "새약타",
+    "새약가져",
+    "새약처방",
+    "새로운약받",
+    "새로운약타",
+    "약받아왔",
+    "약받아옴",
+    "약을받아왔",
+    "약을받아옴",
+    "약받았",
+    "약을받았",
+    "약타왔",
+    "약타옴",
+    "약을타왔",
+    "약을타옴",
+    "약새로받",
+    "약새로타",
+    "처방받아왔",
+    "처방받았",
+    "처방받음",
+    "처방나왔",
+    "처방전받",
+    "새처방받",
+    "새처방나왔",
+    "약봉투받",
+    "약봉지받",
+)
+
+
+def is_ocr_capture_request_text(text: str) -> bool:
+    """Detect utterances that should start prescription/package OCR capture.
+
+    Elderly users often say "새 약 받아왔어" or "약 타왔어" without saying
+    "사진" or "카메라". Treat those as OCR setup requests when no concrete drug
+    name has been provided yet.
+    """
+    lowered = (text or "").lower().strip()
+    if not lowered:
+        return False
+
+    compact = re.sub(r"[\s\t\r\n.,;:!?~'\"`]+", "", lowered)
+    if not compact:
+        return False
+
+    result_context = any(token in lowered for token in OCR_CAPTURE_RESULT_TOKENS) or any(
+        token in compact for token in OCR_CAPTURE_RESULT_TOKENS
+    )
+    wants_recapture = any(
+        token in lowered for token in ("다시 찍", "다시 촬영", "재촬영", "한 번 더", "한번 더")
+    ) or any(token in compact for token in ("다시찍", "다시촬영", "재촬영", "한번더"))
+    if result_context and not wants_recapture:
+        return False
+
+    explicit_capture = (
+        any(token in lowered for token in OCR_CAPTURE_OBJECT_TOKENS)
+        and any(token in lowered for token in OCR_CAPTURE_ACTION_TOKENS)
+    )
+    new_medication_capture = any(
+        pattern in compact for pattern in NEW_MEDICATION_CAPTURE_PATTERNS
+    )
+    return explicit_capture or new_medication_capture
 
 
 def is_non_medication_token(token: str) -> bool:

@@ -19,6 +19,8 @@ from app.schemas.engine_contracts import (
     ConversationComposeResponse,
     ReasoningMode,
 )
+from app.services.medication_extraction import is_ocr_capture_request_text
+from app.services.patient_safety import classify_patient_safety_situation
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +43,12 @@ DUR_FILLERS = [
 ]
 
 OCR_FILLERS = [
+    "카메라 촬영을 준비하고 있어요.",
+    "약봉투나 처방전을 잘 읽을 수 있게 촬영 준비를 하고 있어요.",
+    "잠시 후 약봉투를 카메라 앞에 보여주시면 됩니다.",
+]
+
+OCR_PROCESSING_FILLERS = [
     "사진에서 읽힌 약 이름을 확인하고 있어요.",
     "약봉투 글자가 제대로 읽혔는지 살펴보고 있어요.",
     "추측해서 저장하지 않도록, 인식된 내용을 먼저 확인하고 있어요.",
@@ -56,6 +64,12 @@ RECORD_FILLERS = [
     "복용 기록을 남길 준비를 하고 있어요.",
     "방금 드셨다는 내용을 기록에 맞게 정리하고 있어요.",
     "나중에 다시 확인하실 수 있게 복용 기록을 살펴보고 있어요.",
+]
+
+MEAL_FILLERS = [
+    "식후에 드실 약이 있는지 저장된 기록을 확인하고 있어요.",
+    "방금 식사하신 내용을 기준으로 복용약을 확인하고 있어요.",
+    "식사 후 복용 안내가 필요한지 살펴보고 있어요.",
 ]
 
 SMALLTALK_PATTERNS = {
@@ -117,6 +131,9 @@ class ConversationEngine:
         if input_data.get("is_smalltalk"):
             return None
         text = str(input_data.get("text") or "")
+        safety = classify_patient_safety_situation(text)
+        if safety and safety.severity == "emergency":
+            return None
         if self._filler_category(text) == "general":
             return None
         category = self._filler_category(text)
@@ -128,6 +145,8 @@ class ConversationEngine:
             return random.choice(REMINDER_FILLERS)
         if category == "record":
             return random.choice(RECORD_FILLERS)
+        if category == "meal":
+            return random.choice(MEAL_FILLERS)
         if category == "medication":
             return random.choice(MEDICATION_FILLERS)
         return random.choice(FILLER_RESPONSES)
@@ -408,9 +427,13 @@ class ConversationEngine:
     @staticmethod
     def _filler_category(text: str) -> str:
         lowered = text.lower()
+        if is_ocr_capture_request_text(text):
+            return "ocr"
+        if ConversationEngine._is_after_meal_completion_signal(text):
+            return "meal"
         if any(token in lowered for token in ("사진", "ocr", "약봉투", "처방전", "촬영", "찍")):
             return "ocr"
-        if any(token in lowered for token in ("알림", "예약", "몇 시", "시간 바꿔", "시간 변경")) or (
+        if any(token in lowered for token in ("알림", "알람", "예약", "깨워", "챙겨", "몇 시", "시간 바꿔", "시간 변경")) or (
             any(meal in lowered for meal in ("아침", "점심", "저녁"))
             and re.search(r"\d{1,2}\s*시", lowered)
         ):
@@ -424,12 +447,35 @@ class ConversationEngine:
         return "general"
 
     @staticmethod
-    def _is_ocr_capture_request(text: str) -> bool:
-        lowered = text.lower()
-        return (
-            any(token in lowered for token in ("처방전", "약봉투", "약 사진", "약사진", "사진", "ocr"))
-            and any(token in lowered for token in ("찍", "촬영", "읽", "ocr", "보여"))
+    def _is_after_meal_completion_signal(text: str) -> bool:
+        compact = re.sub(r"\s+", "", text or "").lower()
+        if not compact:
+            return False
+        if any(token in compact for token in ("약먹", "약복용", "복용했")):
+            return False
+        meal_signal = any(
+            token in compact
+            for token in ("밥", "식사", "아침", "점심", "저녁", "식후")
         )
+        done_signal = any(
+            token in compact
+            for token in (
+                "먹었",
+                "먹고왔",
+                "먹고옴",
+                "다먹",
+                "먹음",
+                "식사했",
+                "식사끝",
+                "식사마쳤",
+                "먹고나",
+            )
+        )
+        return meal_signal and done_signal
+
+    @staticmethod
+    def _is_ocr_capture_request(text: str) -> bool:
+        return is_ocr_capture_request_text(text)
 
     def _strip_think_tags(self, text: str) -> str:
         """Remove training-only longCoT blocks from runtime responses."""

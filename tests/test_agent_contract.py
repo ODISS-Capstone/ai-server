@@ -414,6 +414,33 @@ def test_agent_ws_camera_ocr_request_is_detected(monkeypatch, client: TestClient
     assert reply["action"] == "request_ocr"
 
 
+def test_agent_ws_new_medication_received_starts_ocr(monkeypatch, client: TestClient) -> None:
+    from app.api.routes import agent_ws
+
+    async def fake_identity_gate(**kwargs):
+        from app.services.identity_guard import IdentityGateResult
+
+        return IdentityGateResult(allowed=True, reason="identity_verified")
+
+    monkeypatch.setattr(agent_ws, "evaluate_identity_gate", fake_identity_gate)
+
+    with client.websocket_connect("/ws/chat") as ws:
+        ws.send_text(
+            json.dumps(
+                {
+                    "type": "stt_result",
+                    "speaker_id": "speaker-contract-ws",
+                    "text": "오디스 나 새약 받아왔어",
+                }
+            )
+        )
+        reply = ws.receive_json()
+
+    assert reply["type"] == "ocr_request"
+    assert reply["action"] == "request_ocr"
+    assert reply["reason"] == "direct_ocr_capture_request"
+
+
 def test_agent_ws_queued_ocr_request_runs_after_identity_passes(monkeypatch, client: TestClient) -> None:
     from app.api.routes import agent_ws
 

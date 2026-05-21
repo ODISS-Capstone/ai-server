@@ -81,3 +81,70 @@ def test_reminder_pending_expiry_blocks_stale_confirmation(tmp_path):
     assert "시간이 지나" in expired
     assert "speaker-reminder" not in service._pending
     assert "speaker-reminder" not in service._active
+
+
+def test_reminder_understands_elderly_wake_me_language_and_restores(tmp_path):
+    memory = make_memory(tmp_path)
+    current = datetime(2026, 5, 18, 11, 55)
+
+    def now_provider():
+        return current
+
+    service = ReminderService(now_provider=now_provider, start_background_tasks=False)
+
+    setup = run(
+        service.handle_user_text(
+            memory_engine=memory,
+            speaker_id="speaker-reminder",
+            text="약 먹을 때 깨워줘",
+            user_profile={"name": "김영수"},
+            prescription_log="# 현재 복용 약 요약\n\n## 약품 목록\n- 혈압약\n",
+        )
+    )
+    assert "오전 8시" in setup
+    assert "오후 1시" in setup
+
+    confirm = run(
+        service.handle_user_text(
+            memory_engine=memory,
+            speaker_id="speaker-reminder",
+            text="점심은 12시로 해줘",
+            user_profile={"name": "김영수"},
+            prescription_log="# 현재 복용 약 요약\n\n## 약품 목록\n- 혈압약\n",
+        )
+    )
+    assert "점심 약 알림은 오후 12시" in confirm
+
+    restored_sent: list[dict] = []
+    restored = ReminderService(now_provider=now_provider, start_background_tasks=False)
+    restored.register_connection("speaker-reminder", lambda payload: restored_sent.append(payload))
+    run(restored.restore_for_speaker(memory, "speaker-reminder"))
+
+    current = datetime(2026, 5, 18, 12, 0)
+    dispatched = run(restored.dispatch_due_reminders())
+
+    assert dispatched
+    assert restored_sent[-1]["type"] == "reminder"
+    assert "김영수님" in restored_sent[-1]["text"]
+    assert "점심 혈압약" in restored_sent[-1]["text"]
+
+    saved = run(memory.store.read_user_file("speaker-reminder", "reminders.md"))
+    assert "2026-05-19T12:00:00" in saved
+
+
+def test_reminder_setup_uses_existing_prescription_context_for_vague_forgetful_request(tmp_path):
+    memory = make_memory(tmp_path)
+    service = ReminderService(start_background_tasks=False)
+
+    setup = run(
+        service.handle_user_text(
+            memory_engine=memory,
+            speaker_id="speaker-reminder",
+            text="까먹으니까 좀 알려줘",
+            user_profile={"name": "김영수"},
+            prescription_log="# 현재 복용 약 요약\n\n## 약품 목록\n- 혈압약\n",
+        )
+    )
+
+    assert "식후 복용 알림" in setup
+    assert "오전 8시" in setup

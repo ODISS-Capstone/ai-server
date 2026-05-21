@@ -2,12 +2,17 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 from types import SimpleNamespace
 
 import pytest
 
 from app.api.routes import agent_ws
+from app.database.md_store import MDStore
+from app.engines.memory import MemoryEngine
+from app.memory import StructuredMemoryService
 from app.services.identity_guard import IdentityGateResult
+from app.services.reminders import ReminderService
 
 
 class FakeWebSocket:
@@ -62,6 +67,20 @@ def setup_function() -> None:
     agent_ws._bootstrapped_speakers.clear()
     agent_ws._pending_ocr_by_speaker.clear()
     agent_ws._queued_ocr_request_by_speaker.clear()
+
+
+def make_real_memory(tmp_path) -> MemoryEngine:
+    memory = MemoryEngine()
+    memory.store = MDStore(str(tmp_path / "md_database"))
+    memory.structured_memory = StructuredMemoryService(base_path=str(tmp_path / "structured_memory"))
+    run(memory.initialize())
+    run(
+        memory.store.write_flash(
+            "prescription_log",
+            "# 현재 복용 약 요약\n\n## 약품 목록\n- 혈압약\n",
+        )
+    )
+    return memory
 
 
 def test_registered_wake_word_uses_profile_and_skips_orchestrator(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -153,6 +172,62 @@ def test_reminder_setup_sends_filler_before_reminder_response(monkeypatch: pytes
     assert "김영수님" in websocket.sent[-1]["response_text"]
 
 
+def test_agent_ws_reminder_setup_confirm_and_dispatch(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    current = datetime(2026, 5, 18, 11, 55)
+
+    def now_provider() -> datetime:
+        return current
+
+    fake_memory = make_real_memory(tmp_path)
+    websocket = FakeWebSocket()
+    reminder_service = ReminderService(now_provider=now_provider, start_background_tasks=False)
+
+    async def fake_identity_gate(**kwargs):
+        return IdentityGateResult(
+            allowed=True,
+            reason="identity_verified",
+            metadata={"profile": {"name": "김영수", "age": "72", "gender": "남성"}},
+        )
+
+    monkeypatch.setattr(agent_ws, "memory_engine", fake_memory)
+    monkeypatch.setattr(agent_ws, "reminder_service", reminder_service)
+    monkeypatch.setattr(agent_ws, "evaluate_identity_gate", fake_identity_gate)
+
+    run(
+        agent_ws._handle_stt(
+            websocket,
+            {
+                "type": "stt_result",
+                "speaker_id": "speaker-kim",
+                "text": "오디스, 약 먹을 때 깨워줘.",
+            },
+            set(),
+        )
+    )
+    run(
+        agent_ws._handle_stt(
+            websocket,
+            {
+                "type": "stt_result",
+                "speaker_id": "speaker-kim",
+                "text": "점심은 12시로 해줘.",
+            },
+            set(),
+        )
+    )
+
+    assert websocket.sent[-1]["type"] == "response"
+    assert websocket.sent[-1]["response_type"] == "reminder"
+    assert "점심 약 알림은 오후 12시" in websocket.sent[-1]["response_text"]
+
+    current = datetime(2026, 5, 18, 12, 0)
+    dispatched = run(reminder_service.dispatch_due_reminders())
+
+    assert dispatched
+    assert websocket.sent[-1]["type"] == "reminder"
+    assert "점심 혈압약" in websocket.sent[-1]["text"]
+
+
 def test_medication_reasoning_sends_filler_before_orchestrator(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_memory = FakeMemoryEngine()
     websocket = FakeWebSocket()
@@ -202,3 +277,50 @@ def test_medication_reasoning_sends_filler_before_orchestrator(monkeypatch: pyte
     assert websocket.sent[0]["requires_tts"] is True
     assert websocket.sent[-1]["type"] == "response"
     assert websocket.sent[-1]["response_type"] == "medical_response"
+
+
+def test_progress_fillers_continue_until_cancelled(monkeypatch: pytest.MonkeyPatch) -> None:
+    websocket = FakeWebSocket()
+    delays: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        delays.append(delay)
+        if len(delays) >= 6:
+            raise asyncio.CancelledError()
+
+    monkeypatch.setattr(agent_ws.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        run(
+            agent_ws._send_progress_fillers(
+                websocket,
+                "오디스, 혈압약 두 번 먹으면 더 빨리 좋아져?",
+                initial_sent=True,
+            )
+        )
+
+    assert delays == [2.5, 4.0, 5.0, 7.0, 7.0, 7.0]
+    assert len(websocket.sent) == 5
+    assert {payload["stage"] for payload in websocket.sent} == {"dur"}
+    assert all(payload["type"] == "filler" for payload in websocket.sent)
+    assert len({payload["text"] for payload in websocket.sent}) >= 3
+
+
+def test_ocr_progress_fillers_continue_until_cancelled(monkeypatch: pytest.MonkeyPatch) -> None:
+    websocket = FakeWebSocket()
+    delays: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        delays.append(delay)
+        if len(delays) >= 6:
+            raise asyncio.CancelledError()
+
+    monkeypatch.setattr(agent_ws.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        run(agent_ws._send_ocr_progress_fillers(websocket))
+
+    assert delays == [2.5, 4.0, 5.0, 7.0, 7.0, 7.0]
+    assert len(websocket.sent) == 5
+    assert {payload["stage"] for payload in websocket.sent} == {"ocr_processing"}
+    assert all(payload["type"] == "filler" for payload in websocket.sent)

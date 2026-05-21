@@ -371,6 +371,76 @@ def test_name_only_mismatch_starts_new_registration_without_loop(tmp_path):
     assert recall.reason == "identity_registered"
 
 
+def test_explicit_reregistration_request_prompts_for_new_identity(tmp_path, monkeypatch):
+    memory = make_memory(tmp_path)
+    run(
+        memory.save_identity_profile(
+            "reregister-user",
+            {"name": "홍길동", "gender": "남성", "age": "23"},
+            mark_verified=True,
+        )
+    )
+    calls = []
+
+    async def fake_judge_identity_conflict(**kwargs):
+        calls.append(kwargs)
+        return {"conflict": False, "source": "should_not_be_called"}
+
+    monkeypatch.setattr(identity_guard, "judge_identity_conflict", fake_judge_identity_conflict)
+
+    result = run(
+        identity_guard.evaluate_identity_gate(
+            memory_engine=memory,
+            text="아냐 새로 정보등록할게",
+            speaker_id="reregister-user",
+        )
+    )
+
+    state = run(memory.load_identity_state("reregister-user"))
+    assert result.allowed is False
+    assert result.reason == "identity_rejected_needs_registration"
+    assert "새로 등록할 이름, 나이, 성별" in result.response_text
+    assert state.get("pending_identity_action") == "registration"
+    assert calls == []
+
+    recall = run(
+        identity_guard.evaluate_identity_gate(
+            memory_engine=memory,
+            text="내 이름이 누군지 알아?",
+            speaker_id="reregister-user",
+        )
+    )
+
+    assert recall.allowed is False
+    assert recall.reason == "needs_registration"
+    assert "홍길동" not in recall.response_text
+
+
+def test_different_person_reregistration_request_does_not_return_blank(tmp_path):
+    memory = make_memory(tmp_path)
+    run(
+        memory.save_identity_profile(
+            "different-person-user",
+            {"name": "홍길동", "gender": "남성", "age": "23"},
+            mark_verified=True,
+        )
+    )
+
+    result = run(
+        identity_guard.evaluate_identity_gate(
+            memory_engine=memory,
+            text="사실은 다른사람인데 새로 등록 가능할까",
+            speaker_id="different-person-user",
+        )
+    )
+
+    state = run(memory.load_identity_state("different-person-user"))
+    assert result.allowed is False
+    assert result.response_text
+    assert result.reason == "identity_rejected_needs_registration"
+    assert state.get("pending_identity_action") == "registration"
+
+
 def test_profile_consistency_conflict_uses_llm_judge_not_keyword_heuristic(tmp_path, monkeypatch):
     memory = make_memory(tmp_path)
     run(
@@ -439,6 +509,98 @@ def test_stale_identity_pending_expires_instead_of_repeating_reverify(tmp_path):
     assert state.get("pending_identity_action") == ""
 
 
+def test_expired_reverification_accepts_affirmative_reply_instead_of_blank(tmp_path, monkeypatch):
+    memory = make_memory(tmp_path)
+    now = datetime(2026, 5, 18, 6, 20, 0)
+    run(
+        memory.save_identity_profile(
+            "expired-reverify-yes-user",
+            {"name": "김영수", "gender": "남성", "age": "72"},
+            mark_verified=True,
+            now=now - timedelta(minutes=20),
+        )
+    )
+    run(
+        memory.save_identity_profile(
+            "expired-reverify-yes-user",
+            {},
+            pending_identity_action="reverification",
+            mark_seen=False,
+            now=now - timedelta(minutes=6),
+        )
+    )
+    calls = []
+
+    async def fake_pending_identity_judge(**kwargs):
+        calls.append(kwargs)
+        raise AssertionError("expired affirmative should use identity fast path")
+
+    monkeypatch.setattr(identity_guard, "judge_pending_identity_reply_with_llm", fake_pending_identity_judge)
+
+    result = run(
+        identity_guard.evaluate_identity_gate(
+            memory_engine=memory,
+            text="어 맞아",
+            speaker_id="expired-reverify-yes-user",
+            now=now,
+        )
+    )
+
+    state = run(memory.load_identity_state("expired-reverify-yes-user"))
+    assert result.allowed is False
+    assert result.reason == "identity_reverified"
+    assert result.response_text
+    assert "김영수님으로 확인했습니다" in result.response_text
+    assert state.get("pending_identity_action") == ""
+    assert calls == []
+
+
+def test_orchestrator_expired_reverification_affirmative_returns_tts(tmp_path, monkeypatch):
+    memory = make_memory(tmp_path)
+    speaker_id = "expired-reverify-orchestrator-user"
+    now = datetime.now()
+    run(
+        memory.save_identity_profile(
+            speaker_id,
+            {"name": "김영수", "gender": "남성", "age": "72"},
+            mark_verified=True,
+            now=now - timedelta(minutes=20),
+        )
+    )
+    run(
+        memory.save_identity_profile(
+            speaker_id,
+            {},
+            pending_identity_action="reverification",
+            mark_seen=False,
+            now=now - timedelta(minutes=6),
+        )
+    )
+
+    async def fake_pending_identity_judge(**kwargs):
+        raise AssertionError("expired affirmative should not enter pending identity LLM")
+
+    monkeypatch.setattr(identity_guard, "judge_pending_identity_reply_with_llm", fake_pending_identity_judge)
+
+    orchestrator = make_orchestrator(memory)
+    result = run(
+        orchestrator.run_turn(
+            text="어 맞아",
+            speaker_id=speaker_id,
+            include_judge=False,
+            include_delivery_llm=False,
+            run_identity_gate=True,
+        )
+    )
+
+    assert result.identity_gate["reason"] == "identity_reverified"
+    assert result.conversation.response_type == "identity_check"
+    assert result.conversation.requires_tts is True
+    assert result.conversation.response_text
+    assert "김영수님으로 확인했습니다" in result.conversation.response_text
+    assert result.execution_results.get("suppressed") is not True
+
+
 def test_negative_reverification_starts_registration_instead_of_repeating_prompt(tmp_path, monkeypatch):
     memory = make_memory(tmp_path)
     run(
@@ -483,6 +645,76 @@ def test_negative_reverification_starts_registration_instead_of_repeating_prompt
     final_state = run(memory.load_identity_state("demo-kim"))
     assert final_state["profile"]["name"] == "김영수"
     assert final_state.get("pending_identity_action") == ""
+
+
+def test_reverification_accepts_spoken_affirmative_without_repeating_prompt(tmp_path, monkeypatch):
+    memory = make_memory(tmp_path)
+    run(
+        memory.save_identity_profile(
+            "reverify-yes-user",
+            {"name": "김영수", "gender": "남성", "age": "72"},
+            mark_verified=True,
+        )
+    )
+    run(memory.mark_identity_pending("reverify-yes-user", "reverification"))
+    calls = []
+
+    async def fake_pending_identity_judge(**kwargs):
+        calls.append(kwargs)
+        raise AssertionError("spoken affirmative should use identity fast path")
+
+    monkeypatch.setattr(identity_guard, "judge_pending_identity_reply_with_llm", fake_pending_identity_judge)
+
+    result = run(
+        identity_guard.evaluate_identity_gate(
+            memory_engine=memory,
+            text="어 맞아",
+            speaker_id="reverify-yes-user",
+        )
+    )
+
+    state = run(memory.load_identity_state("reverify-yes-user"))
+    assert result.allowed is False
+    assert result.reason == "identity_reverified"
+    assert "김영수님으로 확인했습니다" in result.response_text
+    assert "본인이 맞으신가요" not in result.response_text
+    assert state.get("pending_identity_action") == ""
+    assert calls == []
+
+
+def test_reverification_accepts_self_name_confirmation_without_repeating_prompt(tmp_path, monkeypatch):
+    memory = make_memory(tmp_path)
+    run(
+        memory.save_identity_profile(
+            "reverify-name-user",
+            {"name": "김영수", "gender": "남성", "age": "72"},
+            mark_verified=True,
+        )
+    )
+    run(memory.mark_identity_pending("reverify-name-user", "reverification"))
+    calls = []
+
+    async def fake_pending_identity_judge(**kwargs):
+        calls.append(kwargs)
+        raise AssertionError("matching self-name should use identity fast path")
+
+    monkeypatch.setattr(identity_guard, "judge_pending_identity_reply_with_llm", fake_pending_identity_judge)
+
+    result = run(
+        identity_guard.evaluate_identity_gate(
+            memory_engine=memory,
+            text="내가 김영수야",
+            speaker_id="reverify-name-user",
+        )
+    )
+
+    state = run(memory.load_identity_state("reverify-name-user"))
+    assert result.allowed is False
+    assert result.reason == "identity_reverified"
+    assert "김영수님으로 확인했습니다" in result.response_text
+    assert "본인이 맞으신가요" not in result.response_text
+    assert state.get("pending_identity_action") == ""
+    assert calls == []
 
 
 def test_reverification_noise_is_ignored_without_repeating_prompt(tmp_path, monkeypatch):
@@ -775,6 +1007,71 @@ def test_reasoning_routes_demo_ocr_capture_request():
     assert [task.type for task in register_decision.tasks] == ["request_ocr"]
 
 
+def test_ocr_capture_request_uses_pre_capture_language(tmp_path):
+    memory = make_memory(tmp_path)
+    run(
+        memory.save_identity_profile(
+            "ocr-capture-user",
+            {"name": "김영수", "gender": "남성", "age": "72"},
+            mark_verified=True,
+        )
+    )
+    orchestrator = make_orchestrator(memory)
+
+    result = run(
+        orchestrator.run_turn(
+            text="나 약받아왔는데 사진 찍고싶거든 준비좀 해줄 수 있어?",
+            speaker_id="ocr-capture-user",
+            include_judge=False,
+            include_delivery_llm=False,
+            run_identity_gate=True,
+        )
+    )
+
+    assert result.decision.mode == ReasoningMode.TOOL_FIRST
+    assert [task.type for task in result.decision.tasks] == ["request_ocr"]
+    assert result.execution_results["task_results"]["ocr_requested"] is True
+    assert "촬영" in result.filler_text or "카메라" in result.filler_text
+    assert "읽혔" not in result.filler_text
+    assert "인식" not in result.filler_text
+    assert "카메라 앞으로" in result.conversation.response_text
+    assert "5, 4, 3, 2, 1" in result.conversation.response_text
+    assert "약물 식별을 위해" not in result.conversation.response_text
+
+
+def test_new_medication_received_routes_to_ocr_capture(tmp_path):
+    memory = make_memory(tmp_path)
+    run(
+        memory.save_identity_profile(
+            "new-medication-capture-user",
+            {"name": "김영수", "gender": "남성", "age": "72"},
+            mark_verified=True,
+        )
+    )
+    orchestrator = make_orchestrator(memory)
+
+    result = run(
+        orchestrator.run_turn(
+            text="오디스 나 새약 받아왔어",
+            speaker_id="new-medication-capture-user",
+            include_judge=False,
+            include_delivery_llm=False,
+            run_identity_gate=True,
+        )
+    )
+
+    assert result.decision.mode == ReasoningMode.TOOL_FIRST
+    assert result.decision.rationale == "ocr_capture_requested"
+    assert [task.type for task in result.decision.tasks] == ["request_ocr"]
+    assert result.execution_results["task_results"]["ocr_requested"] is True
+    assert "촬영" in result.filler_text or "카메라" in result.filler_text or "약봉투" in result.filler_text
+    assert "읽혔" not in result.filler_text
+    assert "인식" not in result.filler_text
+    assert "카메라 앞으로" in result.conversation.response_text
+    assert "5, 4, 3, 2, 1" in result.conversation.response_text
+    assert "확인된 정보가 제한적" not in result.conversation.response_text
+
+
 def test_meal_medication_guidance_uses_llm_route_without_ocr(tmp_path, monkeypatch):
     memory = make_memory(tmp_path)
     speaker_id = "meal-route-user"
@@ -889,6 +1186,91 @@ def test_after_meal_question_with_wake_word_uses_stored_medication_first(tmp_pat
     assert "사용자님" not in answer
     assert "구체적인 정보" not in answer
     assert "아직 기록" not in answer
+
+
+def test_short_meal_completion_guides_stored_after_meal_medication(tmp_path, monkeypatch):
+    memory = make_memory(tmp_path)
+    speaker_id = "short-meal-user"
+    run(
+        memory.save_identity_profile(
+            speaker_id,
+            {"name": "김영수", "gender": "남성", "age": "72"},
+            mark_verified=True,
+        )
+    )
+    run(
+        memory.store.write_flash(
+            "prescription_log",
+            "# 현재 복용 약 요약\n\n## 약품 목록\n- 혈압약\n",
+        )
+    )
+
+    async def fake_classify_route(**kwargs):
+        return {"usable": False, "source": "test_no_local_route"}
+
+    monkeypatch.setattr(
+        "app.services.engine_orchestrator.classify_reasoning_route_with_llm",
+        fake_classify_route,
+    )
+
+    orchestrator = make_orchestrator(memory)
+    result = run(
+        orchestrator.run_turn(
+            text="나 밥먹었어",
+            speaker_id=speaker_id,
+            include_judge=False,
+            include_delivery_llm=False,
+            run_identity_gate=True,
+        )
+    )
+
+    assert result.decision.mode == ReasoningMode.MEMORY_ONLY
+    assert result.decision.rationale == "stored_medication_meal_guidance"
+    assert result.decision.tasks == []
+    assert not result.tool_trace
+    assert "방금 드셨다는" not in result.filler_text
+    assert "복용 기록" not in result.filler_text
+    assert "혈압약" in result.conversation.response_text
+    assert "식후" in result.conversation.response_text
+    assert "확인된 정보가 제한적" not in result.conversation.response_text
+
+
+def test_short_meal_completion_without_medication_context_asks_for_package(tmp_path, monkeypatch):
+    memory = make_memory(tmp_path)
+    speaker_id = "short-meal-no-med-user"
+    run(
+        memory.save_identity_profile(
+            speaker_id,
+            {"name": "김영수", "gender": "남성", "age": "72"},
+            mark_verified=True,
+        )
+    )
+
+    async def fake_classify_route(**kwargs):
+        return {"usable": False, "source": "test_no_local_route"}
+
+    monkeypatch.setattr(
+        "app.services.engine_orchestrator.classify_reasoning_route_with_llm",
+        fake_classify_route,
+    )
+
+    orchestrator = make_orchestrator(memory)
+    result = run(
+        orchestrator.run_turn(
+            text="점심 먹었어",
+            speaker_id=speaker_id,
+            include_judge=False,
+            include_delivery_llm=False,
+            run_identity_gate=True,
+        )
+    )
+
+    assert result.decision.mode == ReasoningMode.MEMORY_ONLY
+    assert result.decision.rationale == "meal_guidance_missing_medication_context"
+    assert result.decision.tasks == []
+    assert "약봉투" in result.conversation.response_text
+    assert "처방전" in result.conversation.response_text
+    assert "확인된 정보가 제한적" not in result.conversation.response_text
 
 
 def test_medication_record_challenge_confirms_existing_record(tmp_path, monkeypatch):
@@ -1505,6 +1887,36 @@ def test_schedule_and_dur_answers_do_not_inject_demo_medications(tmp_path):
         assert demo_term not in combined
 
 
+def test_generic_blood_pressure_medication_overview_does_not_call_dur(tmp_path):
+    memory = make_memory(tmp_path)
+    run(
+        memory.save_identity_profile(
+            "bp-overview-user",
+            {"name": "김철수", "gender": "남성", "age": "55"},
+            mark_verified=True,
+        )
+    )
+    orchestrator = make_orchestrator(memory)
+
+    result = run(
+        orchestrator.run_turn(
+            text="내가 혈압약 먹고 있는데 혈압약에 어떤거들이 있는지 확인해줄 수 있어?",
+            speaker_id="bp-overview-user",
+            include_judge=False,
+            include_delivery_llm=False,
+            run_identity_gate=True,
+        )
+    )
+
+    assert result.decision.mode == ReasoningMode.MEMORY_ONLY
+    assert result.decision.rationale == "generic_blood_pressure_medication_overview"
+    assert not result.tool_trace
+    assert "ACE" in result.conversation.response_text
+    assert "ARB" in result.conversation.response_text
+    assert "약봉투" in result.conversation.response_text
+    assert "확인된 정보가 제한적" not in result.conversation.response_text
+
+
 def test_common_medication_mistakes_use_deterministic_safety_responses(tmp_path):
     memory = make_memory(tmp_path)
     orchestrator = make_orchestrator(memory)
@@ -1545,6 +1957,11 @@ def test_common_medication_mistakes_use_deterministic_safety_responses(tmp_path)
             "아스피린 먹고 숨이 차고 얼굴이 부었어.",
             ReasoningMode.FRONTIER_FIRST,
             ["119", "응급실"],
+        ),
+        (
+            "혹시 내가 머리가 아파서그런데 타이레놀 4개를 한번에 먹어도 문제가 없을까",
+            ReasoningMode.MEMORY_ONLY,
+            ["타이레놀", "간 손상", "의사나 약사"],
         ),
     ]
 
