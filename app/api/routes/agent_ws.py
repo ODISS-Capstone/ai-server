@@ -25,7 +25,7 @@ from app.engines.llm_judge import LLMJudgeEngine
 from app.services.engine_orchestrator import EngineOrchestrator
 from app.services.identity_guard import evaluate_identity_gate
 from app.services.llm import extract_ocr_medication_candidates_with_llm, refine_ocr_medication_candidates_with_context
-from app.services.medication_extraction import is_wake_word_only
+from app.services.medication_extraction import is_ocr_capture_request_text, is_wake_word_only
 from app.services.reminders import ReminderService
 from app.tools import llm_search
 
@@ -408,9 +408,11 @@ def _should_send_immediate_filler(text: str) -> bool:
 def _processing_stage_for_text(text: str) -> str:
     lowered = (text or "").lower()
     compact = re.sub(r"\s+", "", lowered)
+    if is_ocr_capture_request_text(text):
+        return "ocr"
     if any(token in lowered for token in ("사진", "ocr", "약봉투", "처방전", "촬영", "찍")):
         return "ocr"
-    if any(token in lowered for token in ("알림", "예약", "시간 바꿔", "시간 변경")) or (
+    if any(token in lowered for token in ("알림", "알람", "예약", "깨워", "챙겨", "시간 바꿔", "시간 변경")) or (
         any(meal in lowered for meal in ("아침", "점심", "저녁"))
         and re.search(r"\d{1,2}\s*시", lowered)
     ):
@@ -444,11 +446,16 @@ async def _send_progress_fillers(
         fillers = MEDICATION_PROGRESS_FILLERS
     else:
         fillers = GENERAL_PROGRESS_FILLERS
-    delays = (2.5, 6.0, 9.5) if initial_sent else (0.4, 3.5, 7.0)
+    warmup_delays = (2.5, 4.0, 5.0) if initial_sent else (0.4, 3.6, 5.0)
+    repeat_delay = 7.0
+    index = 0
     try:
-        for delay, filler in zip(delays, fillers):
+        while True:
+            delay = warmup_delays[index] if index < len(warmup_delays) else repeat_delay
+            filler = fillers[index % len(fillers)]
             await asyncio.sleep(delay)
             await _send_runtime_filler(websocket, filler, stage=stage)
+            index += 1
     except WebSocketDisconnect:
         raise
 
@@ -465,8 +472,13 @@ async def _send_ocr_processing_filler(websocket: WebSocket) -> None:
 
 
 async def _send_ocr_progress_fillers(websocket: WebSocket) -> None:
+    warmup_delays = (2.5, 4.0, 5.0)
+    repeat_delay = 7.0
+    index = 0
     try:
-        for delay, filler in zip((2.5, 6.0, 10.0), OCR_PROGRESS_FILLERS):
+        while True:
+            delay = warmup_delays[index] if index < len(warmup_delays) else repeat_delay
+            filler = OCR_PROGRESS_FILLERS[index % len(OCR_PROGRESS_FILLERS)]
             await asyncio.sleep(delay)
             await websocket.send_json(
                 {
@@ -476,6 +488,7 @@ async def _send_ocr_progress_fillers(websocket: WebSocket) -> None:
                     "stage": "ocr_processing",
                 }
             )
+            index += 1
     except WebSocketDisconnect:
         raise
 
@@ -554,14 +567,7 @@ def _has_actionable_signal(text: str) -> bool:
 
 
 def _is_direct_ocr_capture_request(text: str) -> bool:
-    lowered = (text or "").lower()
-    return (
-        any(token in lowered for token in ("처방전", "약봉투", "약 사진", "약사진", "ocr"))
-        and any(token in lowered for token in ("찍", "촬영", "켜", "등록", "저장", "보여", "읽"))
-    ) or (
-        "카메라" in lowered
-        and any(token in lowered for token in ("켜", "찍", "촬영"))
-    )
+    return is_ocr_capture_request_text(text)
 
 
 def _redact_ocr_context(text: str) -> str:

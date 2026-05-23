@@ -160,7 +160,7 @@ class ReminderService:
                 user_profile=user_profile,
             )
 
-        if self.is_setup_request(stripped):
+        if self.is_setup_request(stripped, prescription_log=prescription_log):
             return self.start_setup(
                 speaker_id=speaker_id,
                 user_profile=user_profile,
@@ -337,8 +337,42 @@ class ReminderService:
         )
 
     @staticmethod
-    def is_setup_request(text: str) -> bool:
+    def is_setup_request(text: str, *, prescription_log: str = "") -> bool:
         lowered = text.lower()
+        compact = re.sub(r"[\s.?!,，。~]+", "", lowered)
+        medication_context = any(token in lowered for token in ("약", "복용", "식후", "밥")) or bool(
+            prescription_log.strip()
+        )
+        reminder_signal = any(
+            token in lowered
+            for token in (
+                "알림",
+                "알람",
+                "예약",
+                "깨워",
+                "챙겨",
+                "까먹",
+                "잊어",
+                "잊어버",
+            )
+        ) or any(token in compact for token in ("시간되면", "때되면", "먹을때", "먹을시간"))
+        setup_signal = any(
+            token in lowered
+            for token in (
+                "추가",
+                "설정",
+                "맞춰",
+                "해줘",
+                "해 줘",
+                "해야",
+                "알려",
+                "말해",
+                "깨워",
+                "챙겨",
+            )
+        )
+        if medication_context and reminder_signal and setup_signal:
+            return True
         return (
             "알림" in lowered
             and any(token in lowered for token in ("약", "복용", "식후", "밥"))
@@ -348,6 +382,31 @@ class ReminderService:
     @staticmethod
     def is_taken_confirmation(text: str) -> bool:
         stripped = text.strip().lower()
+        if any(
+            token in stripped
+            for token in (
+                "?",
+                "먹어도",
+                "괜찮",
+                "되나",
+                "돼",
+                "문제",
+                "위험",
+                "못 먹",
+                "깜빡",
+                "헷갈",
+                "기억",
+                "어떡",
+                "어쩌",
+                "숨",
+                "어지",
+                "아파",
+                "두 번",
+                "한 번 더",
+                "한번 더",
+            )
+        ):
+            return False
         normalized = ReminderService._normalize_short_reply(stripped)
         if normalized in {"먹었어", "먹었어요", "먹었습니다", "복용했어", "복용했어요"}:
             return True
@@ -366,6 +425,21 @@ class ReminderService:
     @staticmethod
     def is_taken_recall(text: str) -> bool:
         lowered = text.lower()
+        if any(
+            token in lowered
+            for token in (
+                "한 번 더",
+                "한번 더",
+                "먹을까",
+                "먹어도",
+                "괜찮",
+                "되나",
+                "돼",
+                "문제",
+                "위험",
+            )
+        ):
+            return False
         return any(token in lowered for token in ("약 먹었나", "복용했나", "먹었는지", "먹었나?", "아까 약", "아까 먹"))
 
     @staticmethod

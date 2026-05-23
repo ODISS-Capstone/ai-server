@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 
 
 @dataclass(frozen=True)
@@ -24,7 +25,25 @@ EMERGENCY_SYMPTOMS = (
     "쓰러",
     "경련",
     "가슴 통증",
+    "가슴이 답답",
+    "가슴 답답",
+    "가슴이 꽉",
+    "가슴이 조",
+    "가슴 조",
+    "가슴이 눌",
+    "가슴 눌",
+    "가슴 압박",
+    "가슴이 무겁",
+    "가슴 무겁",
+    "가슴이 뻐근",
+    "가슴 뻐근",
+    "명치가 답답",
+    "명치 답답",
     "흉통",
+    "식은땀",
+    "왼팔",
+    "턱이 아",
+    "턱 통증",
     "얼굴이 붓",
     "얼굴 붓",
     "혀가 붓",
@@ -41,12 +60,61 @@ MEDICATION_SIGNALS = (
     "정",
     "캡슐",
     "시럽",
+    "알약",
     "혈압약",
     "당뇨약",
     "인슐린",
     "와파린",
     "아스피린",
+    "타이레놀",
+    "아세트아미노펜",
+    "진통제",
+    "해열제",
+    "감기약",
+    "수면제",
+    "항생제",
 )
+
+ACETAMINOPHEN_SIGNALS = (
+    "타이레놀",
+    "아세트아미노펜",
+    "acetaminophen",
+    "tylenol",
+)
+
+EXCESS_DOSE_TOKENS = (
+    "두 번",
+    "2번",
+    "한 번 더",
+    "한번 더",
+    "또 먹",
+    "많이 먹",
+    "과다",
+    "초과",
+    "정해진 양보다",
+    "두 알",
+    "2알",
+    "한 번에",
+    "한번에",
+)
+
+INGESTION_TOKENS = (
+    "먹었",
+    "먹어도",
+    "먹을까",
+    "먹으면",
+    "먹으려",
+    "먹은",
+    "먹어버",
+    "복용",
+    "삼켜",
+    "드셔도",
+    "드실까",
+    "드시려",
+    "드시면",
+)
+
+MULTI_UNIT_DOSE_RE = re.compile(r"(?:[2-9]|[1-9]\d+)\s*(?:개|알|정|캡슐)")
 
 
 def classify_patient_safety_situation(text: str) -> PatientSafetySituation | None:
@@ -61,8 +129,8 @@ def classify_patient_safety_situation(text: str) -> PatientSafetySituation | Non
             key="emergency_symptom_after_medication",
             severity="emergency",
             response_text=(
-                "응급 상황일 수 있습니다. 지금은 약 설명을 기다리지 말고 즉시 119에 연락하거나 가까운 응급실로 이동하세요. "
-                "가능하면 드신 약봉투나 약통을 함께 가져가세요."
+                "가슴 답답함은 응급 신호일 수 있습니다. 어떤 약을 드실지 고르기보다 지금 즉시 119에 연락하거나 가까운 응급실로 이동하세요. "
+                "혼자 이동하지 말고, 가능하면 보호자에게 알리고 드신 약봉투나 약통을 함께 가져가세요."
             ),
         )
 
@@ -91,7 +159,23 @@ def classify_patient_safety_situation(text: str) -> PatientSafetySituation | Non
             ),
         )
 
-    if _has_any(lowered, ("먹었는지 기억", "먹었는지 모르", "먹었나 모르", "복용했는지 모르", "헷갈", "기억 안 나")):
+    if _has_any(
+        lowered,
+        (
+            "먹었는지 기억",
+            "먹었는지 모르",
+            "먹었나 모르",
+            "먹은 것 같",
+            "먹은거 같",
+            "먹은 것같",
+            "먹은거같",
+            "먹은 듯",
+            "먹은듯",
+            "복용했는지 모르",
+            "헷갈",
+            "기억 안 나",
+        ),
+    ):
         return PatientSafetySituation(
             key="uncertain_taken",
             severity="caution",
@@ -102,10 +186,21 @@ def classify_patient_safety_situation(text: str) -> PatientSafetySituation | Non
             ),
         )
 
-    if _has_any(lowered, ("두 번", "2번", "한 번 더", "또 먹", "많이 먹", "과다", "초과", "정해진 양보다", "두 알", "2알")) and _has_any(
+    if (_has_any(lowered, EXCESS_DOSE_TOKENS) or _has_multi_unit_dose(normalized)) and _has_any(
         lowered,
-        ("먹었", "복용", "먹은", "먹어버"),
+        INGESTION_TOKENS,
     ):
+        if _has_any(lowered, ACETAMINOPHEN_SIGNALS):
+            return PatientSafetySituation(
+                key="acetaminophen_excess_dose",
+                severity="urgent",
+                response_text=(
+                    "타이레놀이나 아세트아미노펜 성분 약을 한 번에 여러 알 드시는 것은 위험할 수 있습니다. "
+                    "간 손상 위험이 있으니 정해진 용법보다 한 번에 많이 드시지 마세요. "
+                    "이미 많이 드셨거나 몇 알까지 가능한지 확실하지 않다면 약봉투나 제품 포장을 들고 의사나 약사에게 바로 확인하세요. "
+                    "심한 메스꺼움, 구토, 복통, 의식 저하가 있거나 이미 많이 복용했다면 즉시 119나 응급실에 연락하세요."
+                ),
+            )
         return PatientSafetySituation(
             key="extra_or_double_dose",
             severity="urgent",
@@ -159,3 +254,7 @@ def _has_medication_signal(text: str) -> bool:
 
 def _has_any(text: str, tokens: tuple[str, ...]) -> bool:
     return any(token in text for token in tokens)
+
+
+def _has_multi_unit_dose(text: str) -> bool:
+    return bool(MULTI_UNIT_DOSE_RE.search(text or ""))

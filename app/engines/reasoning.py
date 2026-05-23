@@ -21,6 +21,7 @@ from app.schemas.engine_contracts import (
 from app.services.medication_extraction import (
     extract_medication_suffix_tokens,
     filter_drug_name_candidates,
+    is_ocr_capture_request_text,
     is_wake_word_only,
     strip_wake_words,
 )
@@ -64,6 +65,11 @@ EMERGENCY_KEYWORDS = [
     "응급",
     "119",
     "가슴 통증",
+    "가슴이 답답",
+    "가슴 답답",
+    "가슴 압박",
+    "가슴이 조",
+    "가슴이 눌",
     "흉통",
     "뇌졸중",
     "마비",
@@ -276,6 +282,7 @@ class ReasoningEngine:
         if (
             intent in {IntentType.MEDICATION_QUERY, IntentType.DRUG_IDENTIFICATION}
             and self._is_memory_recall_query(text.lower())
+            and not self._is_meal_medication_guidance_request(text)
             and not any(kw in text.lower() for kw in DIRECT_MEDICAL_QUERY_KEYWORDS)
             and (
                 str(context.get("prescription_log", "")).strip()
@@ -335,6 +342,18 @@ class ReasoningEngine:
                 ],
             )
 
+        if intent in {IntentType.MEDICATION_QUERY, IntentType.DRUG_IDENTIFICATION} and self._is_meal_medication_guidance_request(text):
+            return ReasoningRouteDecision(
+                mode=ReasoningMode.MEMORY_ONLY,
+                intent=IntentType.MEDICATION_QUERY,
+                rationale=(
+                    "stored_medication_meal_guidance"
+                    if self._context_has_medication(context)
+                    else "meal_guidance_missing_medication_context"
+                ),
+                tasks=[],
+            )
+
         if self._is_medication_record_request(lowered):
             return ReasoningRouteDecision(
                 mode=ReasoningMode.MEMORY_ONLY,
@@ -343,15 +362,11 @@ class ReasoningEngine:
                 tasks=[],
             )
 
-        if (
-            intent in {IntentType.MEDICATION_QUERY, IntentType.DRUG_IDENTIFICATION}
-            and self._is_meal_medication_guidance_request(text)
-            and self._context_has_medication(context)
-        ):
+        if self._is_generic_blood_pressure_medication_overview_request(text):
             return ReasoningRouteDecision(
                 mode=ReasoningMode.MEMORY_ONLY,
                 intent=IntentType.MEDICATION_QUERY,
-                rationale="stored_medication_meal_guidance",
+                rationale="generic_blood_pressure_medication_overview",
                 tasks=[],
             )
 
@@ -524,7 +539,7 @@ class ReasoningEngine:
 
         if task_results.get("ocr_requested"):
             parts.append(
-                "약물 식별을 위해 처방전 또는 약 사진이 필요합니다."
+                self.request_ocr()["message"]
             )
 
         dur_data = task_results.get("dur", {})
@@ -728,6 +743,8 @@ class ReasoningEngine:
     @staticmethod
     def _is_meal_medication_guidance_request(text: str) -> bool:
         compact = re.sub(r"\s+", "", text or "")
+        if ReasoningEngine._is_after_meal_completion_signal(text):
+            return True
         return (
             any(token in text for token in ("밥", "식후", "식사"))
             and "약" in text
@@ -738,6 +755,62 @@ class ReasoningEngine:
     def _is_current_medication_record_recall(text: str) -> bool:
         compact = re.sub(r"\s+", "", text or "")
         return "기록" in text and any(token in compact for token in ("남아있", "있지않", "먹고있", "복용중"))
+
+    @staticmethod
+    def _is_after_meal_completion_signal(text: str) -> bool:
+        compact = re.sub(r"\s+", "", text or "").lower()
+        if not compact:
+            return False
+        if any(token in compact for token in ("약먹", "약복용", "복용했")):
+            return False
+        meal_signal = any(
+            token in compact
+            for token in (
+                "밥",
+                "식사",
+                "아침",
+                "점심",
+                "저녁",
+                "식후",
+            )
+        )
+        done_signal = any(
+            token in compact
+            for token in (
+                "먹었",
+                "먹고왔",
+                "먹고옴",
+                "다먹",
+                "먹음",
+                "식사했",
+                "식사끝",
+                "식사마쳤",
+                "먹고나",
+            )
+        )
+        return meal_signal and done_signal
+
+    @staticmethod
+    def _is_generic_blood_pressure_medication_overview_request(text: str) -> bool:
+        compact = re.sub(r"\s+", "", text or "").lower()
+        if not any(token in text for token in ("혈압약", "고혈압약")):
+            return False
+        if any(token in compact for token in ("dur기준", "같이먹", "함께먹", "두번", "2번", "더빨리", "부작용", "위험", "먹어도")):
+            return False
+        return any(
+            token in compact
+            for token in (
+                "어떤거",
+                "어떤것",
+                "무엇",
+                "뭐가",
+                "뭐있",
+                "종류",
+                "목록",
+                "확인해",
+                "알려줘",
+            )
+        )
 
     @staticmethod
     def _context_has_medication(context: dict[str, Any]) -> bool:
@@ -763,6 +836,8 @@ class ReasoningEngine:
         )
 
     def _is_medication_record_request(self, text_lower: str) -> bool:
+        if self._is_after_meal_completion_signal(text_lower):
+            return False
         if any(token in text_lower for token in ("먹었어", "먹었어요", "먹었습니다", "복용했어", "복용했어요")):
             return "약" in text_lower or len(text_lower.strip()) <= 8
         return (
@@ -772,9 +847,5 @@ class ReasoningEngine:
         )
 
     def _is_missing_ocr_image_request(self, text_lower: str) -> bool:
-        return (
-            any(token in text_lower for token in ("처방전", "약봉투", "약 사진", "약사진", "사진", "ocr"))
-            and any(token in text_lower for token in ("읽어서", "읽어", "ocr", "찍", "촬영", "보여", "등록", "저장"))
-            and not any(token in text_lower for token in ("결과", "나왔", "인식"))
-        )
+        return is_ocr_capture_request_text(text_lower)
 
