@@ -64,6 +64,8 @@ class Settings(BaseSettings):
     llm_engine_max_concurrency_external: int = 1
     llm_engine_max_concurrency_judge: int = 1
     llm_engine_max_concurrency_search: int = 1
+    llm_engine_max_concurrency_tool: int = 4
+    llm_engine_max_concurrency_dur: int = 4
 
     # External LLM (OpenAI — LLM as a Judge + LLM Search)
     openai_api_key: Optional[str] = None
@@ -73,6 +75,19 @@ class Settings(BaseSettings):
     openai_search_timeout_seconds: float = 6.0
     anthropic_api_key: Optional[str] = None
     google_ai_api_key: Optional[str] = None
+
+    # Together AI (OpenAI-compatible frontier provider)
+    together_api_key: Optional[str] = None
+    together_base_url: str = "https://api.together.ai/v1/chat/completions"
+    together_model: str = "Qwen/Qwen3.5-9B"
+    together_judge_model: Optional[str] = None
+    together_search_model: Optional[str] = None
+    together_timeout_seconds: float = 6.0
+
+    # Frontier provider routing (OpenAI / Together)
+    frontier_llm_enabled_providers: str = "openai,together"
+    frontier_llm_primary_provider: str = "openai"
+    frontier_llm_fallback_enabled: bool = True
 
     # OCR
     ocr_api_timeout_seconds: float = 8.0

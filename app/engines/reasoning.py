@@ -26,6 +26,7 @@ from app.services.medication_extraction import (
     strip_wake_words,
 )
 from app.services.patient_safety import classify_patient_safety_situation
+from app.services.llm_queue import run_with_engine_queue
 from app.tools import dur_api, hira_api, health_supplement, llm_search
 
 logger = logging.getLogger(__name__)
@@ -460,10 +461,14 @@ class ReasoningEngine:
                         context=context,
                         medication_count=len(drug_names),
                     )
-                    rows = await dur_api.check_dur_for_prescription(
-                        [{"name": name} for name in drug_names],
-                        endpoint_keys=endpoint_keys,
-                    )
+
+                    async def _run_dur_check() -> list[dict[str, Any]]:
+                        return await dur_api.check_dur_for_prescription(
+                            [{"name": name} for name in drug_names],
+                            endpoint_keys=endpoint_keys,
+                        )
+
+                    rows = await run_with_engine_queue("dur", _run_dur_check)
                     dur_results = {
                         row["medication"]: row.get("dur", {})
                         for row in rows
@@ -473,10 +478,14 @@ class ReasoningEngine:
 
                 elif task_type == "dur_product_info":
                     drug_names = self._extract_drug_names(text, context)
-                    rows = await dur_api.check_dur_for_prescription(
-                        [{"name": name} for name in drug_names],
-                        endpoint_keys=("dur_product_info",),
-                    )
+
+                    async def _run_dur_product_info() -> list[dict[str, Any]]:
+                        return await dur_api.check_dur_for_prescription(
+                            [{"name": name} for name in drug_names],
+                            endpoint_keys=("dur_product_info",),
+                        )
+
+                    rows = await run_with_engine_queue("dur", _run_dur_product_info)
                     dur_results = {
                         row["medication"]: row.get("dur", {})
                         for row in rows
@@ -486,20 +495,28 @@ class ReasoningEngine:
 
                 elif task_type == "hira_lookup":
                     drug_names = self._extract_drug_names(text, context)
-                    hira_rows = await asyncio.gather(
-                        *(hira_api.identify_medicine(item_name=name) for name in drug_names)
-                    )
+
+                    async def _run_hira_lookup() -> list[dict[str, Any]]:
+                        return await asyncio.gather(
+                            *(hira_api.identify_medicine(item_name=name) for name in drug_names)
+                        )
+
+                    hira_rows = await run_with_engine_queue("tool", _run_hira_lookup)
                     hira_results = dict(zip(drug_names, hira_rows))
                     results["task_results"]["hira"] = hira_results
 
                 elif task_type == "supplement_lookup":
                     supplement_names = self._extract_supplement_names(text)
-                    supplement_rows = await asyncio.gather(
-                        *(
-                            health_supplement.get_supplement_detail(product_name=name)
-                            for name in supplement_names
+
+                    async def _run_supplement_lookup() -> list[dict[str, Any]]:
+                        return await asyncio.gather(
+                            *(
+                                health_supplement.get_supplement_detail(product_name=name)
+                                for name in supplement_names
+                            )
                         )
-                    )
+
+                    supplement_rows = await run_with_engine_queue("tool", _run_supplement_lookup)
                     supp_results = dict(zip(supplement_names, supplement_rows))
                     results["task_results"]["supplements"] = supp_results
 

@@ -245,7 +245,9 @@ def test_judge_llm_does_not_force_no_think(monkeypatch):
     monkeypatch.setattr(settings, "openai_api_key", "test-key")
     monkeypatch.setattr(settings, "openai_model", "gpt-5.5")
     monkeypatch.setattr(settings, "openai_judge_model", "gpt-5.5")
-    monkeypatch.setattr("app.engines.llm_judge.httpx.AsyncClient", fake_client)
+    monkeypatch.setattr(settings, "frontier_llm_enabled_providers", "openai")
+    monkeypatch.setattr(settings, "frontier_llm_primary_provider", "openai")
+    monkeypatch.setattr("app.services.frontier_llm.httpx.AsyncClient", fake_client)
 
     result = asyncio.run(
         LLMJudgeEngine().verify_fact(
@@ -286,7 +288,9 @@ def test_llm_search_strips_reasoning_tags_from_answer(monkeypatch):
         )
 
     monkeypatch.setattr(settings, "openai_api_key", "test-key")
-    monkeypatch.setattr("app.tools.llm_search.httpx.AsyncClient", fake_client)
+    monkeypatch.setattr(settings, "frontier_llm_enabled_providers", "openai")
+    monkeypatch.setattr(settings, "frontier_llm_primary_provider", "openai")
+    monkeypatch.setattr("app.services.frontier_llm.httpx.AsyncClient", fake_client)
 
     result = asyncio.run(llm_search.llm_search("search query"))
 

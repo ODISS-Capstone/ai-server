@@ -19,6 +19,8 @@ _ENGINE_LIMIT_FIELDS = {
     "external": "llm_engine_max_concurrency_external",
     "judge": "llm_engine_max_concurrency_judge",
     "search": "llm_engine_max_concurrency_search",
+    "tool": "llm_engine_max_concurrency_tool",
+    "dur": "llm_engine_max_concurrency_dur",
 }
 _SEMAPHORES_BY_LOOP: WeakKeyDictionary[
     asyncio.AbstractEventLoop, dict[str, asyncio.Semaphore]

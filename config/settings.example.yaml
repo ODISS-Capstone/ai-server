@@ -1,0 +1,112 @@
+# ODISS ai-server 설정 예시 (YAML)
+# 실제 런타임은 .env 기반입니다. 이 파일은 배포/운영 참고용 템플릿입니다.
+# API 키·비밀값은 ${ENV_VAR} 형태로 두고 실제 값은 .env 또는 시크릿 매니저에 넣으세요.
+
+app:
+  env: development          # development | staging | production
+  debug: true
+  log_level: INFO
+
+# ── 실시간 대화: 로컬 GPU LLM (vLLM / Qwen / EXAONE) ──
+internal_llm:
+  api_url: http://127.0.0.1:8001/v1/chat/completions
+  api_key: ${INTERNAL_LLM_API_KEY}
+  model: qwen3-4b
+  prompts_path: ./app/prompts/llm_prompts.json
+  tools_path: ./app/prompts/llm_tools.json
+  timeout_seconds: 6.0
+  local_delivery_timeout_seconds: 4.0
+  temperature:
+    answer: 0.1
+    route: 0.0
+    delivery: 0.1
+
+# ── 엔진 큐 (asyncio 세마포어, 동시 처리 상한) ──
+llm_queue:
+  internal: 1    # 라우팅 / identity / delivery — GPU 1장이면 1 권장
+  external: 1    # OCR 후보 정제 등 frontier 보조 호출
+  judge: 1       # 팩트 검증 / 최종 안전 검토
+  search: 1      # T13 LLM 검색
+  tool: 4        # HIRA / 건기식 Tool
+  dur: 4         # DUR Tool (data.go.kr fan-out은 dur_api 내부에서 별도 제한)
+
+# ── Frontier provider 라우팅 (OpenAI + Together) ──
+frontier:
+  enabled_providers:
+    - openai
+    - together
+  primary_provider: openai      # openai | together
+  fallback_enabled: true        # primary 실패 시 다음 provider 시도
+
+  openai:
+    api_key: ${OPENAI_API_KEY}
+    model: gpt-4o-mini
+    judge_model: gpt-5
+    timeout_seconds: 6.0
+    search_timeout_seconds: 6.0
+
+  together:
+    api_key: ${TOGETHER_API_KEY}
+    base_url: https://api.together.ai/v1/chat/completions
+    model: Qwen/Qwen3.5-9B
+    judge_model: Qwen/Qwen3.5-9B
+    search_model: Qwen/Qwen3.5-9B
+    timeout_seconds: 6.0
+
+# ── 공공데이터 Tool (DUR / HIRA / 건기식) ──
+public_data_tools:
+  service_key: ${DATA_GO_KR_SERVICE_KEY}
+  dur:
+    base_url: http://apis.data.go.kr/1471000
+    timeout_seconds: 8.0
+    max_concurrency: 8          # endpoint fan-out 내부 제한
+  hira:
+    base_url: http://apis.data.go.kr/1471000/MdcinGrnIdntfcInfoService03
+    timeout_seconds: 8.0
+  health_supplement:
+    base_url: http://apis.data.go.kr/1471000/HtfsSttusIdntfcInfoService01
+    timeout_seconds: 8.0
+
+# ── 운영 프리셋 (위 값 덮어쓰기 참고) ──
+presets:
+  # GPU만 쓰고 frontier는 judge/search만 켜는 경우
+  gpu_first:
+    llm_queue:
+      internal: 1
+      judge: 1
+      search: 1
+      tool: 2
+      dur: 2
+    frontier:
+      primary_provider: openai
+      fallback_enabled: true
+
+  # GPU 포화 시 frontier로 judge/search 부하 분산
+  gpu_saturated:
+    llm_queue:
+      internal: 1
+      judge: 2
+      search: 2
+      tool: 6
+      dur: 6
+    frontier:
+      primary_provider: together
+      fallback_enabled: true
+      together:
+        model: moonshotai/Kimi-K2.5
+
+  # Together만 쓰는 dev/staging
+  together_only:
+    frontier:
+      enabled_providers:
+        - together
+      primary_provider: together
+      fallback_enabled: false
+
+  # OpenAI만 쓰는 prod
+  openai_only:
+    frontier:
+      enabled_providers:
+        - openai
+      primary_provider: openai
+      fallback_enabled: false

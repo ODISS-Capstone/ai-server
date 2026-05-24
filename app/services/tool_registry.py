@@ -22,11 +22,18 @@ from pathlib import Path
 from typing import Any
 
 from app.core.config import settings
+from app.services.llm_queue import run_with_engine_queue
 from app.tools import dur_api, health_supplement, hira_api
 
 logger = logging.getLogger(__name__)
 
 ToolHandler = Callable[..., Awaitable[dict[str, Any]]]
+
+
+def _queue_engine_for_tool(tool_name: str) -> str:
+    if tool_name.startswith(("Tool_Check_DUR_", "Tool_Get_DUR_")):
+        return "dur"
+    return "tool"
 
 
 def _dur_handler(endpoint_key: str) -> ToolHandler:
@@ -106,9 +113,13 @@ class ToolRegistry:
         parsed = self._normalize_argument_aliases(self._coerce_arguments(arguments))
         parsed = self._filter_schema_properties(tool_name, parsed)
         filtered = self._filter_supported_kwargs(handler, parsed)
+        engine = _queue_engine_for_tool(tool_name)
+
+        async def _invoke() -> dict[str, Any]:
+            return await handler(**filtered)
 
         try:
-            return await handler(**filtered)
+            return await run_with_engine_queue(engine, _invoke)
         except Exception as exc:
             logger.error("Tool %s failed: %s", tool_name, exc)
             return {

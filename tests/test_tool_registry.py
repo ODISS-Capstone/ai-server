@@ -151,6 +151,98 @@ def test_dispatch_unknown_tool_returns_error_envelope():
     assert "Unknown tool" in result["message"]
 
 
+def test_dispatch_routes_dur_tools_through_dur_queue(monkeypatch, tmp_path):
+    schema_file = tmp_path / "tools.json"
+    schema_file.write_text(
+        json.dumps(
+            {
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "Tool_Check_DUR_Dosage_Caution",
+                            "description": "DUR dosage caution",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    queue_calls: list[str] = []
+
+    async def fake_run_with_engine_queue(engine, operation):
+        queue_calls.append(engine)
+        return await operation()
+
+    async def dur_handler(**kwargs) -> dict[str, object]:
+        return {"success": True, "items": []}
+
+    monkeypatch.setattr(
+        tool_registry_module,
+        "run_with_engine_queue",
+        fake_run_with_engine_queue,
+    )
+    registry = ToolRegistry(
+        schema_path=schema_file,
+        handlers={"Tool_Check_DUR_Dosage_Caution": dur_handler},
+    )
+
+    result = asyncio.run(registry.dispatch("Tool_Check_DUR_Dosage_Caution", {}))
+
+    assert result["success"] is True
+    assert queue_calls == ["dur"]
+
+
+def test_dispatch_routes_non_dur_tools_through_tool_queue(monkeypatch, tmp_path):
+    schema_file = tmp_path / "tools.json"
+    schema_file.write_text(
+        json.dumps(
+            {
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "Tool_Get_Drug_Identification",
+                            "description": "HIRA lookup",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    queue_calls: list[str] = []
+
+    async def fake_run_with_engine_queue(engine, operation):
+        queue_calls.append(engine)
+        return await operation()
+
+    async def hira_handler(**kwargs) -> dict[str, object]:
+        return {"success": True, "items": []}
+
+    monkeypatch.setattr(
+        tool_registry_module,
+        "run_with_engine_queue",
+        fake_run_with_engine_queue,
+    )
+    registry = ToolRegistry(
+        schema_path=schema_file,
+        handlers={"Tool_Get_Drug_Identification": hira_handler},
+    )
+
+    result = asyncio.run(registry.dispatch("Tool_Get_Drug_Identification", {}))
+
+    assert result["success"] is True
+    assert queue_calls == ["tool"]
+
+
 def test_dispatch_rejects_non_object_argument_json(tmp_path):
     registry = ToolRegistry(schema_path=tmp_path / "missing.json", handlers={})
 

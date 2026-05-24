@@ -7,10 +7,7 @@ server.mermaid 매핑:
 import logging
 from typing import Any, Optional
 
-import httpx
-
-from app.core.config import settings
-from app.services.llm_queue import run_with_engine_queue
+from app.services.frontier_llm import chat_completion, has_configured_frontier_provider
 from app.services.prompt_registry import DEFAULT_PROMPTS, get_prompt_registry
 
 logger = logging.getLogger(__name__)
@@ -18,36 +15,8 @@ logger = logging.getLogger(__name__)
 JUDGE_SYSTEM_PROMPT = DEFAULT_PROMPTS["judge_verify"]["system"]
 
 
-def _supports_temperature(model: str) -> bool:
-    """Return whether Chat Completions should include temperature."""
-    normalized = (model or "").lower().strip()
-    return not normalized.startswith("gpt-5")
-
-
 class LLMJudgeEngine:
     """LLM as a Judge: 팩트 체킹 및 판단 검토."""
-
-    def __init__(self):
-        self.model = settings.openai_judge_model or settings.openai_model
-
-    def _chat_payload(
-        self,
-        messages: list[dict[str, Any]],
-        *,
-        max_tokens: int,
-        temperature: float = 0.1,
-    ) -> dict[str, Any]:
-        payload: dict[str, Any] = {
-            "model": self.model,
-            "messages": messages,
-        }
-        if (self.model or "").lower().strip().startswith("gpt-5"):
-            payload["max_completion_tokens"] = max_tokens
-        else:
-            payload["max_tokens"] = max_tokens
-        if _supports_temperature(self.model):
-            payload["temperature"] = temperature
-        return payload
 
     async def verify_fact(
         self,
@@ -56,9 +25,8 @@ class LLMJudgeEngine:
         additional_context: Optional[str] = None,
     ) -> dict[str, Any]:
         """중요 추론 항목의 팩트 체킹."""
-        api_key = settings.openai_api_key
-        if not api_key:
-            logger.warning("OpenAI API key not set — skipping LLM Judge verification")
+        if not has_configured_frontier_provider():
+            logger.warning("Frontier provider not configured — skipping LLM Judge verification")
             return {
                 "verified": True,
                 "needs_correction": False,
@@ -77,43 +45,20 @@ class LLMJudgeEngine:
             additional_context_block=additional_context_block,
         )
 
-        try:
-            async def post_judge_verify() -> dict[str, Any]:
-                async with httpx.AsyncClient(timeout=settings.openai_timeout_seconds) as client:
-                    resp = await client.post(
-                        "https://api.openai.com/v1/chat/completions",
-                        headers={
-                            "Authorization": f"Bearer {api_key}",
-                            "Content-Type": "application/json",
-                        },
-                        json=self._chat_payload(messages, max_tokens=256),
-                    )
-                    resp.raise_for_status()
-                    return resp.json()
-
-            data = await run_with_engine_queue("judge", post_judge_verify)
-
-            answer = (
-                data.get("choices", [{}])[0]
-                .get("message", {})
-                .get("content", "")
-            )
-            return self._parse_judge_response(answer, statement)
-
-        except httpx.HTTPStatusError as e:
-            logger.error("LLM Judge API error: %s", e.response.status_code)
+        result = await chat_completion(
+            task="judge",
+            messages=messages,
+            max_tokens=256,
+            temperature=0.1,
+        )
+        if not result["success"]:
             return {
                 "verified": True,
                 "needs_correction": False,
-                "message": f"LLM Judge API 오류: {e.response.status_code}",
+                "message": result.get("message", "LLM Judge 오류"),
             }
-        except Exception as e:
-            logger.error("LLM Judge error: %s", e)
-            return {
-                "verified": True,
-                "needs_correction": False,
-                "message": f"LLM Judge 오류: {e}",
-            }
+
+        return self._parse_judge_response(result["content"], statement)
 
     async def review_final_answer(
         self,
@@ -129,9 +74,8 @@ class LLMJudgeEngine:
                 "message": "검토할 핵심 메시지가 없습니다.",
             }
 
-        api_key = settings.openai_api_key
-        if not api_key:
-            logger.warning("OpenAI API key not set — using core message as reviewed text")
+        if not has_configured_frontier_provider():
+            logger.warning("Frontier provider not configured — using core message as reviewed text")
             return {
                 "reviewed": False,
                 "reviewed_text": core_message,
@@ -150,49 +94,27 @@ class LLMJudgeEngine:
             additional_context_block=additional_context_block,
         )
 
-        try:
-            async def post_final_review() -> dict[str, Any]:
-                async with httpx.AsyncClient(timeout=settings.openai_timeout_seconds) as client:
-                    resp = await client.post(
-                        "https://api.openai.com/v1/chat/completions",
-                        headers={
-                            "Authorization": f"Bearer {api_key}",
-                            "Content-Type": "application/json",
-                        },
-                        json=self._chat_payload(messages, max_tokens=400),
-                    )
-                    resp.raise_for_status()
-                    return resp.json()
-
-            data = await run_with_engine_queue("judge", post_final_review)
-            reviewed_text = (
-                data.get("choices", [{}])[0]
-                .get("message", {})
-                .get("content", "")
-                .strip()
-            )
-
-            return {
-                "reviewed": bool(reviewed_text),
-                "reviewed_text": reviewed_text or core_message,
-                "model": self.model,
-                "message": "최종 검토 완료" if reviewed_text else "빈 검토 결과 — 원문 사용",
-            }
-
-        except httpx.HTTPStatusError as e:
-            logger.error("LLM Judge final review API error: %s", e.response.status_code)
+        result = await chat_completion(
+            task="judge",
+            messages=messages,
+            max_tokens=400,
+            temperature=0.1,
+        )
+        if not result["success"]:
             return {
                 "reviewed": False,
                 "reviewed_text": core_message,
-                "message": f"LLM Judge API 오류: {e.response.status_code}",
+                "message": result.get("message", "LLM Judge 오류"),
             }
-        except Exception as e:
-            logger.error("LLM Judge final review error: %s", e)
-            return {
-                "reviewed": False,
-                "reviewed_text": core_message,
-                "message": f"LLM Judge 오류: {e}",
-            }
+
+        reviewed_text = (result.get("content") or "").strip()
+        return {
+            "reviewed": bool(reviewed_text),
+            "reviewed_text": reviewed_text or core_message,
+            "model": result.get("model"),
+            "provider": result.get("provider"),
+            "message": "최종 검토 완료" if reviewed_text else "빈 검토 결과 — 원문 사용",
+        }
 
     async def evaluate_response(
         self,
@@ -200,8 +122,7 @@ class LLMJudgeEngine:
         criteria: Optional[list[str]] = None,
     ) -> dict[str, Any]:
         """응답 품질 평가 (성능 증강)."""
-        api_key = settings.openai_api_key
-        if not api_key:
+        if not has_configured_frontier_provider():
             return {"score": 0.0, "feedback": "LLM Judge 미설정"}
 
         default_criteria = [
@@ -217,32 +138,16 @@ class LLMJudgeEngine:
             response_text=response_text,
         )
 
-        try:
-            async def post_judge_evaluate() -> dict[str, Any]:
-                async with httpx.AsyncClient(timeout=settings.openai_timeout_seconds) as client:
-                    resp = await client.post(
-                        "https://api.openai.com/v1/chat/completions",
-                        headers={
-                            "Authorization": f"Bearer {api_key}",
-                            "Content-Type": "application/json",
-                        },
-                        json=self._chat_payload(messages, max_tokens=160),
-                    )
-                    resp.raise_for_status()
-                    return resp.json()
+        result = await chat_completion(
+            task="judge",
+            messages=messages,
+            max_tokens=160,
+            temperature=0.1,
+        )
+        if not result["success"]:
+            return {"score": 0.0, "feedback": result.get("message", "LLM Judge 오류")}
 
-            data = await run_with_engine_queue("judge", post_judge_evaluate)
-
-            answer = (
-                data.get("choices", [{}])[0]
-                .get("message", {})
-                .get("content", "")
-            )
-            return self._parse_evaluation(answer)
-
-        except Exception as e:
-            logger.error("LLM Judge evaluation error: %s", e)
-            return {"score": 0.0, "feedback": str(e)}
+        return self._parse_evaluation(result["content"])
 
     def _parse_judge_response(
         self, response: str, original: str

@@ -21,3 +21,13 @@ def test_health():
     data = r.json()
     assert data.get("status") == "ok"
     assert data.get("service") == "odiss-medication-guidance"
+
+
+def test_frontier_llm_health():
+    r = client.get("/health/frontier-llm")
+    assert r.status_code == 200
+    data = r.json()
+    assert "enabled_providers" in data
+    assert "providers" in data
+    assert "openai" in data["providers"]
+    assert "together" in data["providers"]
