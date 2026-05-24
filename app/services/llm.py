@@ -11,6 +11,7 @@ import httpx
 
 from app.core.config import settings
 from app.core.safety import ensure_disclaimer
+from app.services.frontier_llm import together_conversation_completion
 from app.services.llm_queue import run_with_engine_queue
 from app.services.prompt_registry import DEFAULT_PROMPTS, get_prompt_registry
 from app.services.tool_registry import ToolRegistry, get_tool_registry
@@ -18,6 +19,35 @@ from app.services.tool_registry import ToolRegistry, get_tool_registry
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT_RECOGNITION = DEFAULT_PROMPTS["main_answer"]["system"]
+
+
+def get_conversation_llm_backend() -> str:
+    """Return normalized conversation LLM backend mode."""
+    backend = (settings.conversation_llm_backend or "local").strip().lower()
+    if backend not in {"local", "together", "auto"}:
+        logger.warning("[ConversationLLM] invalid backend=%s fallback=local", backend)
+        return "local"
+    return backend
+
+
+def get_conversation_llm_config() -> dict[str, Any]:
+    """Expose the effective conversation LLM switch configuration."""
+    backend = get_conversation_llm_backend()
+    return {
+        "backend": backend,
+        "fallback_enabled": settings.conversation_llm_fallback_enabled,
+        "local": {
+            "configured": bool(settings.internal_llm_api_url),
+            "url": settings.internal_llm_api_url,
+            "model": settings.internal_llm_model,
+        },
+        "together": {
+            "configured": bool(settings.together_api_key),
+            "url": settings.together_base_url,
+            "model": settings.together_conversation_model or settings.together_model,
+            "timeout_seconds": settings.together_conversation_timeout_seconds,
+        },
+    }
 
 
 def build_user_prompt(query_text: str, llm_doc: str) -> str:
@@ -1360,10 +1390,10 @@ async def _post_chat_once(
     timeout_seconds: Optional[float] = None,
     chat_template_kwargs: Optional[dict[str, Any]] = None,
 ) -> str:
-    async def post_internal() -> str:
+    async def post_local() -> str:
         started = perf_counter()
         logger.info(
-            "[InternalLLM] request_start model=%s url=%s messages=%d max_tokens=%d",
+            "[ConversationLLM] request_start backend=local model=%s url=%s messages=%d max_tokens=%d",
             model,
             url,
             len(messages),
@@ -1389,11 +1419,41 @@ async def _post_chat_once(
                 data.get("choices", [{}])[0].get("message", {}).get("content", "") or ""
             )
             logger.info(
-                "[InternalLLM] request_done model=%s answer_chars=%d elapsed_ms=%.1f",
+                "[ConversationLLM] request_done backend=local model=%s answer_chars=%d elapsed_ms=%.1f",
                 model,
                 len(answer),
                 (perf_counter() - started) * 1000,
             )
             return answer
 
-    return await run_with_engine_queue("internal", post_internal)
+    async def post_together() -> str:
+        started = perf_counter()
+        result = await together_conversation_completion(
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=settings.internal_llm_temperature if temperature is None else temperature,
+        )
+        if not result.get("success"):
+            raise RuntimeError(result.get("message") or "Together conversation call failed")
+        answer = _strip_reasoning_tags(str(result.get("content") or ""))
+        logger.info(
+            "[ConversationLLM] request_done backend=together model=%s answer_chars=%d elapsed_ms=%.1f",
+            result.get("model"),
+            len(answer),
+            (perf_counter() - started) * 1000,
+        )
+        return answer
+
+    backend = get_conversation_llm_backend()
+    if backend == "together":
+        return await post_together()
+    if backend == "auto":
+        try:
+            return await run_with_engine_queue("internal", post_local)
+        except Exception as exc:
+            if not settings.conversation_llm_fallback_enabled:
+                raise
+            logger.warning("[ConversationLLM] local_failed fallback=together error=%s", exc)
+            return await post_together()
+
+    return await run_with_engine_queue("internal", post_local)

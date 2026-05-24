@@ -12,7 +12,7 @@ from app.services.llm_queue import run_with_engine_queue
 logger = logging.getLogger(__name__)
 
 FrontierProvider = Literal["openai", "together"]
-FrontierTask = Literal["judge", "search", "external"]
+FrontierTask = Literal["judge", "search", "external", "conversation"]
 
 _OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
 _ALL_PROVIDERS: tuple[FrontierProvider, ...] = ("openai", "together")
@@ -66,6 +66,8 @@ def _model_for_provider_task(provider: FrontierProvider, task: FrontierTask) -> 
             return settings.openai_judge_model or settings.openai_model
         return settings.openai_model
 
+    if task == "conversation":
+        return settings.together_conversation_model or settings.together_model
     if task == "judge":
         return settings.together_judge_model or settings.together_model
     if task == "search":
@@ -74,6 +76,10 @@ def _model_for_provider_task(provider: FrontierProvider, task: FrontierTask) -> 
 
 
 def _timeout_for_provider_task(provider: FrontierProvider, task: FrontierTask) -> float:
+    if task == "conversation":
+        if provider == "openai":
+            return settings.openai_timeout_seconds
+        return settings.together_conversation_timeout_seconds
     if provider == "openai":
         if task == "search":
             return settings.openai_search_timeout_seconds
@@ -121,6 +127,8 @@ def _build_chat_payload(
 
 
 def _queue_engine_for_task(task: FrontierTask) -> str:
+    if task == "conversation":
+        return "internal"
     if task == "judge":
         return "judge"
     if task == "search":
@@ -220,6 +228,80 @@ async def chat_completion(
     }
 
 
+async def together_conversation_completion(
+    *,
+    messages: list[dict[str, Any]],
+    max_tokens: int = 256,
+    temperature: float = 0.1,
+) -> dict[str, Any]:
+    """Call Together directly for conversation LLM work."""
+    if not settings.together_api_key:
+        return {
+            "success": False,
+            "content": "",
+            "provider": "together",
+            "model": None,
+            "message": "TOGETHER_API_KEY is not set",
+        }
+
+    model = settings.together_conversation_model or settings.together_model
+    url = _chat_url_for_provider("together")
+    payload = _build_chat_payload(
+        model=model,
+        messages=messages,
+        max_tokens=max_tokens,
+        temperature=temperature,
+    )
+
+    async def _post() -> dict[str, Any]:
+        async with httpx.AsyncClient(
+            timeout=settings.together_conversation_timeout_seconds
+        ) as client:
+            response = await client.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {settings.together_api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+            response.raise_for_status()
+            data = response.json()
+            data["_frontier_provider"] = "together"
+            data["_frontier_model"] = model
+            return data
+
+    try:
+        data = await run_with_engine_queue("internal", _post)
+        return {
+            "success": True,
+            "content": _extract_content(data),
+            "provider": "together",
+            "model": model,
+            "message": "ok",
+        }
+    except httpx.HTTPStatusError as exc:
+        message = f"together HTTP {exc.response.status_code}"
+        logger.error("[ConversationLLM] %s", message)
+        return {
+            "success": False,
+            "content": "",
+            "provider": "together",
+            "model": model,
+            "message": message,
+        }
+    except Exception as exc:  # noqa: BLE001 - caller decides fallback behavior
+        message = f"together error: {exc}"
+        logger.error("[ConversationLLM] %s", message)
+        return {
+            "success": False,
+            "content": "",
+            "provider": "together",
+            "model": model,
+            "message": message,
+        }
+
+
 async def check_frontier_llm_health() -> dict[str, Any]:
     """Return configured/enabled status for frontier providers."""
     enabled = _parse_enabled_providers()
@@ -231,6 +313,7 @@ async def check_frontier_llm_health() -> dict[str, Any]:
             "primary": provider == (settings.frontier_llm_primary_provider or "").strip().lower(),
             "model_judge": _model_for_provider_task(provider, "judge"),
             "model_search": _model_for_provider_task(provider, "search"),
+            "model_conversation": _model_for_provider_task(provider, "conversation"),
         }
 
     return {

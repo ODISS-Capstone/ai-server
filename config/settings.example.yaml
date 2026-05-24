@@ -21,6 +21,13 @@ internal_llm:
     route: 0.0
     delivery: 0.1
 
+# ── 대화 LLM 백엔드 스위치 ──
+conversation_llm:
+  backend: auto                 # local | together | auto
+  fallback_enabled: true        # auto에서 local 실패 시 Together 사용
+  together_model: Qwen/Qwen3.5-9B
+  together_timeout_seconds: 10.0
+
 # ── 엔진 큐 (asyncio 세마포어, 동시 처리 상한) ──
 llm_queue:
   internal: 1    # 라우팅 / identity / delivery — GPU 1장이면 1 권장

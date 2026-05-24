@@ -60,6 +60,10 @@ class Settings(BaseSettings):
     internal_llm_temperature: float = 0.1
     internal_llm_route_temperature: float = 0.0
     internal_llm_delivery_temperature: float = 0.1
+    conversation_llm_backend: str = "local"  # local | together | auto
+    conversation_llm_fallback_enabled: bool = True
+    together_conversation_model: Optional[str] = None
+    together_conversation_timeout_seconds: float = 10.0
     llm_engine_max_concurrency_internal: int = 1
     llm_engine_max_concurrency_external: int = 1
     llm_engine_max_concurrency_judge: int = 1
