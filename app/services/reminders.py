@@ -616,8 +616,20 @@ class ReminderService:
 
     @staticmethod
     def _medication_label_from_context(prescription_log: str) -> str:
-        if "혈압" in prescription_log:
+        medication_names: list[str] = []
+        for line in str(prescription_log or "").splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("- "):
+                continue
+            name = stripped[2:].strip()
+            if name and name not in medication_names:
+                medication_names.append(name)
+        if any("혈압" in name for name in medication_names) or "혈압" in prescription_log:
             return "혈압약"
+        if medication_names:
+            if len(medication_names) <= 2:
+                return ", ".join(medication_names)
+            return ", ".join(medication_names[:2]) + f" 외 {len(medication_names) - 2}개 약"
         if "약품 목록" in prescription_log:
             return "식후 약"
         return "식후 약"
