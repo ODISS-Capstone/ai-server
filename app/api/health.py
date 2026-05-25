@@ -2,7 +2,7 @@
 from fastapi import APIRouter
 
 from app.services.frontier_llm import check_frontier_llm_health
-from app.services.llm import check_internal_llm_health, get_conversation_llm_config
+from app.services.llm import check_internal_llm_health, get_conversation_llm_config, get_internal_llm_config
 
 router = APIRouter()
 
@@ -22,6 +22,7 @@ async def llm_health() -> dict:
         "internal": internal,
         "frontier": frontier,
         "conversation": get_conversation_llm_config(),
+        "local_llm": get_internal_llm_config(),
     }
 
 

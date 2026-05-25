@@ -106,6 +106,16 @@ def _supports_temperature(model: str) -> bool:
     return not normalized.startswith("gpt-5")
 
 
+def _default_temperature_for_task(task: FrontierTask) -> float:
+    if task == "judge":
+        return settings.frontier_llm_judge_temperature
+    if task == "search":
+        return settings.internal_llm_memory_temperature
+    if task == "conversation":
+        return settings.internal_llm_delivery_temperature
+    return settings.internal_llm_temperature
+
+
 def _build_chat_payload(
     *,
     model: str,
@@ -150,7 +160,7 @@ async def chat_completion(
     task: FrontierTask,
     messages: list[dict[str, Any]],
     max_tokens: int = 256,
-    temperature: float = 0.1,
+    temperature: Optional[float] = None,
 ) -> dict[str, Any]:
     """Call the first available frontier provider with optional fallback."""
     providers = _provider_order()
@@ -172,11 +182,16 @@ async def chat_completion(
         api_key = _api_key_for_provider(provider)
         url = _chat_url_for_provider(provider)
         timeout = _timeout_for_provider_task(provider, task)
+        resolved_temperature = (
+            _default_temperature_for_task(task)
+            if temperature is None
+            else temperature
+        )
         payload = _build_chat_payload(
             model=model,
             messages=messages,
             max_tokens=max_tokens,
-            temperature=temperature,
+            temperature=resolved_temperature,
         )
         queue_engine = _queue_engine_for_task(task)
 
@@ -232,7 +247,7 @@ async def together_conversation_completion(
     *,
     messages: list[dict[str, Any]],
     max_tokens: int = 256,
-    temperature: float = 0.1,
+    temperature: Optional[float] = None,
 ) -> dict[str, Any]:
     """Call Together directly for conversation LLM work."""
     if not settings.together_api_key:
@@ -246,11 +261,16 @@ async def together_conversation_completion(
 
     model = settings.together_conversation_model or settings.together_model
     url = _chat_url_for_provider("together")
+    resolved_temperature = (
+        settings.internal_llm_delivery_temperature
+        if temperature is None
+        else temperature
+    )
     payload = _build_chat_payload(
         model=model,
         messages=messages,
         max_tokens=max_tokens,
-        temperature=temperature,
+        temperature=resolved_temperature,
     )
 
     async def _post() -> dict[str, Any]:

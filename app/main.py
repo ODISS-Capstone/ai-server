@@ -15,14 +15,16 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.api import dur, health, query, upload
-from app.api.routes import agent_ws, ocr_api, stt_api
+from app.api.routes import agent_ws, memory_browser_api, ocr_api, stt_api
 from app.core.config import settings
 from app.core.logging_config import configure_logging
 from app.database.md_store import md_store
 from app.engines.memory import MemoryEngine
 from app.services import turboquant_runtime
+from app.services.llm import get_internal_llm_provider
 
 configure_logging()
 logger = logging.getLogger(__name__)
@@ -39,7 +41,8 @@ async def lifespan(app: FastAPI):
         settings.log_file_path,
     )
     logger.info(
-        "[InternalLLM] config url=%s model=%s api_key_set=%s",
+        "[InternalLLM] config provider=%s url=%s model=%s api_key_set=%s",
+        get_internal_llm_provider(),
         settings.internal_llm_api_url or "-",
         settings.internal_llm_model,
         bool(settings.internal_llm_api_key),
@@ -73,6 +76,20 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+cors_origins = [
+    origin.strip()
+    for origin in settings.memory_browser_cors_origins.split(",")
+    if origin.strip()
+]
+if cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=cors_origins,
+        allow_credentials=True,
+        allow_methods=["GET", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type"],
+    )
+
 # ── 기존 HTTP API 라우터 (하위 호환) ──
 app.include_router(health.router, prefix="/health")
 app.include_router(upload.router)
@@ -83,6 +100,7 @@ app.include_router(query.router)
 app.include_router(agent_ws.router, tags=["websocket"])
 app.include_router(ocr_api.router)
 app.include_router(stt_api.router)
+app.include_router(memory_browser_api.router)
 
 
 @app.get("/")

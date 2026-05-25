@@ -3,6 +3,7 @@ import logging
 import re
 from typing import Any, Optional
 
+from app.core.config import settings
 from app.services.frontier_llm import chat_completion, has_configured_frontier_provider
 from app.services.prompt_registry import DEFAULT_PROMPTS, get_prompt_registry
 
@@ -22,6 +23,8 @@ def _strip_reasoning_tags(content: str) -> str:
 async def llm_search(
     query: str,
     context: Optional[str] = None,
+    *,
+    temperature: Optional[float] = None,
 ) -> dict[str, Any]:
     """LLM 기반 에이전트 검색 (T13)."""
     if not has_configured_frontier_provider():
@@ -44,7 +47,11 @@ async def llm_search(
         task="search",
         messages=messages,
         max_tokens=512,
-        temperature=0.1,
+        temperature=(
+            settings.internal_llm_memory_temperature
+            if temperature is None
+            else temperature
+        ),
     )
     if not result["success"]:
         logger.error("LLM Search error: %s", result.get("message"))

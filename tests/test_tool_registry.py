@@ -361,6 +361,8 @@ def test_run_chat_with_tools_loops_until_final_answer(monkeypatch, tmp_path):
 
     assert answer == "합은 5입니다."
     assert len(captured_payloads) == 2
+    assert captured_payloads[0]["temperature"] == 0.0
+    assert captured_payloads[1]["temperature"] == 0.0
     tool_turn = captured_payloads[1]["messages"]
     assert tool_turn[-1]["role"] == "tool"
     assert tool_turn[-1]["tool_call_id"] == "call-1"

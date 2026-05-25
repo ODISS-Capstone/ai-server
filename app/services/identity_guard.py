@@ -6,6 +6,7 @@ from datetime import datetime
 import re
 from typing import Any, Optional
 
+from app.core.config import settings
 from app.engines.memory import MemoryEngine
 from app.services.llm import (
     extract_identity_profile_with_llm,
@@ -16,8 +17,16 @@ from app.services.llm import (
 from app.services.medication_extraction import is_wake_word_only
 
 
-IDENTITY_REVERIFY_WINDOW_SECONDS = 5 * 60
-IDENTITY_PENDING_TIMEOUT_SECONDS = 5 * 60
+DEFAULT_IDENTITY_REVERIFY_WINDOW_SECONDS = 60 * 60
+DEFAULT_IDENTITY_PENDING_TIMEOUT_SECONDS = 5 * 60
+
+
+def _identity_reverify_window_seconds() -> int:
+    return max(0, int(settings.identity_reverify_window_seconds or 0))
+
+
+def _identity_pending_timeout_seconds() -> int:
+    return max(1, int(settings.identity_pending_timeout_seconds or 0))
 
 PROFILE_RECALL_TOKENS = (
     "내 이름",
@@ -86,7 +95,7 @@ async def evaluate_identity_gate(
     if (
         pending_action == "reverification"
         and pending_since
-        and (current_time - pending_since).total_seconds() > IDENTITY_PENDING_TIMEOUT_SECONDS
+        and (current_time - pending_since).total_seconds() > _identity_pending_timeout_seconds()
         and _is_reverification_fast_confirmation(text, profile, heuristic_identity)
     ):
         saved = await memory_engine.mark_identity_seen(speaker_id, verified=True, now=current_time)
@@ -104,7 +113,7 @@ async def evaluate_identity_gate(
     if (
         pending_action
         and pending_since
-        and (current_time - pending_since).total_seconds() > IDENTITY_PENDING_TIMEOUT_SECONDS
+        and (current_time - pending_since).total_seconds() > _identity_pending_timeout_seconds()
     ):
         cleared = await memory_engine.mark_identity_seen(speaker_id, verified=False, now=current_time)
         state = await memory_engine.load_identity_state(speaker_id)
@@ -480,7 +489,7 @@ async def evaluate_identity_gate(
         )
 
     last_seen = _parse_datetime(state.get("last_seen_at"))
-    if last_seen and (current_time - last_seen).total_seconds() > IDENTITY_REVERIFY_WINDOW_SECONDS:
+    if last_seen and (current_time - last_seen).total_seconds() > _identity_reverify_window_seconds():
         await memory_engine.mark_identity_pending(speaker_id, "reverification")
         return IdentityGateResult(
             allowed=False,

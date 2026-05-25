@@ -24,6 +24,10 @@ class Settings(BaseSettings):
     md_database_path: str = "./data/md_database"
     structured_memory_path: str = "./data/md_database/structured_memory"
 
+    # Identity gate
+    identity_reverify_window_seconds: int = 60 * 60
+    identity_pending_timeout_seconds: int = 5 * 60
+
     # OCR — DeepSeek
     deepseek_ocr_api_url: Optional[str] = None
     deepseek_ocr_api_key: Optional[str] = None
@@ -49,17 +53,22 @@ class Settings(BaseSettings):
     kpic_dur_api_key: Optional[str] = None
     kpic_dur_api_timeout_seconds: float = 8.0
 
-    # Internal LLM (Qwen / EXAONE)
-    internal_llm_api_url: Optional[str] = None
+    # Internal LLM (Ollama — OpenAI-compatible /v1/chat/completions)
+    internal_llm_provider: str = "ollama"  # ollama | vllm | openai_compatible
+    internal_llm_api_url: Optional[str] = "http://127.0.0.1:11434/v1/chat/completions"
     internal_llm_api_key: Optional[str] = None
-    internal_llm_model: str = "qwen"
+    internal_llm_model: str = "qwen3:4b"
     llm_prompts_path: str = "./app/prompts/llm_prompts.json"
     llm_tools_path: str = "./app/prompts/llm_tools.json"
-    internal_llm_timeout_seconds: float = 6.0
+    internal_llm_timeout_seconds: float = 60.0
     local_delivery_llm_timeout_seconds: float = 4.0
-    internal_llm_temperature: float = 0.1
+    internal_llm_temperature: float = 0.0
     internal_llm_route_temperature: float = 0.0
-    internal_llm_delivery_temperature: float = 0.1
+    internal_llm_delivery_temperature: float = 0.0
+    internal_llm_reasoning_temperature: float = 0.25
+    internal_llm_tool_temperature: float = 0.0
+    internal_llm_memory_temperature: float = 0.0
+    frontier_llm_judge_temperature: float = 0.0
     conversation_llm_backend: str = "local"  # local | together | auto
     conversation_llm_fallback_enabled: bool = True
     together_conversation_model: Optional[str] = None
@@ -103,6 +112,10 @@ class Settings(BaseSettings):
     # File storage
     storage_path: str = "./data/storage"
     nfs_mount_path: Optional[str] = None
+
+    # Memory browser (read-only patient memory web UI)
+    memory_browser_token: Optional[str] = None
+    memory_browser_cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
 
     # TTS / STT (optional — Clova)
     clova_stt_client_id: Optional[str] = None

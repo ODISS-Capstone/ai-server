@@ -60,6 +60,8 @@ def test_delivery_llm_disables_thinking_on_user_facing_pass(monkeypatch, content
     monkeypatch.setattr(settings, "internal_llm_api_url", "http://local/v1/chat/completions")
     monkeypatch.setattr(settings, "internal_llm_api_key", None)
     monkeypatch.setattr(settings, "internal_llm_model", "qwen3-4b")
+    monkeypatch.setattr(settings, "internal_llm_provider", "vllm")
+    monkeypatch.setattr(settings, "conversation_llm_backend", "local")
     monkeypatch.setattr(llm_service.httpx, "AsyncClient", fake_client)
 
     answer = asyncio.run(
@@ -72,6 +74,7 @@ def test_delivery_llm_disables_thinking_on_user_facing_pass(monkeypatch, content
     assert captured
     users = _user_messages(captured[0])
     assert captured[0]["json"].get("chat_template_kwargs") == {"enable_thinking": False}
+    assert captured[0]["json"]["temperature"] == settings.internal_llm_delivery_temperature
     assert not users[-1].startswith("/no_think")
     assert "<think>" not in answer
     assert "</think>" not in answer
@@ -86,6 +89,8 @@ def test_internal_reasoning_llm_does_not_force_no_think(monkeypatch):
     monkeypatch.setattr(settings, "internal_llm_api_url", "http://local/v1/chat/completions")
     monkeypatch.setattr(settings, "internal_llm_api_key", None)
     monkeypatch.setattr(settings, "internal_llm_model", "qwen3-4b")
+    monkeypatch.setattr(settings, "internal_llm_provider", "vllm")
+    monkeypatch.setattr(settings, "conversation_llm_backend", "local")
     monkeypatch.setattr(llm_service.httpx, "AsyncClient", fake_client)
 
     answer = asyncio.run(
@@ -98,6 +103,7 @@ def test_internal_reasoning_llm_does_not_force_no_think(monkeypatch):
 
     assert captured
     assert "chat_template_kwargs" not in captured[0]["json"]
+    assert captured[0]["json"]["temperature"] == settings.internal_llm_reasoning_temperature
     assert not any(message.startswith("/no_think") for message in _user_messages(captured[0]))
     assert answer == "핵심"
 
@@ -177,6 +183,8 @@ def test_identity_conflict_judge_uses_local_llm(monkeypatch):
     monkeypatch.setattr(settings, "internal_llm_api_url", "http://local/v1/chat/completions")
     monkeypatch.setattr(settings, "internal_llm_api_key", None)
     monkeypatch.setattr(settings, "internal_llm_model", "qwen3-4b")
+    monkeypatch.setattr(settings, "internal_llm_provider", "vllm")
+    monkeypatch.setattr(settings, "conversation_llm_backend", "local")
     monkeypatch.setattr(llm_service.httpx, "AsyncClient", fake_client)
 
     result = asyncio.run(
@@ -207,6 +215,8 @@ def test_route_classifier_uses_zero_temperature(monkeypatch):
     monkeypatch.setattr(settings, "internal_llm_api_url", "http://local/v1/chat/completions")
     monkeypatch.setattr(settings, "internal_llm_api_key", None)
     monkeypatch.setattr(settings, "internal_llm_model", "qwen3-4b")
+    monkeypatch.setattr(settings, "internal_llm_provider", "vllm")
+    monkeypatch.setattr(settings, "conversation_llm_backend", "local")
     monkeypatch.setattr(llm_service.httpx, "AsyncClient", fake_client)
 
     result = asyncio.run(
@@ -363,4 +373,32 @@ def test_llm_search_strips_reasoning_tags_from_answer(monkeypatch):
 
     assert result["success"] is True
     assert result["answer"] == "Search answer."
+    assert captured[0]["json"]["temperature"] == settings.internal_llm_memory_temperature
     assert "think" not in result["answer"].lower()
+
+
+def test_ollama_provider_omits_vllm_chat_template_kwargs(monkeypatch):
+    captured: list[dict] = []
+
+    def fake_client(**kwargs):
+        return _FakeAsyncClient(captured=captured, content="OK", **kwargs)
+
+    monkeypatch.setattr(settings, "internal_llm_api_url", "http://127.0.0.1:11434/v1/chat/completions")
+    monkeypatch.setattr(settings, "internal_llm_api_key", None)
+    monkeypatch.setattr(settings, "internal_llm_model", "qwen3:4b")
+    monkeypatch.setattr(settings, "internal_llm_provider", "ollama")
+    monkeypatch.setattr(settings, "conversation_llm_backend", "local")
+    monkeypatch.setattr(llm_service.httpx, "AsyncClient", fake_client)
+
+    asyncio.run(
+        llm_service.call_local_delivery_llm(
+            original_query="ping",
+            reviewed_message="pong",
+            require_disclaimer=False,
+        )
+    )
+
+    assert captured
+    assert "chat_template_kwargs" not in captured[0]["json"]
+    assert llm_service.get_internal_llm_provider() == "ollama"
+    assert llm_service.supports_chat_template_kwargs() is False

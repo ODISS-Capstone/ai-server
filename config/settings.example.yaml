@@ -7,19 +7,29 @@ app:
   debug: true
   log_level: INFO
 
-# ── 실시간 대화: 로컬 GPU LLM (vLLM / Qwen / EXAONE) ──
+# ── 신원 확인 게이트 ──
+identity_gate:
+  reverify_window_seconds: 3600   # 마지막 확인 후 1시간 동안 재확인 생략
+  pending_timeout_seconds: 300     # 신원 확인 질문 대기 만료
+
+# ── 실시간 대화: 로컬 LLM (Ollama OpenAI-compatible API) ──
 internal_llm:
-  api_url: http://127.0.0.1:8001/v1/chat/completions
+  provider: ollama                 # ollama | vllm | openai_compatible
+  api_url: http://127.0.0.1:11434/v1/chat/completions
   api_key: ${INTERNAL_LLM_API_KEY}
-  model: qwen3-4b
+  model: qwen3:4b
   prompts_path: ./app/prompts/llm_prompts.json
   tools_path: ./app/prompts/llm_tools.json
-  timeout_seconds: 6.0
-  local_delivery_timeout_seconds: 4.0
+  timeout_seconds: 60.0
+  local_delivery_timeout_seconds: 30.0
   temperature:
-    answer: 0.1
+    default: 0.0
     route: 0.0
-    delivery: 0.1
+    delivery: 0.0
+    reasoning: 0.25
+    tool: 0.0
+    memory: 0.0
+    judge: 0.0
 
 # ── 대화 LLM 백엔드 스위치 ──
 conversation_llm:
@@ -117,3 +127,12 @@ presets:
         - openai
       primary_provider: openai
       fallback_enabled: false
+
+# ── 환자 메모리 브라우저 (read-only web UI) ──
+memory_browser:
+  token: ${MEMORY_BROWSER_TOKEN}   # unset + development → open access
+  cors_origins:
+    - http://localhost:5173
+    - http://127.0.0.1:5173
+  api_prefix: /api/memory
+  frontend_dev_port: 5173

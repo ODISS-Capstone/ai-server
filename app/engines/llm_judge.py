@@ -7,6 +7,7 @@ server.mermaid 매핑:
 import logging
 from typing import Any, Optional
 
+from app.core.config import settings
 from app.services.frontier_llm import chat_completion, has_configured_frontier_provider
 from app.services.prompt_registry import DEFAULT_PROMPTS, get_prompt_registry
 
@@ -49,7 +50,7 @@ class LLMJudgeEngine:
             task="judge",
             messages=messages,
             max_tokens=256,
-            temperature=0.1,
+            temperature=settings.frontier_llm_judge_temperature,
         )
         if not result["success"]:
             return {
@@ -98,7 +99,7 @@ class LLMJudgeEngine:
             task="judge",
             messages=messages,
             max_tokens=400,
-            temperature=0.1,
+            temperature=settings.frontier_llm_judge_temperature,
         )
         if not result["success"]:
             return {
@@ -142,7 +143,7 @@ class LLMJudgeEngine:
             task="judge",
             messages=messages,
             max_tokens=160,
-            temperature=0.1,
+            temperature=settings.frontier_llm_judge_temperature,
         )
         if not result["success"]:
             return {"score": 0.0, "feedback": result.get("message", "LLM Judge 오류")}

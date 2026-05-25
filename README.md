@@ -39,103 +39,30 @@ python -m uvicorn app.main:app --reload --host 0.0.0.0
 - 파이프라인: POST /query/pipeline (이미지 업로드 → OCR → DUR → DB/문서화)
 - 답변 생성: POST /query/ask (session_id, query_text 선택) → 내부 LLM → 검열 → 외부 LLM → 검증 → 사용자 친화 → MCP/기기 전송
 
-## Qwen3-4B + TurboQuant 상시 검증
+## Qwen3-4B + Ollama (로컬 LLM)
 
-ai-server는 내부 LLM을 직접 추론하지 않고 OpenAI-compatible LLM 서버를 `INTERNAL_LLM_API_URL`로 호출한다. 따라서 Qwen3-4B는 별도 모델 서버 프로세스로 계속 띄우고, ai-server는 그 endpoint를 바라보게 한다.
+ai-server는 내부 LLM을 직접 추론하지 않고 OpenAI-compatible LLM 서버를 `INTERNAL_LLM_API_URL`로 호출한다. 기본 백엔드는 **Ollama** (`http://127.0.0.1:11434/v1/chat/completions`)이다.
 
-> 주의: `app.services.turboquant_runtime`의 auto-wrap은 해당 Python 프로세스 안에서 `transformers`로 로드되는 모델에 적용된다. 별도 LLM 서버를 띄울 때도 그 서버 프로세스에 `TurboQuantWrapper`를 설치하고 `TURBOQUANT_*` 환경 변수를 함께 넘겨야 한다.
-
-### 1. 모델 파일 배치
-
-서버에 모델 디렉터리를 만든다.
+### 1. Ollama 설치 및 모델 pull
 
 ```bash
-mkdir -p /home/jepetolee/models
+curl -fsSL https://ollama.com/install.sh | sh
+ollama pull qwen3:4b
 ```
 
-Hugging Face에서 받는 경우:
+다른 태그를 쓰면 `.env`의 `INTERNAL_LLM_MODEL`을 Ollama에 등록된 이름과 맞춘다 (예: `qwen2.5:3b`).
+
+### 2. ai-server 연결
+
+`.env` 예시:
 
 ```bash
-huggingface-cli download Qwen/Qwen3-4B \
-  --local-dir /home/jepetolee/models/qwen3-4b
-```
-
-이미 받은 모델을 서버로 업로드하는 경우:
-
-```bash
-scp -r ./Qwen3-4B user@server:/home/jepetolee/models/qwen3-4b
-```
-
-### 2. TurboQuantWrapper 설치
-
-TurboQuantWrapper 저장소를 같은 서버에 두고 editable로 설치한다.
-
-```bash
-git clone <TurboQuantWrapper repo url> /home/jepetolee/TurboQuantWrapper
-python3 -m pip install --upgrade pip
-python3 -m pip install "transformers>=4.44.0" "accelerate>=0.30.0" sentencepiece
-python3 -m pip install -e /home/jepetolee/TurboQuantWrapper
-```
-
-설치 확인:
-
-```bash
-python3 - <<'PY'
-import turboquant.runtime as tq
-print("TurboQuant runtime OK:", tq)
-PY
-```
-
-Qwen3-4B wrapper smoke가 필요하면 TurboQuantWrapper의 테스트 스크립트를 먼저 돌린다.
-
-```bash
-python3 /home/jepetolee/TurboQuantWrapper/scripts/test_turboquant_wrapping.py \
-  --targets qwen3-4b \
-  --report turboquant-wrap-qwen3-4b.json
-```
-
-### 3. LLM 서버 상시 실행
-
-운영 중 계속 떠 있어야 하므로 `tmux`에서 실행한다.
-
-```bash
-tmux new -s qwen3-llm
-```
-
-LLM 서버 프로세스에는 TurboQuant 환경 변수를 같이 준다.
-
-```bash
-export CUDA_VISIBLE_DEVICES=0
-export TURBOQUANT_AUTO_WRAP=true
-export TURBOQUANT_KEY_BITS=3
-export TURBOQUANT_VALUE_BITS=3
-export TURBOQUANT_COMPRESS_VALUES=false
-export TURBOQUANT_REQUIRE_CUDA=true
-
-python3 -m vllm.entrypoints.openai.api_server \
-  --model /home/jepetolee/models/qwen3-4b \
-  --served-model-name qwen3-4b \
-  --host 0.0.0.0 \
-  --port 8001 \
-  --gpu-memory-utilization 0.85 \
-  --max-model-len 32768 \
-  --trust-remote-code
-```
-
-`Ctrl+B`, `D`로 tmux에서 빠져나오면 서버는 계속 실행된다. 다시 들어가려면:
-
-```bash
-tmux attach -t qwen3-llm
-```
-
-### 4. ai-server 연결
-
-ai-server의 `.env` 또는 실행 환경에 내부 LLM endpoint를 지정한다.
-
-```bash
-INTERNAL_LLM_API_URL=http://localhost:8001/v1/chat/completions
+INTERNAL_LLM_PROVIDER=ollama
+INTERNAL_LLM_API_URL=http://127.0.0.1:11434/v1/chat/completions
 INTERNAL_LLM_API_KEY=
-INTERNAL_LLM_MODEL=qwen3-4b
+INTERNAL_LLM_MODEL=qwen3:4b
+INTERNAL_LLM_TIMEOUT_SECONDS=60.0
+CONVERSATION_LLM_BACKEND=local
 
 LOG_LEVEL=INFO
 LOG_TO_FILE=true
@@ -148,17 +75,18 @@ ai-server 실행:
 python3 -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-### 5. 검증
+### 3. 검증
 
-LLM 서버를 직접 확인한다.
+Ollama 직접 확인:
 
 ```bash
-curl http://localhost:8001/v1/chat/completions \
+curl http://127.0.0.1:11434/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "qwen3-4b",
-    "messages": [{"role": "user", "content": "/no_think\nping"}],
-    "max_tokens": 32
+    "model": "qwen3:4b",
+    "messages": [{"role": "user", "content": "ping"}],
+    "max_tokens": 32,
+    "temperature": 0
   }'
 ```
 
@@ -168,17 +96,54 @@ ai-server 경유 확인:
 curl http://localhost:8000/health/llm
 ```
 
-로그 확인:
+정상 연결이면 `logs/ai-server.log`에 `[InternalLLMHealth] check_ok`가 남는다.
+
+### 4. vLLM (선택)
+
+GPU 서버에서 vLLM을 쓰는 경우 provider만 바꾼다:
 
 ```bash
-tail -f logs/ai-server.log
+INTERNAL_LLM_PROVIDER=vllm
+INTERNAL_LLM_API_URL=http://localhost:8001/v1/chat/completions
+INTERNAL_LLM_MODEL=qwen3-4b
 ```
 
-정상 연결이면 `logs/ai-server.log`에 `[InternalLLMHealth] check_ok`가 남는다. GPU 적재 상태는 별도 터미널에서 확인한다.
+vLLM은 Qwen thinking 모드용 `chat_template_kwargs`를 지원한다. Ollama/openai_compatible provider에서는 해당 필드를 자동으로 생략한다.
+
+<details>
+<summary>vLLM + TurboQuant 상세 (레거시 GPU 배포)</summary>
+
+## Qwen3-4B + TurboQuant + vLLM
+
+> 주의: `app.services.turboquant_runtime`의 auto-wrap은 해당 Python 프로세스 안에서 `transformers`로 로드되는 모델에 적용된다. 별도 LLM 서버를 띄울 때도 그 서버 프로세스에 `TurboQuantWrapper`를 설치하고 `TURBOQUANT_*` 환경 변수를 함께 넘겨야 한다.
+
+### 모델 파일 배치
 
 ```bash
-watch -n 1 nvidia-smi
+mkdir -p /home/jepetolee/models
+huggingface-cli download Qwen/Qwen3-4B \
+  --local-dir /home/jepetolee/models/qwen3-4b
 ```
+
+### LLM 서버 상시 실행 (tmux)
+
+```bash
+export CUDA_VISIBLE_DEVICES=0
+export TURBOQUANT_AUTO_WRAP=true
+export TURBOQUANT_KEY_BITS=3
+export TURBOQUANT_VALUE_BITS=3
+
+python3 -m vllm.entrypoints.openai.api_server \
+  --model /home/jepetolee/models/qwen3-4b \
+  --served-model-name qwen3-4b \
+  --host 0.0.0.0 \
+  --port 8001 \
+  --gpu-memory-utilization 0.85 \
+  --max-model-len 32768 \
+  --trust-remote-code
+```
+
+</details>
 
 ## 테스트
 
@@ -214,6 +179,51 @@ python scripts/evaluate_engine_datasets.py \
 python scripts/evaluate_engine_datasets.py \
   --dataset data/fine_tuning/qwen_reasoning_samples.jsonl \
   --task-family reasoning
+```
+
+## 환자 메모리 브라우저
+
+환자명으로 Markdown DB의 프로필·OCR·처방·복용·DUR·flash 메모리를 **read-only** 조회하는 TypeScript UI입니다.
+
+| 항목 | 내용 |
+|------|------|
+| API | `GET /api/memory/*` (Bearer `MEMORY_BROWSER_TOKEN`) |
+| development | 토큰 미설정 시 인증 생략 |
+| production | 토큰 미설정 시 `503`, 토큰 불일치 시 `403` |
+| path safety | `resolve_safe_path`로 traversal 차단 |
+
+### 서버
+
+`.env`에 추가:
+
+```bash
+MEMORY_BROWSER_TOKEN=your-browser-token
+MEMORY_BROWSER_CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
+```
+
+AI 서버 실행 (기존과 동일):
+
+```bash
+python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+### 프론트 (`web/`)
+
+```bash
+cd web
+cp .env.example .env.local
+# .env.local → VITE_MEMORY_BROWSER_TOKEN=your-browser-token (서버와 동일)
+npm install
+npm run dev
+```
+
+브라우저: http://localhost:5173 — Vite dev server가 `/api/memory`를 `http://127.0.0.1:8000`으로 프록시합니다.
+
+### 테스트
+
+```bash
+pytest tests/test_memory_browser_api.py -q
+cd web && npm test && npm run build
 ```
 
 ## 환경 변수

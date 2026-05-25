@@ -20,6 +20,42 @@ logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT_RECOGNITION = DEFAULT_PROMPTS["main_answer"]["system"]
 
+_OLLAMA_PROVIDER = "ollama"
+_VLLM_PROVIDER = "vllm"
+_OPENAI_COMPATIBLE_PROVIDER = "openai_compatible"
+_VALID_INTERNAL_LLM_PROVIDERS = {
+    _OLLAMA_PROVIDER,
+    _VLLM_PROVIDER,
+    _OPENAI_COMPATIBLE_PROVIDER,
+}
+
+
+def get_internal_llm_provider() -> str:
+    """Return normalized local LLM backend provider."""
+    provider = (settings.internal_llm_provider or _OLLAMA_PROVIDER).strip().lower()
+    if provider not in _VALID_INTERNAL_LLM_PROVIDERS:
+        logger.warning("[InternalLLM] invalid provider=%s fallback=ollama", provider)
+        return _OLLAMA_PROVIDER
+    return provider
+
+
+def supports_chat_template_kwargs() -> bool:
+    """vLLM-only Qwen thinking toggle; Ollama rejects unknown payload fields."""
+    return get_internal_llm_provider() == _VLLM_PROVIDER
+
+
+def get_internal_llm_config() -> dict[str, Any]:
+    """Expose effective local LLM (Ollama/vLLM) configuration."""
+    provider = get_internal_llm_provider()
+    return {
+        "provider": provider,
+        "configured": bool(settings.internal_llm_api_url),
+        "url": settings.internal_llm_api_url,
+        "model": settings.internal_llm_model,
+        "timeout_seconds": settings.internal_llm_timeout_seconds,
+        "supports_chat_template_kwargs": supports_chat_template_kwargs(),
+    }
+
 
 def get_conversation_llm_backend() -> str:
     """Return normalized conversation LLM backend mode."""
@@ -36,11 +72,7 @@ def get_conversation_llm_config() -> dict[str, Any]:
     return {
         "backend": backend,
         "fallback_enabled": settings.conversation_llm_fallback_enabled,
-        "local": {
-            "configured": bool(settings.internal_llm_api_url),
-            "url": settings.internal_llm_api_url,
-            "model": settings.internal_llm_model,
-        },
+        "local": get_internal_llm_config(),
         "together": {
             "configured": bool(settings.together_api_key),
             "url": settings.together_base_url,
@@ -113,6 +145,7 @@ async def check_internal_llm_health(
         return {
             "status": "ok",
             "configured": True,
+            "provider": get_internal_llm_provider(),
             "model": selected_model,
             "url": url,
             "status_code": response.status_code,
@@ -188,6 +221,7 @@ async def call_internal_llm(
             key,
             messages,
             model=model or settings.internal_llm_model,
+            temperature=settings.internal_llm_reasoning_temperature,
         )
 
     registry = tool_registry or get_tool_registry()
@@ -198,6 +232,7 @@ async def call_internal_llm(
             key,
             messages,
             model=model or settings.internal_llm_model,
+            temperature=settings.internal_llm_reasoning_temperature,
         )
 
     return await run_chat_with_tools(
@@ -207,6 +242,7 @@ async def call_internal_llm(
         tool_registry=registry,
         max_tool_rounds=max_tool_rounds,
         model=model or settings.internal_llm_model,
+        temperature=settings.internal_llm_tool_temperature,
     )
 
 
@@ -896,14 +932,18 @@ async def run_chat_with_tools(
                 r = await client.post(
                     api_url,
                     headers=_json_headers(api_key),
-                    json={
-                        "model": model,
-                        "messages": current_messages,
-                        "tools": tools,
-                        "tool_choice": "auto",
-                        "max_tokens": max_tokens,
-                        "temperature": settings.internal_llm_temperature if temperature is None else temperature,
-                    },
+                    json=_build_internal_chat_payload(
+                        model=model,
+                        messages=current_messages,
+                        max_tokens=max_tokens,
+                        temperature=(
+                            settings.internal_llm_tool_temperature
+                            if temperature is None
+                            else temperature
+                        ),
+                        tools=tools,
+                        tool_choice="auto",
+                    ),
                 )
                 r.raise_for_status()
                 return r.json()
@@ -1370,6 +1410,31 @@ def _json_headers(api_key: Optional[str]) -> dict[str, str]:
     return headers
 
 
+def _build_internal_chat_payload(
+    *,
+    model: str,
+    messages: list[dict[str, Any]],
+    max_tokens: int,
+    temperature: float,
+    chat_template_kwargs: Optional[dict[str, Any]] = None,
+    tools: Optional[list[dict[str, Any]]] = None,
+    tool_choice: Optional[str] = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    if tools:
+        payload["tools"] = tools
+    if tool_choice:
+        payload["tool_choice"] = tool_choice
+    if chat_template_kwargs and supports_chat_template_kwargs():
+        payload["chat_template_kwargs"] = chat_template_kwargs
+    return payload
+
+
 def _strip_reasoning_tags(content: str) -> str:
     """Remove completed Qwen-style reasoning blocks from user-facing text."""
     if "<think" not in content.lower():
@@ -1400,14 +1465,15 @@ async def _post_chat_once(
             max_tokens,
         )
         async with httpx.AsyncClient(timeout=timeout_seconds or settings.internal_llm_timeout_seconds) as client:
-            payload: dict[str, Any] = {
-                "model": model,
-                "messages": messages,
-                "max_tokens": max_tokens,
-                "temperature": settings.internal_llm_temperature if temperature is None else temperature,
-            }
-            if chat_template_kwargs:
-                payload["chat_template_kwargs"] = chat_template_kwargs
+            payload = _build_internal_chat_payload(
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=(
+                    settings.internal_llm_temperature if temperature is None else temperature
+                ),
+                chat_template_kwargs=chat_template_kwargs,
+            )
             r = await client.post(
                 url,
                 headers=_json_headers(key),

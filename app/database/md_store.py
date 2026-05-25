@@ -129,6 +129,39 @@ class MDStore:
         p = self.permanent / "patients" / user_id / "profile.md"
         return p.exists()
 
+    async def list_patient_ids(self) -> list[str]:
+        """Return all speaker/user ids under permanent/patients."""
+        return await asyncio.get_event_loop().run_in_executor(
+            None, self._sync_list_patient_ids,
+        )
+
+    async def list_user_files(self, user_id: str) -> list[str]:
+        """Return filenames stored for a patient."""
+        return await asyncio.get_event_loop().run_in_executor(
+            None, self._sync_list_user_files, user_id,
+        )
+
+    async def read_safe_entry(self, relative_path: str) -> str:
+        """Read a markdown entry only if it stays inside the database base."""
+        resolved = self.resolve_safe_path(relative_path)
+        return await asyncio.get_event_loop().run_in_executor(
+            None, self._sync_read, resolved,
+        )
+
+    def resolve_safe_path(self, relative_path: str) -> Path:
+        """Resolve a relative path and reject traversal outside the base."""
+        candidate = Path(relative_path)
+        if candidate.is_absolute():
+            resolved = candidate.resolve()
+        else:
+            resolved = (self.base / candidate).resolve()
+        base = self.base.resolve()
+        if base not in resolved.parents and resolved != base:
+            raise ValueError("Path is outside the memory database root")
+        if not resolved.exists() or not resolved.is_file():
+            raise FileNotFoundError(relative_path)
+        return resolved
+
     # ────────────────────────────────────────────
     #  Flash — 단일 파일 덮어쓰기 / 읽기
     # ────────────────────────────────────────────
@@ -256,6 +289,22 @@ class MDStore:
                 "content": self._sync_read(p),
             })
         return results
+
+    def _sync_list_patient_ids(self) -> list[str]:
+        patients_dir = self.permanent / "patients"
+        if not patients_dir.exists():
+            return []
+        return sorted(
+            item.name
+            for item in patients_dir.iterdir()
+            if item.is_dir() and (item / "profile.md").exists()
+        )
+
+    def _sync_list_user_files(self, user_id: str) -> list[str]:
+        user_dir = self.permanent / "patients" / user_id
+        if not user_dir.exists():
+            return []
+        return sorted(path.name for path in user_dir.glob("*.md"))
 
     def _flash_path(self, key: str) -> Path:
         fname = FLASH_FILES.get(key)

@@ -10,6 +10,7 @@ import asyncio
 import re
 from typing import Any, Optional
 
+from app.core.config import settings
 from app.engines.memory import MemoryEngine
 from app.engines.llm_judge import LLMJudgeEngine
 from app.schemas.engine_contracts import (
@@ -589,7 +590,10 @@ class ReasoningEngine:
                 parts.append("이전 기록에서 바로 답할 핵심 내용을 찾지 못했습니다.")
 
         if not parts:
-            search_result = await llm_search.llm_search(query)
+            search_result = await llm_search.llm_search(
+                query,
+                temperature=settings.internal_llm_reasoning_temperature,
+            )
             if search_result.get("success") and search_result.get("answer"):
                 core_msg = search_result["answer"]
             else:
