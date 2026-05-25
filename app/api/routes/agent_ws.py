@@ -46,34 +46,27 @@ reminder_service = ReminderService()
 _pending_ocr_by_speaker: dict[str, dict[str, Any]] = {}
 _queued_ocr_request_by_speaker: dict[str, dict[str, Any]] = {}
 _bootstrapped_speakers: set[str] = set()
+_wake_profile_cache_by_speaker: dict[str, dict[str, Any]] = {}
 OCR_PENDING_TTL = timedelta(minutes=5)
 ANONYMOUS_OCR_KEY = "__anonymous__"
 WEBSOCKET_IDLE_TIMEOUT_SEC = 65.0
+WAKE_PROFILE_LOOKUP_TIMEOUT_SEC = 0.15
 MEDICATION_PROGRESS_FILLERS = (
-    "복용 안전 확인이 필요해서 조금 더 살펴볼게요.",
-    "복용 중인 약 기준으로 같이 먹어도 되는지 확인하고 있어요.",
-    "처방을 바꾸라는 뜻은 아니고, 주의할 조합이 있는지만 확인 중이에요.",
+    "아직 약 정보를 확인하고 있습니다. 잠시만 기다려주세요.",
 )
 REMINDER_PROGRESS_FILLERS = (
-    "알림 시간을 확인하고 있어요.",
-    "복약 알림이 헷갈리지 않도록 시간을 맞춰보고 있어요.",
-    "설정한 알림을 기록에 저장하고 있어요.",
+    "아직 알림 정보를 확인하고 있습니다. 잠시만 기다려주세요.",
 )
 RECORD_PROGRESS_FILLERS = (
-    "복용 기록을 확인하고 있어요.",
-    "방금 말씀하신 복용 내용을 기록과 맞춰보고 있어요.",
-    "나중에 다시 확인하실 수 있게 정리하고 있어요.",
+    "아직 복용 기록을 확인하고 있습니다. 잠시만 기다려주세요.",
 )
 GENERAL_PROGRESS_FILLERS = (
-    "말씀하신 내용을 확인하고 있어요.",
-    "필요한 기록을 찾아보고 있어요.",
-    "답변을 정리하고 있어요.",
+    "아직 내용을 확인하고 있습니다. 잠시만 기다려주세요.",
 )
 OCR_PROCESSING_FILLER = "사진을 확인하고 있습니다. 잠시만 기다려주세요."
 OCR_PROGRESS_FILLERS = (
-    "사진 속 글자가 제대로 읽혔는지 확인하고 있어요.",
-    "약 이름을 추측하지 않도록 인식 결과를 한 번 더 살펴보고 있어요.",
-    "복약 기록에 저장해도 되는 정보인지 정리하고 있어요.",
+    "사진 속 글자를 확인하고 있습니다. 잠시만 기다려주세요.",
+    "약 이름을 확인하고 있습니다. 잠시만 기다려주세요.",
 )
 
 
@@ -173,6 +166,10 @@ async def _handle_stt(websocket: WebSocket, message: dict, active_speakers: set[
         )
         return
 
+    if is_wake_word_only(text):
+        await _handle_wake_word_fast_path(websocket, speaker_id, active_speakers)
+        return
+
     if speaker_id:
         if speaker_id not in _bootstrapped_speakers:
             await memory_engine.bootstrap_flash_from_permanent(speaker_id)
@@ -235,24 +232,6 @@ async def _handle_stt(websocket: WebSocket, message: dict, active_speakers: set[
 
     if queued_ocr_reason:
         await _send_queued_ocr_request_if_ready(websocket, speaker_id)
-        return
-
-    if is_wake_word_only(text):
-        profile = (identity_gate.metadata or {}).get("profile") or {}
-        if not profile:
-            context = await memory_engine.load_context(speaker_id)
-            profile = context.get("user_profile", {})
-        response_text = conversation_engine.build_wake_word_response(profile)
-        response = conversation_engine.build_response(
-            {
-                "text": response_text,
-                "type": "wake_word_ack",
-                "requires_tts": True,
-            }
-        )
-        await websocket.send_json({"type": "response", **response})
-        if speaker_id:
-            await memory_engine.mark_identity_seen(speaker_id, verified=True)
         return
 
     if await _handle_pending_ocr_confirmation(websocket, text, speaker_id):
@@ -365,6 +344,68 @@ async def _handle_stt(websocket: WebSocket, message: dict, active_speakers: set[
         await memory_engine.mark_identity_seen(speaker_id, verified=True)
 
 
+async def _handle_wake_word_fast_path(
+    websocket: WebSocket,
+    speaker_id: str | None,
+    active_speakers: set[str],
+) -> None:
+    """Acknowledge wake-word-only turns without waiting for identity/LLM work."""
+    if speaker_id:
+        async def send_reminder(payload: dict[str, Any]) -> None:
+            await websocket.send_json(payload)
+
+        reminder_service.register_connection(speaker_id, send_reminder)
+        active_speakers.add(speaker_id)
+
+    profile = await _load_wake_profile_fast(speaker_id)
+    response_text = conversation_engine.build_wake_word_response(profile)
+    response = conversation_engine.build_response(
+        {
+            "text": response_text,
+            "type": "wake_word_ack",
+            "requires_tts": True,
+        }
+    )
+    await websocket.send_json({"type": "response", **response})
+
+    if speaker_id:
+        asyncio.create_task(_refresh_wake_word_state_background(speaker_id))
+
+
+async def _load_wake_profile_fast(speaker_id: str | None) -> dict[str, Any]:
+    if not speaker_id:
+        return {}
+    cached = _wake_profile_cache_by_speaker.get(speaker_id)
+    if cached:
+        return cached
+    try:
+        state = await asyncio.wait_for(
+            memory_engine.load_identity_state(speaker_id),
+            timeout=WAKE_PROFILE_LOOKUP_TIMEOUT_SEC,
+        )
+    except Exception as exc:  # noqa: BLE001 - wake acknowledgement must stay instant
+        logger.debug("[WakeWord] profile_fast_lookup_skipped speaker=%s error=%r", speaker_id, exc)
+        return {}
+    profile = state.get("profile") or {}
+    if profile:
+        _wake_profile_cache_by_speaker[speaker_id] = profile
+    return profile
+
+
+async def _refresh_wake_word_state_background(speaker_id: str) -> None:
+    try:
+        if speaker_id not in _bootstrapped_speakers:
+            await memory_engine.bootstrap_flash_from_permanent(speaker_id)
+            _bootstrapped_speakers.add(speaker_id)
+        await reminder_service.restore_for_speaker(memory_engine, speaker_id)
+        state = await memory_engine.load_identity_state(speaker_id)
+        profile = state.get("profile") or {}
+        if profile:
+            _wake_profile_cache_by_speaker[speaker_id] = profile
+    except Exception as exc:  # noqa: BLE001 - background refresh must not affect the turn
+        logger.warning("[WakeWord] background_refresh_failed speaker=%s error=%r", speaker_id, exc)
+
+
 async def _send_runtime_filler(websocket: WebSocket, text: str, *, stage: str) -> None:
     await websocket.send_json(
         {
@@ -434,7 +475,7 @@ async def _send_progress_fillers(
     *,
     initial_sent: bool,
 ) -> None:
-    """Send short spoken progress updates while slow runtime work runs."""
+    """Send at most one short progress update while slow runtime work runs."""
     stage = _processing_stage_for_text(text)
     if stage == "general":
         return
@@ -446,16 +487,10 @@ async def _send_progress_fillers(
         fillers = MEDICATION_PROGRESS_FILLERS
     else:
         fillers = GENERAL_PROGRESS_FILLERS
-    warmup_delays = (2.5, 4.0, 5.0) if initial_sent else (0.4, 3.6, 5.0)
-    repeat_delay = 7.0
-    index = 0
+    delay = 6.0 if initial_sent else 0.6
     try:
-        while True:
-            delay = warmup_delays[index] if index < len(warmup_delays) else repeat_delay
-            filler = fillers[index % len(fillers)]
-            await asyncio.sleep(delay)
-            await _send_runtime_filler(websocket, filler, stage=stage)
-            index += 1
+        await asyncio.sleep(delay)
+        await _send_runtime_filler(websocket, fillers[0], stage=stage)
     except WebSocketDisconnect:
         raise
 
@@ -472,13 +507,8 @@ async def _send_ocr_processing_filler(websocket: WebSocket) -> None:
 
 
 async def _send_ocr_progress_fillers(websocket: WebSocket) -> None:
-    warmup_delays = (2.5, 4.0, 5.0)
-    repeat_delay = 7.0
-    index = 0
     try:
-        while True:
-            delay = warmup_delays[index] if index < len(warmup_delays) else repeat_delay
-            filler = OCR_PROGRESS_FILLERS[index % len(OCR_PROGRESS_FILLERS)]
+        for delay, filler in zip((5.0, 8.0), OCR_PROGRESS_FILLERS):
             await asyncio.sleep(delay)
             await websocket.send_json(
                 {
@@ -488,7 +518,6 @@ async def _send_ocr_progress_fillers(websocket: WebSocket) -> None:
                     "stage": "ocr_processing",
                 }
             )
-            index += 1
     except WebSocketDisconnect:
         raise
 
