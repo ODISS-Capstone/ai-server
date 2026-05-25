@@ -94,8 +94,25 @@ EXCESS_DOSE_TOKENS = (
     "정해진 양보다",
     "두 알",
     "2알",
+    "두 개",
+    "두개",
+    "두 정",
+    "두정",
+    "두 캡슐",
+    "두캡슐",
+    "세 알",
+    "세알",
+    "세 개",
+    "세개",
+    "세 정",
+    "세정",
+    "여러 알",
+    "여러알",
+    "여러 개",
+    "여러개",
     "한 번에",
     "한번에",
+    "한꺼번에",
 )
 
 INGESTION_TOKENS = (
@@ -114,7 +131,7 @@ INGESTION_TOKENS = (
     "드시면",
 )
 
-MULTI_UNIT_DOSE_RE = re.compile(r"(?:[2-9]|[1-9]\d+)\s*(?:개|알|정|캡슐)")
+MULTI_UNIT_DOSE_RE = re.compile(r"(?:[2-9]|[1-9]\d+|두|세|네|다섯|여섯|일곱|여덟|아홉|여러)\s*(?:개|알|정|캡슐)")
 
 
 def classify_patient_safety_situation(text: str) -> PatientSafetySituation | None:

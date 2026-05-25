@@ -1995,3 +1995,34 @@ def test_common_medication_mistakes_use_deterministic_safety_responses(tmp_path)
     assert "missed_dose" in incidents
     assert "wrong_person_medication" in incidents
     assert "emergency_symptom_after_medication" in incidents
+
+
+def test_after_meal_guidance_prefers_current_prescription_over_recent_context(tmp_path):
+    memory = make_memory(tmp_path)
+    orchestrator = make_orchestrator(memory)
+
+    context = {
+        "user_profile": {"name": "김영수", "age": "72", "gender": "남성"},
+        "prescription_log": (
+            "# 현재 복용 약 요약\n\n"
+            "## 약품 목록\n"
+            "- 타이레놀정500밀리그람\n"
+            "- 아스피린프로텍트정100밀리그람\n"
+        ),
+        "context_memory": "- 최근 질문: 혈압약 두 개 동시에 먹어도 돼?\n",
+    }
+
+    result = run(
+        orchestrator.run_turn(
+            text="나 밥 먹었어",
+            speaker_id="meal-current-prescription-user",
+            include_judge=False,
+            include_delivery_llm=False,
+            allow_frontier_memory_fallback=False,
+            preloaded_context=context,
+        )
+    )
+
+    assert "타이레놀정500밀리그람" in result.conversation.response_text
+    assert "아스피린프로텍트정100밀리그람" in result.conversation.response_text
+    assert "혈압약" not in result.conversation.response_text
