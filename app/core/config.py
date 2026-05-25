@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     log_to_file: bool = True
     log_file_path: str = "./logs/ai-server.log"
+    app_timezone: str = "Asia/Seoul"
 
     database_url: str = "sqlite+aiosqlite:///./data/senior_med.db"
     md_database_path: str = "./data/md_database"

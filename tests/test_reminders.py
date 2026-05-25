@@ -193,3 +193,15 @@ def test_reminder_dispatch_uses_current_prescription_names(tmp_path):
     assert "점심 약 알림은 오후 12시" in confirm
     assert dispatched
     assert "점심 타이레놀정500밀리그람, 아스피린프로텍트정100밀리그람" in sent[-1]["text"]
+
+
+def test_reminder_default_timezone_is_kst_and_legacy_naive_times_are_localized():
+    service = ReminderService(start_background_tasks=False)
+    now = datetime(2026, 5, 26, 11, 59, tzinfo=service._timezone)
+
+    parsed = service._parse_datetime("2026-05-26T12:00:00", now=now)
+
+    assert service._now().utcoffset() == timedelta(hours=9)
+    assert parsed is not None
+    assert parsed.tzinfo is not None
+    assert parsed.utcoffset() == timedelta(hours=9)
