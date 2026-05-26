@@ -61,6 +61,21 @@ def test_chest_tightness_medicine_request_is_emergency_not_drug_recommendation()
     assert decision.mode == ReasoningMode.FRONTIER_FIRST
 
 
+def test_plain_sudden_chest_pain_is_emergency_not_smalltalk():
+    engine = make_reasoning()
+
+    text = "어 나 갑자기 가슴이 아파 어떡하지"
+    situation = classify_patient_safety_situation(text)
+    decision = engine.route_execution(ReasoningRouteInput(text=text, context={}))
+
+    assert situation is not None
+    assert situation.severity == "emergency"
+    assert "119" in situation.response_text
+    assert "응급실" in situation.response_text
+    assert decision.intent == IntentType.EMERGENCY
+    assert decision.mode == ReasoningMode.FRONTIER_FIRST
+
+
 def test_acetaminophen_multi_tablet_question_uses_deterministic_safety():
     engine = make_reasoning()
 

@@ -1383,8 +1383,9 @@ def _build_stored_medication_guidance_text(
                 "복용량은 약봉투나 처방전에 적힌 대로만 드세요."
             )
         if _is_after_meal_completion_signal(text):
+            meal_part = f"{meal} 식후" if meal else "식후"
             return (
-                f"{name}, 네. {meal_label}를 하셨군요. {med_text}을 드시면 됩니다. "
+                f"{name}, 네. {meal_label}를 하셨군요. {meal_part} 복용약인 {med_text}을 드시면 됩니다. "
                 "복용량은 약봉투나 처방전에 적힌 대로만 드세요. "
                 "드신 뒤에는 '먹었어'라고 말씀해 주세요."
             )
@@ -1475,12 +1476,14 @@ def _sync_wake_profile_cache_from_identity_gate(speaker_id: str | None, identity
 
 
 def _friendly_medication_label(meds: list[str]) -> str:
-    specific = [med for med in meds if med not in {"혈압약", "고혈압약", "약"}]
-    if specific:
-        return ", ".join(specific[:3])
-    if any("혈압" in med for med in meds):
-        return "혈압약"
-    return ", ".join(meds[:3]) or "저장된 약"
+    labels: list[str] = []
+    for med in meds:
+        label = "혈압약" if med == "고혈압약" else med
+        if label and label != "약" and label not in labels:
+            labels.append(label)
+    if labels:
+        return ", ".join(labels[:3])
+    return "저장된 약"
 
 
 def _meal_hint_from_text(text: str) -> str:
