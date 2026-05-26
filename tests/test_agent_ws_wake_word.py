@@ -40,6 +40,16 @@ class FakeMemoryEngine:
             "prescription_log": "# 현재 복용 약 요약\n\n## 약품 목록\n- 혈압약\n",
         }
 
+    async def load_identity_state(self, speaker_id: str) -> dict:
+        return {
+            "exists": True,
+            "profile": {
+                "name": "김영수",
+                "age": "72",
+                "gender": "남성",
+            },
+        }
+
     async def mark_identity_seen(self, speaker_id: str, *, verified: bool = False, now=None) -> dict:
         self.seen.append((speaker_id, verified))
         return {}
@@ -67,6 +77,7 @@ def setup_function() -> None:
     agent_ws._bootstrapped_speakers.clear()
     agent_ws._pending_ocr_by_speaker.clear()
     agent_ws._queued_ocr_request_by_speaker.clear()
+    agent_ws._wake_profile_cache_by_speaker.clear()
 
 
 def make_real_memory(tmp_path) -> MemoryEngine:
@@ -87,25 +98,15 @@ def test_registered_wake_word_uses_profile_and_skips_orchestrator(monkeypatch: p
     fake_memory = FakeMemoryEngine()
     websocket = FakeWebSocket()
 
-    async def fake_identity_gate(**kwargs):
-        return IdentityGateResult(
-            allowed=True,
-            reason="identity_verified",
-            metadata={
-                "profile": {
-                    "name": "김영수",
-                    "age": "72",
-                    "gender": "남성",
-                }
-            },
-        )
+    async def fail_if_identity_gate_called(**kwargs):
+        raise AssertionError("wake-word-only turn should not call the identity gate")
 
     async def fail_if_orchestrator_called(**kwargs):
         raise AssertionError("wake-word-only turn should not call the orchestrator")
 
     monkeypatch.setattr(agent_ws, "memory_engine", fake_memory)
     monkeypatch.setattr(agent_ws, "reminder_service", FakeReminderService())
-    monkeypatch.setattr(agent_ws, "evaluate_identity_gate", fake_identity_gate)
+    monkeypatch.setattr(agent_ws, "evaluate_identity_gate", fail_if_identity_gate_called)
     monkeypatch.setattr(agent_ws.engine_orchestrator, "run_turn", fail_if_orchestrator_called)
 
     run(
@@ -126,7 +127,7 @@ def test_registered_wake_word_uses_profile_and_skips_orchestrator(monkeypatch: p
     assert websocket.sent[-1]["response_text"] == "네, 김영수님. 말씀하세요."
     assert "어르신" not in websocket.sent[-1]["response_text"]
     assert "약" not in websocket.sent[-1]["response_text"]
-    assert fake_memory.seen == [("speaker-kim", True)]
+    assert fake_memory.seen == []
 
 
 def test_reminder_setup_sends_filler_before_reminder_response(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -279,48 +280,43 @@ def test_medication_reasoning_sends_filler_before_orchestrator(monkeypatch: pyte
     assert websocket.sent[-1]["response_type"] == "medical_response"
 
 
-def test_progress_fillers_continue_until_cancelled(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_progress_fillers_send_only_one_late_update(monkeypatch: pytest.MonkeyPatch) -> None:
     websocket = FakeWebSocket()
     delays: list[float] = []
 
     async def fake_sleep(delay: float) -> None:
         delays.append(delay)
-        if len(delays) >= 6:
-            raise asyncio.CancelledError()
 
     monkeypatch.setattr(agent_ws.asyncio, "sleep", fake_sleep)
 
-    with pytest.raises(asyncio.CancelledError):
-        run(
-            agent_ws._send_progress_fillers(
-                websocket,
-                "오디스, 혈압약 두 번 먹으면 더 빨리 좋아져?",
-                initial_sent=True,
-            )
+    run(
+        agent_ws._send_progress_fillers(
+            websocket,
+            "오디스, 혈압약 두 번 먹으면 더 빨리 좋아져?",
+            initial_sent=True,
         )
+    )
 
-    assert delays == [2.5, 4.0, 5.0, 7.0, 7.0, 7.0]
-    assert len(websocket.sent) == 5
+    assert delays == [6.0]
+    assert len(websocket.sent) == 1
     assert {payload["stage"] for payload in websocket.sent} == {"dur"}
     assert all(payload["type"] == "filler" for payload in websocket.sent)
-    assert len({payload["text"] for payload in websocket.sent}) >= 3
+    assert "잠시만 기다려주세요" in websocket.sent[0]["text"]
 
 
-def test_ocr_progress_fillers_continue_until_cancelled(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_ocr_progress_fillers_are_capped(monkeypatch: pytest.MonkeyPatch) -> None:
     websocket = FakeWebSocket()
     delays: list[float] = []
 
     async def fake_sleep(delay: float) -> None:
         delays.append(delay)
-        if len(delays) >= 6:
-            raise asyncio.CancelledError()
 
     monkeypatch.setattr(agent_ws.asyncio, "sleep", fake_sleep)
 
-    with pytest.raises(asyncio.CancelledError):
-        run(agent_ws._send_ocr_progress_fillers(websocket))
+    run(agent_ws._send_ocr_progress_fillers(websocket))
 
-    assert delays == [2.5, 4.0, 5.0, 7.0, 7.0, 7.0]
-    assert len(websocket.sent) == 5
+    assert delays == [5.0, 8.0]
+    assert len(websocket.sent) == 2
     assert {payload["stage"] for payload in websocket.sent} == {"ocr_processing"}
     assert all(payload["type"] == "filler" for payload in websocket.sent)
+    assert all("잠시만 기다려주세요" in payload["text"] for payload in websocket.sent)

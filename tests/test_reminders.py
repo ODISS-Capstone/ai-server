@@ -148,3 +148,60 @@ def test_reminder_setup_uses_existing_prescription_context_for_vague_forgetful_r
 
     assert "식후 복용 알림" in setup
     assert "오전 8시" in setup
+
+
+def test_reminder_dispatch_uses_current_prescription_names(tmp_path):
+    memory = make_memory(tmp_path)
+    current = datetime(2026, 5, 26, 11, 59)
+
+    def now_provider():
+        return current
+
+    sent: list[dict] = []
+    service = ReminderService(now_provider=now_provider, start_background_tasks=False)
+    service.register_connection("speaker-reminder", lambda payload: sent.append(payload))
+    prescription_log = (
+        "# 현재 복용 약 요약\n\n"
+        "## 약품 목록\n"
+        "- 타이레놀정500밀리그람\n"
+        "- 아스피린프로텍트정100밀리그람\n"
+    )
+
+    setup = run(
+        service.handle_user_text(
+            memory_engine=memory,
+            speaker_id="speaker-reminder",
+            text="밥 먹고 나서 약 먹어야 한다는 알림 추가해줘",
+            user_profile={"name": "김영수"},
+            prescription_log=prescription_log,
+        )
+    )
+    confirm = run(
+        service.handle_user_text(
+            memory_engine=memory,
+            speaker_id="speaker-reminder",
+            text="점심은 12시로 해줘",
+            user_profile={"name": "김영수"},
+            prescription_log=prescription_log,
+        )
+    )
+
+    current = datetime(2026, 5, 26, 12, 0)
+    dispatched = run(service.dispatch_due_reminders())
+
+    assert "식후 복용 알림" in setup
+    assert "점심 약 알림은 오후 12시" in confirm
+    assert dispatched
+    assert "점심 타이레놀정500밀리그람, 아스피린프로텍트정100밀리그람" in sent[-1]["text"]
+
+
+def test_reminder_default_timezone_is_kst_and_legacy_naive_times_are_localized():
+    service = ReminderService(start_background_tasks=False)
+    now = datetime(2026, 5, 26, 11, 59, tzinfo=service._timezone)
+
+    parsed = service._parse_datetime("2026-05-26T12:00:00", now=now)
+
+    assert service._now().utcoffset() == timedelta(hours=9)
+    assert parsed is not None
+    assert parsed.tzinfo is not None
+    assert parsed.utcoffset() == timedelta(hours=9)

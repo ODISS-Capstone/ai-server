@@ -2079,8 +2079,9 @@ class EngineOrchestrator:
     @classmethod
     def _medications_from_context(cls, context: dict[str, Any]) -> list[str]:
         meds = cls._medications_from_prescription_log(context.get("prescription_log", ""))
+        if meds:
+            return meds[:8]
         text_parts: list[str] = [
-            str(context.get("prescription_log") or ""),
             str(context.get("context_memory") or ""),
             str(context.get("current_manual") or ""),
             str(context.get("memory_prompt") or ""),

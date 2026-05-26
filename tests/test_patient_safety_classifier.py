@@ -73,3 +73,17 @@ def test_acetaminophen_multi_tablet_question_uses_deterministic_safety():
     assert "간 손상" in situation.response_text
     assert decision.intent == IntentType.MEDICATION_QUERY
     assert decision.mode == ReasoningMode.MEMORY_ONLY
+
+
+def test_korean_unit_count_double_blood_pressure_dose_uses_safety_route():
+    engine = make_reasoning()
+
+    text = "나 혈압약 두 개 동시에 먹어도 돼?"
+    situation = classify_patient_safety_situation(text)
+    decision = engine.route_execution(ReasoningRouteInput(text=text, context={}))
+
+    assert situation is not None
+    assert situation.key == "extra_or_double_dose"
+    assert "추가로 더 드시지" in situation.response_text
+    assert decision.intent == IntentType.MEDICATION_QUERY
+    assert decision.mode == ReasoningMode.MEMORY_ONLY

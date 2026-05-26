@@ -6,9 +6,11 @@ import inspect
 import json
 import re
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone, tzinfo
 from typing import Any, Awaitable, Callable, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from app.core.config import settings
 from app.engines.memory import MemoryEngine
 
 SendCallback = Callable[[dict[str, Any]], Awaitable[None] | None]
@@ -69,7 +71,8 @@ class ReminderService:
         now_provider: Optional[Callable[[], datetime]] = None,
         start_background_tasks: bool = True,
     ) -> None:
-        self._now = now_provider or datetime.now
+        self._timezone = self._load_timezone()
+        self._now = now_provider or (lambda: datetime.now(self._timezone))
         self._start_background_tasks = start_background_tasks
         self._callbacks: dict[str, SendCallback] = {}
         self._tasks: dict[tuple[str, str], asyncio.Task] = {}
@@ -258,7 +261,7 @@ class ReminderService:
         now = self._now()
         for schedule in list(self._active.values()):
             for meal, next_run_text in list((schedule.next_runs or {}).items()):
-                next_run = self._parse_datetime(next_run_text)
+                next_run = self._parse_datetime(next_run_text, now=now)
                 if next_run and next_run <= now:
                     payload = await self._send_reminder(schedule, meal)
                     if payload:
@@ -328,7 +331,7 @@ class ReminderService:
         if not records:
             return f"{name}, 아직 오늘 복용했다고 기록된 내용은 없습니다. 헷갈리시면 약봉투나 약통을 한 번 더 확인해 주세요."
         last = records[-1]
-        taken_at = self._parse_datetime(last.get("taken_at", "")) or self._now()
+        taken_at = self._parse_datetime(last.get("taken_at", ""), now=self._now()) or self._now()
         meal = last.get("meal") or "식후"
         medication_label = last.get("medication_label") or "약"
         return (
@@ -480,9 +483,10 @@ class ReminderService:
             schedule = self._active.get(speaker_id)
             if not schedule or not schedule.active or meal not in schedule.times:
                 return
+            now = self._now()
             next_run_text = (schedule.next_runs or {}).get(meal)
-            next_run = self._parse_datetime(next_run_text) if next_run_text else self.compute_next_run(schedule.times[meal])
-            delay = max(0.0, (next_run - self._now()).total_seconds())
+            next_run = self._parse_datetime(next_run_text, now=now) if next_run_text else self.compute_next_run(schedule.times[meal])
+            delay = max(0.0, (next_run - now).total_seconds())
             await asyncio.sleep(delay)
             await self._send_reminder(schedule, meal)
             if schedule.next_runs is None:
@@ -566,14 +570,26 @@ class ReminderService:
             return f"{meridiem} {display_hour}시 {now.minute}분"
         return f"{meridiem} {display_hour}시"
 
-    @staticmethod
-    def _parse_datetime(value: Any) -> Optional[datetime]:
+    def _parse_datetime(self, value: Any, *, now: Optional[datetime] = None) -> Optional[datetime]:
         if not value:
             return None
         try:
-            return datetime.fromisoformat(str(value))
+            parsed = datetime.fromisoformat(str(value))
         except ValueError:
             return None
+        reference = now or self._now()
+        if reference.tzinfo is not None and parsed.tzinfo is None:
+            return parsed.replace(tzinfo=self._timezone)
+        if reference.tzinfo is None and parsed.tzinfo is not None:
+            return parsed.replace(tzinfo=None)
+        return parsed
+
+    @staticmethod
+    def _load_timezone() -> tzinfo:
+        try:
+            return ZoneInfo(settings.app_timezone or "Asia/Seoul")
+        except ZoneInfoNotFoundError:
+            return timezone(timedelta(hours=9), "Asia/Seoul")
 
     @staticmethod
     def _name(user_profile: Optional[dict[str, Any]]) -> str:
@@ -616,8 +632,20 @@ class ReminderService:
 
     @staticmethod
     def _medication_label_from_context(prescription_log: str) -> str:
-        if "혈압" in prescription_log:
+        medication_names: list[str] = []
+        for line in str(prescription_log or "").splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("- "):
+                continue
+            name = stripped[2:].strip()
+            if name and name not in medication_names:
+                medication_names.append(name)
+        if any("혈압" in name for name in medication_names) or "혈압" in prescription_log:
             return "혈압약"
+        if medication_names:
+            if len(medication_names) <= 2:
+                return ", ".join(medication_names)
+            return ", ".join(medication_names[:2]) + f" 외 {len(medication_names) - 2}개 약"
         if "약품 목록" in prescription_log:
             return "식후 약"
         return "식후 약"
