@@ -51,6 +51,13 @@ COMMON_MEDICATION_NAMES = {
     "메트포르민",
     "암로디핀",
 }
+SPOKEN_MEDICATION_ALIASES = {
+    "디오반": "디오반정",
+    "타이레놀": "타이레놀",
+    "로사르탄": "로사르탄정",
+    "아스피린": "아스피린",
+    "와파린": "와파린",
+}
 
 
 class MemoryEngine:
@@ -218,6 +225,52 @@ class MemoryEngine:
             speaker_id=speaker_id,
         )
         return med_names
+
+    async def store_spoken_medication_result(
+        self,
+        text: str,
+        med_names: list[str],
+        *,
+        speaker_id: Optional[str] = None,
+    ) -> list[str]:
+        """Store medication names the user provided verbally as current meds."""
+        normalized: list[str] = []
+        for med in med_names:
+            name = self._normalize_spoken_medication_candidate(med)
+            if name and name not in normalized:
+                normalized.append(name)
+        if not normalized:
+            return []
+
+        existing_log = await self.store.read_flash("prescription_log")
+        merged = self._extract_medications_from_markdown(existing_log)
+        for name in normalized:
+            if name not in merged:
+                merged.append(name)
+
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        prescription = (
+            f"# 음성 복약 등록\n"
+            f"> 기록 시각: {now}\n"
+            f"> 입력 경로: STT 음성 약 이름 등록\n\n"
+            "## 약품 목록\n"
+            + "\n".join(f"- {name}" for name in normalized)
+            + "\n\n## 원문\n"
+            + text[:1000]
+            + "\n"
+        )
+        await self.store.save("prescriptions", prescription)
+        await self.store.write_flash(
+            "prescription_log",
+            self._format_prescription_log(merged, recorded_at=now),
+        )
+        await self.structured_memory.sync_medication_context(
+            med_names=merged,
+            dur_results=[],
+            recorded_at=now,
+            speaker_id=speaker_id,
+        )
+        return merged
 
     # ── ME_Context: 사용자 식별 및 컨텍스트 로드 ──
 
@@ -1099,6 +1152,87 @@ class MemoryEngine:
             if name and name not in normalized:
                 normalized.append(name)
         return normalized[:8]
+
+    def extract_spoken_medications_from_text(self, text: str) -> list[str]:
+        """Extract medication names from verbal current-medication registration."""
+        raw = text or ""
+        lowered = raw.lower().strip()
+        compact = re.sub(r"[\s\t\r\n.,;:!?~'\"`]+", "", lowered)
+        if not compact:
+            return []
+
+        explicit_registration = any(
+            token in lowered
+            for token in (
+                "가지고",
+                "갖고",
+                "먹고 있어",
+                "먹고있",
+                "복용 중",
+                "복용중",
+                "처방받",
+                "처방 받",
+                "받아왔",
+                "추가",
+                "등록",
+                "저장",
+                "내 약",
+            )
+        ) or any(token in compact for token in ("가지고", "갖고", "먹고있", "복용중", "처방받", "받아왔", "추가", "등록", "저장", "내약"))
+        blood_pressure_naming = "혈압" in compact and any(alias in compact for alias in SPOKEN_MEDICATION_ALIASES)
+        if not explicit_registration and not blood_pressure_naming:
+            return []
+
+        safety_question = any(
+            token in compact
+            for token in (
+                "먹어도돼",
+                "먹어도되",
+                "괜찮",
+                "문제",
+                "위험",
+                "부작용",
+                "같이먹",
+                "동시에",
+                "중단",
+                "끊어도",
+            )
+        )
+        strong_registration = any(token in compact for token in ("추가", "등록", "저장", "내약"))
+        if safety_question and not strong_registration:
+            return []
+
+        candidates: list[str] = list(extract_medication_suffix_tokens(raw))
+        for alias, canonical in SPOKEN_MEDICATION_ALIASES.items():
+            if alias in compact:
+                candidates.append(canonical)
+        for match in re.finditer(r"혈압\s*(?:약|양)?\s*([가-힣A-Za-z0-9]+)", raw):
+            candidates.append(match.group(1))
+        for match in re.finditer(r"(?:약\s*이름은|약은|먹는\s*약은|복용\s*약은)\s*([가-힣A-Za-z0-9]+)", raw):
+            candidates.append(match.group(1))
+
+        normalized: list[str] = []
+        for candidate in candidates:
+            name = self._normalize_spoken_medication_candidate(candidate)
+            if name and name not in normalized:
+                normalized.append(name)
+        return normalized[:8]
+
+    def _normalize_spoken_medication_candidate(self, raw: str) -> str:
+        name = self._normalize_medication_name(raw)
+        if not name or is_non_medication_token(name):
+            return ""
+        for alias, canonical in SPOKEN_MEDICATION_ALIASES.items():
+            if name == alias or alias in name:
+                return canonical
+        blocked = {"혈압", "혈압약", "당뇨", "당뇨약", "약", "확인", "한번", "오늘", "저녁"}
+        if name in blocked:
+            return ""
+        if any(name.endswith(suffix) for suffix in ("정", "장용정", "캡슐", "시럽")):
+            return name
+        if name in COMMON_MEDICATION_NAMES:
+            return name
+        return ""
 
     @staticmethod
     def _format_prescription_log(med_names: list[str], *, recorded_at: str) -> str:

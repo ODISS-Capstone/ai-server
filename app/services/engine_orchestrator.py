@@ -37,7 +37,11 @@ from app.services.llm import (
     classify_reasoning_route_with_llm,
     recover_medical_followup_with_llm,
 )
-from app.services.medication_extraction import is_wake_word_only, strip_wake_words
+from app.services.medication_extraction import (
+    extract_medication_suffix_tokens,
+    is_wake_word_only,
+    strip_wake_words,
+)
 from app.services.patient_safety import classify_patient_safety_situation
 from app.services.reminders import ReminderService
 
@@ -298,6 +302,339 @@ class EngineOrchestrator:
 
         query_text = self._query_text_without_wake_word(text)
 
+        profile_memory_ack = self._profile_memory_ack_turn(query_text, context)
+        if profile_memory_ack:
+            decision = ReasoningRouteDecision(
+                mode=ReasoningMode.MEMORY_ONLY,
+                intent="smalltalk",
+                rationale="profile_memory_ack",
+                tasks=[],
+            )
+            evidence = self._empty_evidence(query_text)
+            execution_results = {
+                "intent": decision.intent,
+                "query": query_text,
+                "task_results": {"profile_memory_ack": profile_memory_ack},
+                "emergency": False,
+            }
+            conversation = ConversationComposeResponse(
+                response_text=profile_memory_ack["response_text"],
+                response_type="profile_recall",
+                requires_tts=True,
+            )
+            trace_engine(
+                "CE_Response",
+                "ConversationEngine",
+                "compose_profile_memory_ack_response",
+                response_type=conversation.response_type,
+                requires_tts=conversation.requires_tts,
+            )
+            trace_engine(
+                "DeliveryLLM",
+                "QwenDelivery",
+                "skip_llm_polish",
+                status="skipped",
+                delivery_skipped_reason="profile_memory_ack",
+            )
+            return EnginePipelineResult(
+                input_data=input_data,
+                context=context,
+                identity_gate=identity_gate_info,
+                decision=decision,
+                evidence=evidence,
+                execution_results=execution_results,
+                filler_text="",
+                core_message=conversation.response_text,
+                judge_review={},
+                reviewed_message=conversation.response_text,
+                delivery_message=conversation.response_text,
+                conversation=conversation,
+                engine_trace=engine_trace,
+                memory_trace=memory_trace,
+                tool_trace=tool_trace,
+            )
+
+        medication_safety_turn = self._handle_medication_safety_question_turn(
+            text=query_text,
+            context=context,
+            trace_engine=trace_engine,
+        )
+        if medication_safety_turn:
+            response_text = medication_safety_turn["response_text"]
+            decision = ReasoningRouteDecision(
+                mode=ReasoningMode.MEMORY_ONLY,
+                intent="medication_query",
+                rationale="medication_safety_fast_path",
+                tasks=[],
+            )
+            evidence = self._empty_evidence(query_text)
+            execution_results = {
+                "intent": decision.intent,
+                "query": query_text,
+                "task_results": {"medication_safety_fast_path": medication_safety_turn},
+                "emergency": False,
+            }
+            conversation = ConversationComposeResponse(
+                response_text=response_text,
+                response_type="medical_response",
+                requires_tts=True,
+            )
+            trace_engine(
+                "RE_Intent",
+                "ReasoningEngine",
+                "medication_safety_fast_path",
+                mode=decision.mode.value,
+                intent=decision.intent,
+            )
+            trace_engine(
+                "ME_RAG",
+                "MemoryEngine",
+                "prepare_evidence_bundle",
+                status="skipped",
+                reason="medication_safety_fast_path",
+            )
+            trace_engine(
+                "DeliveryLLM",
+                "QwenDelivery",
+                "skip_llm_polish",
+                status="skipped",
+                delivery_skipped_reason="medication_safety_fast_path",
+            )
+            return EnginePipelineResult(
+                input_data=input_data,
+                context=context,
+                identity_gate=identity_gate_info,
+                decision=decision,
+                evidence=evidence,
+                execution_results=execution_results,
+                filler_text="",
+                core_message=response_text,
+                judge_review={},
+                reviewed_message=response_text,
+                delivery_message=response_text,
+                conversation=conversation,
+                engine_trace=engine_trace,
+                memory_trace=memory_trace,
+                tool_trace=tool_trace,
+            )
+
+        spoken_medications = self._extract_spoken_medications_from_text(query_text)
+        if spoken_medications:
+            merged_medications = await self._store_spoken_medication_context(
+                text=query_text,
+                med_names=spoken_medications,
+                speaker_id=speaker_id,
+            )
+            if merged_medications:
+                context = await self._refresh_context_from_flash(
+                    speaker_id=speaker_id,
+                    context=context,
+                    trace_engine=trace_engine,
+                    trace_memory=trace_memory,
+                    reason="spoken_medication_registration",
+                )
+                response_text = self._spoken_medication_registration_response(
+                    merged_medications,
+                    context,
+                )
+                decision = ReasoningRouteDecision(
+                    mode=ReasoningMode.MEMORY_ONLY,
+                    intent="medication_query",
+                    rationale="spoken_medication_registration",
+                    tasks=[],
+                )
+                evidence = self._empty_evidence(query_text)
+                execution_results = {
+                    "intent": decision.intent,
+                    "query": query_text,
+                    "task_results": {
+                        "spoken_medication_registration": {
+                            "medications": merged_medications,
+                        }
+                    },
+                    "emergency": False,
+                }
+                conversation = ConversationComposeResponse(
+                    response_text=response_text,
+                    response_type="medication_query",
+                    requires_tts=True,
+                )
+                trace_engine(
+                    "ME_Update",
+                    "MemoryEngine",
+                    "store_spoken_medication_registration",
+                    medications=merged_medications,
+                )
+                trace_memory("write", "Prescription.md", category="prescriptions", path="permanent/prescriptions/*/*.md")
+                trace_memory("write", "PrescriptionLog.md", category="prescription_log", path="flash/prescription_log.md")
+                trace_engine(
+                    "DeliveryLLM",
+                    "QwenDelivery",
+                    "skip_llm_polish",
+                    status="skipped",
+                    delivery_skipped_reason="spoken_medication_registration",
+                )
+                return EnginePipelineResult(
+                    input_data=input_data,
+                    context=context,
+                    identity_gate=identity_gate_info,
+                    decision=decision,
+                    evidence=evidence,
+                    execution_results=execution_results,
+                    filler_text="",
+                    core_message=response_text,
+                    judge_review={},
+                    reviewed_message=response_text,
+                    delivery_message=response_text,
+                    conversation=conversation,
+                    engine_trace=engine_trace,
+                    memory_trace=memory_trace,
+                    tool_trace=tool_trace,
+                )
+
+        stored_guidance_turn = self._handle_stored_medication_guidance_turn(
+            text=query_text,
+            context=context,
+            trace_engine=trace_engine,
+        )
+        if stored_guidance_turn:
+            response_text = stored_guidance_turn["response_text"]
+            decision = ReasoningRouteDecision(
+                mode=ReasoningMode.MEMORY_ONLY,
+                intent="medication_query",
+                rationale=stored_guidance_turn["rationale"],
+                tasks=[],
+            )
+            evidence = self._empty_evidence(query_text)
+            execution_results = {
+                "intent": decision.intent,
+                "query": query_text,
+                "task_results": {"stored_medication_guidance": stored_guidance_turn},
+                "emergency": False,
+            }
+            conversation = ConversationComposeResponse(
+                response_text=response_text,
+                response_type="medical_response",
+                requires_tts=True,
+            )
+            trace_engine(
+                "CE_Response",
+                "ConversationEngine",
+                "compose_stored_medication_guidance_response",
+                response_type=conversation.response_type,
+                requires_tts=conversation.requires_tts,
+            )
+            trace_engine(
+                "RE_Intent",
+                "LocalLLM",
+                "skip_route_classification",
+                status="skipped",
+                route_skipped_reason=stored_guidance_turn["rationale"],
+            )
+            trace_engine(
+                "DeliveryLLM",
+                "QwenDelivery",
+                "skip_llm_polish",
+                status="skipped",
+                delivery_skipped_reason="stored_medication_guidance",
+            )
+            return EnginePipelineResult(
+                input_data=input_data,
+                context=context,
+                identity_gate=identity_gate_info,
+                decision=decision,
+                evidence=evidence,
+                execution_results=execution_results,
+                filler_text="",
+                core_message=response_text,
+                judge_review={},
+                reviewed_message=response_text,
+                delivery_message=response_text,
+                conversation=conversation,
+                engine_trace=engine_trace,
+                memory_trace=memory_trace,
+                tool_trace=tool_trace,
+            )
+
+        fast_smalltalk_checker = getattr(self.conversation, "fast_smalltalk_type", None)
+        fast_smalltalk_type = fast_smalltalk_checker(query_text) if callable(fast_smalltalk_checker) else None
+        if fast_smalltalk_type:
+            response_builder = getattr(self.conversation, "build_smalltalk_fast_response", None)
+            response_text = (
+                response_builder(query_text, context.get("user_profile") or {})
+                if callable(response_builder)
+                else "안녕하세요. 무엇을 도와드릴까요?"
+            )
+            decision = ReasoningRouteDecision(
+                mode=ReasoningMode.MEMORY_ONLY,
+                intent="smalltalk",
+                rationale="smalltalk_detected",
+                tasks=[],
+            )
+            evidence = self._empty_evidence(query_text)
+            execution_results = {
+                "intent": decision.intent,
+                "query": query_text,
+                "task_results": {"smalltalk_fast_path": {"type": fast_smalltalk_type}},
+                "emergency": False,
+            }
+            conversation = ConversationComposeResponse(
+                response_text=response_text,
+                response_type="smalltalk",
+                requires_tts=True,
+            )
+            trace_engine(
+                "RE_Intent",
+                "ReasoningEngine",
+                "smalltalk_fast_path",
+                mode=decision.mode.value,
+                intent=decision.intent,
+                smalltalk_type=fast_smalltalk_type,
+            )
+            trace_engine(
+                "ME_RAG",
+                "MemoryEngine",
+                "prepare_evidence_bundle",
+                status="skipped",
+                reason="smalltalk_fast_path",
+            )
+            trace_engine(
+                "DeliveryLLM",
+                "QwenDelivery",
+                "skip_llm_polish",
+                status="skipped",
+                delivery_skipped_reason="smalltalk_fast_path",
+            )
+            trace_engine(
+                "CE_Response",
+                "ConversationEngine",
+                "compose_smalltalk_fast_response",
+                response_type=conversation.response_type,
+                requires_tts=conversation.requires_tts,
+            )
+            logger.info(
+                "[EnginePipeline] smalltalk_fast_path type=%s elapsed_ms=%.1f",
+                fast_smalltalk_type,
+                (perf_counter() - turn_started) * 1000,
+            )
+            return EnginePipelineResult(
+                input_data=input_data,
+                context=context,
+                identity_gate=identity_gate_info,
+                decision=decision,
+                evidence=evidence,
+                execution_results=execution_results,
+                filler_text="",
+                core_message=response_text,
+                judge_review={},
+                reviewed_message=response_text,
+                delivery_message=response_text,
+                conversation=conversation,
+                engine_trace=engine_trace,
+                memory_trace=memory_trace,
+                tool_trace=tool_trace,
+            )
+
         medication_memory_turn = await self._handle_direct_medication_taken_turn(
             text=query_text,
             speaker_id=speaker_id,
@@ -402,15 +739,27 @@ class EngineOrchestrator:
             )
 
         stage_started = perf_counter()
-        llm_route = await self._classify_route_with_local_llm(text=query_text, context=context)
-        decision = self._decision_from_llm_route(llm_route, query_text) or self.reasoning.route_execution(
-            ReasoningRouteInput(
-                text=query_text,
-                speaker_id=speaker_id,
-                is_smalltalk=input_data.get("is_smalltalk", False),
-                context=context,
-            )
+        route_input = ReasoningRouteInput(
+            text=query_text,
+            speaker_id=speaker_id,
+            is_smalltalk=input_data.get("is_smalltalk", False),
+            context=context,
         )
+        deterministic_decision = self.reasoning.route_execution(route_input)
+        deterministic_route_reason = self._deterministic_route_preference_reason(deterministic_decision)
+        llm_route: dict[str, Any] = {}
+        if deterministic_route_reason:
+            decision = deterministic_decision
+            trace_engine(
+                "RE_Intent",
+                "LocalLLM",
+                "skip_route_classification",
+                status="skipped",
+                route_skipped_reason=deterministic_route_reason,
+            )
+        else:
+            llm_route = await self._classify_route_with_local_llm(text=query_text, context=context)
+            decision = self._decision_from_llm_route(llm_route, query_text) or deterministic_decision
         trace_engine(
             "RE_Intent",
             "ReasoningEngine",
@@ -418,8 +767,15 @@ class EngineOrchestrator:
             mode=decision.mode.value,
             intent=decision.intent,
             task_types=[task.type for task in decision.tasks],
-            source="local_llm" if llm_route.get("usable") else "deterministic_fallback",
+            source=(
+                "deterministic_fast_path"
+                if deterministic_route_reason
+                else "local_llm"
+                if llm_route.get("usable")
+                else "deterministic_fallback"
+            ),
             route_label=llm_route.get("route_label", ""),
+            route_skipped_reason=deterministic_route_reason,
         )
         logger.info(
             "[ReasoningEngine] route_decided mode=%s intent=%s tasks=%d rationale=%s elapsed_ms=%.1f",
@@ -695,7 +1051,12 @@ class EngineOrchestrator:
 
         judge_review: dict[str, Any] = {}
         reviewed_message = core_message
-        skip_llm_polish = self._skip_llm_polish(text=query_text, decision=decision)
+        skip_llm_polish_reason = self._llm_polish_skip_reason(
+            text=query_text,
+            decision=decision,
+            core_message=core_message,
+        )
+        skip_llm_polish = bool(skip_llm_polish_reason)
         should_run_judge = (
             include_judge
             and core_message
@@ -750,6 +1111,19 @@ class EngineOrchestrator:
                 "[DeliveryLLM] message_rewritten chars=%d elapsed_ms=%.1f",
                 len(delivery_message or ""),
                 (perf_counter() - stage_started) * 1000,
+            )
+        elif skip_llm_polish_reason:
+            trace_engine(
+                "DeliveryLLM",
+                "QwenDelivery",
+                "skip_llm_polish",
+                status="skipped",
+                delivery_skipped_reason=skip_llm_polish_reason,
+            )
+            logger.info(
+                "[DeliveryLLM] skipped reason=%s chars=%d",
+                skip_llm_polish_reason,
+                len(delivery_message or ""),
             )
 
         stage_started = perf_counter()
@@ -857,6 +1231,34 @@ class EngineOrchestrator:
             conversation_context=conversation_context,
             user_profile=context.get("user_profile") or {},
         )
+
+    @staticmethod
+    def _deterministic_route_preference_reason(decision: ReasoningRouteDecision) -> str:
+        """Keep high-confidence local rules ahead of slower LLM route selection."""
+        rationale = str(getattr(decision, "rationale", "") or "")
+        if rationale.startswith("deterministic_patient_safety:"):
+            return "patient_safety_fast_path"
+        fast_rationales = {
+            "empty_user_input",
+            "profile_identity_recall",
+            "ocr_result_requires_prescription_logging",
+            "medication_memory_recall_available",
+            "smalltalk_detected",
+            "out_of_scope_smalltalk_suppressed",
+            "emergency_policy_first",
+            "ocr_capture_requested",
+            "stored_medication_meal_guidance",
+            "meal_guidance_missing_medication_context",
+            "medication_record_memory_write",
+            "generic_blood_pressure_medication_overview",
+            "stored_medication_record_recall",
+            "medication_safety_fast_path",
+        }
+        if rationale in fast_rationales:
+            return rationale
+        if getattr(decision, "mode", None) == ReasoningMode.ASK_USER_CLARIFY:
+            return "clarify_fast_path"
+        return ""
 
     async def _classify_route_with_local_llm(
         self,
@@ -1139,6 +1541,13 @@ class EngineOrchestrator:
         if safety:
             return safety.response_text
 
+        if self._is_medication_safety_question_request(text):
+            return self._build_medication_safety_question_text(
+                text,
+                self._medications_for_safety_question(text, context),
+                context,
+            )
+
         if profile and self._is_profile_recall(text):
             name = profile.get("name") or "등록된 사용자"
             age = profile.get("age") or ""
@@ -1328,27 +1737,101 @@ class EngineOrchestrator:
         return ""
 
     @staticmethod
-    def _skip_llm_polish(*, text: str, decision: Any) -> bool:
-        lowered = text.lower()
-        if decision.mode == ReasoningMode.ASK_USER_CLARIFY:
-            return True
-        if decision.intent == "emergency":
-            return True
+    def _llm_polish_skip_reason(
+        *,
+        text: str,
+        decision: Any,
+        core_message: str = "",
+    ) -> str:
+        rationale = str(getattr(decision, "rationale", "") or "").lower()
+        intent = str(getattr(decision, "intent", "") or "").lower()
+        mode = getattr(decision, "mode", None)
+        task_types = {
+            str(getattr(task, "type", "") or "").lower()
+            for task in getattr(decision, "tasks", []) or []
+        }
+
+        if mode == ReasoningMode.ASK_USER_CLARIFY:
+            return "clarify_fast_path"
+        if intent == "smalltalk" or rationale == "smalltalk_detected":
+            return "smalltalk_fast_path"
         if is_profile_recall_query(text):
-            return True
-        return any(
-            token in lowered
-            for token in (
-                "ocr 결과",
-                "dur 기준",
-                "복용지도를 계획",
-                "복용 계획",
-                "복약 계획",
-                "복약 안내",
-                "약 알림",
-                "읽힌 처방",
-            )
+            return "profile_recall_fast_path"
+        if (
+            intent == "emergency"
+            or "emergency" in task_types
+            or "emergency" in rationale
+        ):
+            return "emergency_fast_path"
+        if rationale.startswith("deterministic_patient_safety:") or classify_patient_safety_situation(text):
+            return "patient_safety_fast_path"
+
+        if "ocr_capture_requested" in rationale or "request_ocr" in task_types:
+            return "ocr_capture_fast_path"
+
+        fast_rationales = (
+            "stored_medication_meal_guidance",
+            "stored_medication_vague_guidance",
+            "medication_record_memory_write",
+            "stored_medication_record_recall",
+            "stored_medication_list_recall",
+            "medication_intent_to_take",
+            "contextual_uncertain_taken",
+            "medication_taken_recall",
+            "medication_taken_record",
+            "medication_taken_time_correction",
+            "medication_safety_fast_path",
         )
+        if rationale in fast_rationales:
+            return "medication_memory_fast_path"
+
+        route_fast_labels = (
+            "local_llm_route:meal_medication_prep",
+            "local_llm_route:after_meal_medication",
+            "local_llm_route:medication_record",
+            "local_llm_route:medication_taken_recall",
+            "local_llm_route:medication_safety_query",
+            "local_llm_route:drug_identification",
+            "local_llm_route:ocr_capture",
+            "local_llm_route:ocr_result",
+        )
+        if rationale in route_fast_labels:
+            return "reasoning_route_fast_path"
+
+        tool_fast_tasks = {
+            "dur_check",
+            "dur_product_info",
+            "hira_lookup",
+            "request_ocr",
+        }
+        if task_types & tool_fast_tasks:
+            return "tool_safety_fast_path"
+
+        haystack = f"{text}\n{core_message}".lower()
+        safety_terms = (
+            "119",
+            "응급",
+            "타이레놀",
+            "아세트아미노펜",
+            "간 손상",
+            "중복",
+            "과량",
+            "임의로",
+            "의사",
+            "약사",
+            "복용 기록",
+            "약봉투",
+            "처방전",
+            "dur",
+        )
+        if intent in {"medication_query", "drug_identification"} and any(term in haystack for term in safety_terms):
+            return "medication_safety_fast_path"
+
+        return ""
+
+    @staticmethod
+    def _skip_llm_polish(*, text: str, decision: Any) -> bool:
+        return bool(EngineOrchestrator._llm_polish_skip_reason(text=text, decision=decision))
 
     @staticmethod
     def _requires_frontier_final_review(text: str, decision: Any, core_message: str) -> bool:
@@ -1589,6 +2072,257 @@ class EngineOrchestrator:
             engine("CE_Response", "ConversationEngine", "CE_Response.emergency_tts CE_Response.requires_tts_true")
             engine("ME_Update", "MemoryEngine", "ME_Update.MedicationLog.md")
 
+    def _profile_memory_ack_turn(self, text: str, context: dict[str, Any]) -> dict[str, Any]:
+        if not self._is_profile_memory_ack_text(text):
+            return {}
+        profile = context.get("user_profile") or {}
+        name = str(profile.get("name") or "").strip()
+        age = str(profile.get("age") or "").strip()
+        gender = str(profile.get("gender") or "").strip()
+        if not name:
+            response = "아직 등록된 이름이 없습니다. 이름, 나이, 성별을 말씀해 주시면 기억하겠습니다."
+        else:
+            details = []
+            if gender:
+                details.append(gender)
+            if age:
+                details.append(f"{age}세")
+            detail_text = f" ({', '.join(details)})" if details else ""
+            response = f"네, {name}님{detail_text}으로 기억하고 있습니다."
+        return {
+            "rationale": "profile_memory_ack",
+            "response_text": response,
+        }
+
+    @staticmethod
+    def _is_profile_memory_ack_text(text: str) -> bool:
+        compact = re.sub(r"[\s.?!,，。~]+", "", (text or "").strip().lower())
+        if not compact:
+            return False
+        if not any(token in compact for token in ("기억해줘", "기억해", "기억하고있", "잘기억")):
+            return False
+        if any(
+            token in compact
+            for token in (
+                "약",
+                "복용",
+                "처방",
+                "먹",
+                "타이레놀",
+                "디오반",
+                "혈압",
+                "당뇨",
+                "알림",
+                "알람",
+                "기록",
+                "사진",
+                "ocr",
+            )
+        ):
+            return False
+        return True
+
+    def _handle_medication_safety_question_turn(
+        self,
+        *,
+        text: str,
+        context: dict[str, Any],
+        trace_engine: Any,
+    ) -> dict[str, Any]:
+        if classify_patient_safety_situation(text):
+            return {}
+        if not self._is_medication_safety_question_request(text):
+            return {}
+        meds = self._medications_for_safety_question(text, context)
+        trace_engine("RE_Intent", "ReasoningEngine", "medication_safety_question_detected")
+        return {
+            "rationale": "medication_safety_fast_path",
+            "response_text": self._build_medication_safety_question_text(text, meds, context),
+            "medications": meds,
+        }
+
+    @staticmethod
+    def _compact_text(text: str) -> str:
+        return re.sub(r"[\s\t\r\n.,;:!?~'\"`，。]+", "", (text or "").strip().lower())
+
+    @classmethod
+    def _is_medication_safety_question_request(cls, text: str) -> bool:
+        cleaned = strip_wake_words(text)
+        compact = cls._compact_text(cleaned)
+        if not compact:
+            return False
+        if any(token in compact for token in ("알림", "알람", "예약", "깨워", "설정", "기록해", "먹었다고")):
+            return False
+        med_signal = (
+            "약" in compact
+            or "복용" in compact
+            or bool(extract_medication_suffix_tokens(cleaned))
+            or any(token in compact for token in ("타이레놀", "아세트아미노펜", "디오반", "와파린", "아스피린"))
+        )
+        if not med_signal:
+            return False
+        safety_signal = any(
+            token in compact
+            for token in (
+                "먹어도돼",
+                "먹어도되",
+                "먹어도될까",
+                "먹어도되나",
+                "먹어도괜찮",
+                "복용해도돼",
+                "복용해도되",
+                "괜찮",
+                "문제없",
+                "위험",
+                "부작용",
+                "같이먹",
+                "함께먹",
+                "동시에",
+                "한번에",
+                "한꺼번에",
+                "여러알",
+                "많이먹",
+                "더먹",
+                "중복",
+                "겹쳐먹",
+                "두개",
+                "2개",
+                "세개",
+                "3개",
+                "네개",
+                "내게",
+                "4개",
+            )
+        )
+        return safety_signal and any(token in compact for token in ("먹", "복용", "삼켜", "드셔", "먹어도", "복용해도"))
+
+    @classmethod
+    def _medications_for_safety_question(cls, text: str, context: dict[str, Any]) -> list[str]:
+        cleaned = strip_wake_words(text)
+        compact = cls._compact_text(cleaned)
+        stored = cls._medications_from_context(context)
+        meds: list[str] = []
+
+        for med in stored:
+            normalized = cls._compact_text(med)
+            stem = normalized[:-1] if normalized.endswith("정") else normalized
+            if normalized and (normalized in compact or (len(stem) >= 2 and stem in compact)):
+                meds.append(med)
+
+        for med in extract_medication_suffix_tokens(cleaned):
+            if med not in meds:
+                meds.append(med)
+
+        for name in ("타이레놀", "아세트아미노펜", "혈압약", "고혈압약", "당뇨약", "와파린", "아스피린"):
+            if name in compact and name not in meds:
+                meds.append(name)
+
+        if not meds:
+            meds.extend(stored[:3])
+        return meds[:5]
+
+    @classmethod
+    def _build_medication_safety_question_text(
+        cls,
+        text: str,
+        meds: list[str],
+        context: dict[str, Any],
+    ) -> str:
+        name = cls._display_name(context.get("user_profile") or {})
+        med_text = cls._friendly_medication_label(meds) if meds else "그 약"
+        compact = cls._compact_text(strip_wake_words(text))
+        other_med_signal = any(token in compact for token in ("다른약", "같이먹", "함께먹", "병용", "상호작용"))
+        multi_dose_signal = any(
+            token in compact
+            for token in (
+                "동시에",
+                "한번에",
+                "한꺼번에",
+                "여러알",
+                "많이먹",
+                "더먹",
+                "중복",
+                "두개",
+                "2개",
+                "세개",
+                "3개",
+                "네개",
+                "내게",
+                "4개",
+            )
+        )
+        if other_med_signal and not multi_dose_signal:
+            return (
+                f"{name}, {med_text}을 다른 약과 같이 드셔도 되는지는 같이 드시려는 약 이름이 필요합니다. "
+                "확인 전에는 임의로 같이 드시지 말고, 약봉투나 처방전을 들고 의사나 약사에게 먼저 확인해 주세요."
+            )
+        return (
+            f"{name}, {med_text}은 처방된 양보다 한 번에 더 드시면 위험할 수 있습니다. "
+            "지금 여러 알을 동시에 드시려는 상황이면 드시지 말고, 약봉투에 적힌 1회 복용량을 먼저 확인해 주세요. "
+            "이미 많이 드셨거나 어지러움, 심한 저혈압 느낌, 실신할 것 같은 증상이 있으면 119나 응급실에 연락하세요."
+        )
+
+    def _handle_stored_medication_guidance_turn(
+        self,
+        *,
+        text: str,
+        context: dict[str, Any],
+        trace_engine: Any,
+    ) -> dict[str, Any]:
+        if classify_patient_safety_situation(text):
+            return {}
+        meds = self._medications_from_context(context)
+        if not meds:
+            return {}
+        if not self._is_stored_medication_guidance_request(text, meds):
+            return {}
+        med_text = self._friendly_medication_label(meds)
+        name = self._display_name(context.get("user_profile") or {})
+        compact = re.sub(r"\s+", "", text or "")
+        trace_engine("ME_RAG", "MemoryEngine", "stored_medication_guidance")
+        if self._is_meal_medication_prep_request(text) or self._is_after_meal_medication_request(text):
+            meal = self._meal_hint_from_text(text)
+            meal_part = f"{meal} 식사 후" if meal else "식사 후"
+            return {
+                "rationale": "stored_medication_meal_guidance",
+                "response_text": (
+                    f"{name}, 현재 기록 기준으로 저장된 약은 {med_text}입니다. "
+                    f"밥을 드신 뒤, 약봉투나 처방전에 식후, 즉 {meal_part} 복용으로 적혀 있다면 정해진 양만 물과 함께 드세요. "
+                    "이미 드셨거나 헷갈리면 한 번 더 드시지 말고 약봉투나 약통을 먼저 확인해 주세요."
+                ),
+                "medications": meds,
+            }
+        return {
+            "rationale": "stored_medication_vague_guidance",
+            "response_text": (
+                f"{name}, 현재 저장된 약은 {med_text}입니다. "
+                "오늘 드셔야 하는지와 시간은 약봉투나 처방전에 적힌 복용법을 기준으로 확인해야 합니다. "
+                "복용 시간이 맞고 아직 안 드셨다면 정해진 양만 드세요. 이미 드셨거나 헷갈리면 한 번 더 드시지 마세요."
+            ),
+            "medications": meds,
+        }
+
+    @staticmethod
+    def _is_stored_medication_guidance_request(text: str, meds: list[str] | None = None) -> bool:
+        compact = re.sub(r"[\s.?!,，。~]+", "", (text or "").strip().lower())
+        if not compact:
+            return False
+        if any(token in compact for token in ("알림", "알람", "예약", "깨워", "설정", "추가")):
+            return False
+        if any(token in compact for token in ("먹어도돼", "먹어도되", "같이먹", "동시에", "많이먹", "네개", "4개")):
+            return False
+        if any(token in compact for token in ("밥먹었", "식사했", "식사끝", "식후", "저녁먹었", "점심먹었", "아침먹었", "잘먹었", "잘먹었습니다", "잘먹음")):
+            return True
+        if "그거" in compact and any(token in compact for token in ("먹어야", "먹나", "먹으면", "먹을까")):
+            return True
+        for med in meds or []:
+            normalized_med = re.sub(r"\s+", "", med.lower())
+            if normalized_med and normalized_med in compact and "먹어야" in compact:
+                return True
+        if "먹어야" in compact and not any(token in compact for token in ("밥먹어야", "식사해야", "물먹어야")):
+            return True
+        return "오늘" in compact and "먹어야" in compact and ("약" in compact or "그거" in compact)
+
     async def _handle_direct_medication_taken_turn(
         self,
         *,
@@ -1613,6 +2347,19 @@ class EngineOrchestrator:
                 ),
                 "action": "uncertain_taken",
             }
+        if ReminderService.is_taken_time_correction(text):
+            response_text = await self._correct_last_medication_taken_time(
+                text=text,
+                speaker_id=speaker_id,
+                context=context,
+            )
+            trace_engine("ME_Update", "MemoryEngine", "correct_medication_taken_time")
+            trace_memory("write", "MedicationTaken.md", category="medication_taken", path=f"patients/{speaker_id}/medication_taken.md")
+            return {
+                "rationale": "medication_taken_time_correction",
+                "response_text": response_text,
+                "action": "correct_time",
+            }
         if self._is_medication_taken_recall_text(text):
             response_text = await self._recall_last_medication_taken(
                 speaker_id=speaker_id,
@@ -1629,13 +2376,32 @@ class EngineOrchestrator:
             meds = self._medications_from_context(context)
             if meds:
                 med_text = self._friendly_medication_label(meds)
+                compact = re.sub(r"[\s.?!,，。~]+", "", (text or "").strip().lower())
+                suffix = (
+                    " 그 외에 추가로 저장된 약은 없습니다. 새 약이 있으면 약 이름을 말씀해 주세요."
+                    if ("그거말고" in compact or "다른" in compact) and len(meds) <= 1
+                    else " 정확한 복용 시간과 양은 약봉투나 처방전에 적힌 내용을 기준으로 확인해 주세요."
+                )
                 return {
                     "rationale": "stored_medication_list_recall",
                     "response_text": (
-                        f"{self._display_name(context.get('user_profile') or {})}, 현재 기록에는 {med_text}이 저장되어 있습니다. "
-                        "정확한 복용 시간과 양은 약봉투나 처방전에 적힌 내용을 기준으로 확인해 주세요."
+                        f"{self._display_name(context.get('user_profile') or {})}, 현재 기록에는 {med_text}이 저장되어 있습니다."
+                        + suffix
                     ),
                     "action": "list_current_medications",
+                }
+        if self._is_medication_intent_to_take_text(text):
+            meds = self._medications_from_context(context)
+            if meds:
+                med_text = self._friendly_medication_label(meds)
+                return {
+                    "rationale": "medication_intent_to_take",
+                    "response_text": (
+                        f"네, {self._display_name(context.get('user_profile') or {})}. 현재 저장된 약은 {med_text}입니다. "
+                        "약봉투나 처방전에 적힌 복용 시간이 맞다면 정해진 양만 물과 함께 드세요. "
+                        "드신 뒤에는 '먹었어'라고 말씀하시면 복용 기록으로 남겨둘게요."
+                    ),
+                    "action": "intent_to_take",
                 }
         if self._is_medication_taken_confirmation_text(text):
             response_text = await self._record_direct_medication_taken(
@@ -1747,12 +2513,18 @@ class EngineOrchestrator:
         compact = re.sub(r"\s+", "", lowered)
         if not compact:
             return False
-        if any(token in compact for token in ("기록", "어제", "그제", "시간", "언제", "몇시")):
+        if any(token in compact for token in ("어제", "그제", "시간", "언제", "몇시")):
+            return False
+        if "기록" in compact and "기록된" not in compact:
             return False
         if any(token in compact for token in ("밥", "식사", "식후", "아침", "점심", "저녁")) and "먹" in compact:
             return False
         if any(token in compact for token in ("먹어도", "괜찮", "두번", "2번", "위험", "문제", "부작용")):
             return False
+        list_signal = any(token in compact for token in ("저장된", "등록된", "기록된", "목록", "뭐있", "뭐가있", "다른약", "그거말고"))
+        query_signal = any(token in compact for token in ("있나", "있어", "뭐", "뭐야", "알려", "확인", "보여"))
+        if list_signal and query_signal:
+            return True
         if "약" not in compact and "처방" not in compact:
             return False
         return any(
@@ -1771,6 +2543,15 @@ class EngineOrchestrator:
                 "뭘먹고",
             )
         )
+
+    @staticmethod
+    def _is_medication_intent_to_take_text(text: str) -> bool:
+        compact = re.sub(r"[\s.?!,，。~]+", "", (text or "").strip().lower())
+        if not compact:
+            return False
+        if any(token in compact for token in ("먹었", "복용했", "기록", "먹어도", "괜찮", "위험", "부작용")):
+            return False
+        return any(token in compact for token in ("지금먹을게", "지금먹을께", "먹을게", "먹을께", "먹겠습니다", "먹을게요"))
 
     def _is_contextual_medication_uncertainty_text(self, text: str, context: dict[str, Any]) -> bool:
         if not self._medications_from_context(context):
@@ -1849,8 +2630,9 @@ class EngineOrchestrator:
         content += "- " + json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
         await self.memory.store.save_user_file(speaker_id, "medication_taken.md", content)
         name = self._display_name(profile)
+        taken_phrase = self._format_taken_medication_phrase(meal, label)
         return (
-            f"알겠습니다. {name}, 오늘 {meal} {label}을 복용한 것으로 기록해두겠습니다. "
+            f"알겠습니다. {name}, 오늘 {taken_phrase}을 복용한 것으로 기록해두겠습니다. "
             "나중에 헷갈리시면 '아까 약 먹었나?'라고 물어보세요."
         )
 
@@ -1871,10 +2653,44 @@ class EngineOrchestrator:
         last = records[-1]
         meal = str(last.get("meal") or "식후")
         label = str(last.get("medication_label") or "약")
+        taken_at = self._parse_taken_datetime(last.get("taken_at"))
+        taken_time = (
+            ReminderService._display_record_datetime(taken_at, now=datetime.now())
+            if taken_at
+            else "오늘"
+        )
+        taken_phrase = self._format_taken_medication_phrase(meal, label)
         return (
-            f"확인해보겠습니다. {name}은 오늘 {meal} {label}을 복용했다고 기록되어 있습니다. "
+            f"확인해보겠습니다. {name}은 {taken_time}에 {taken_phrase}을 복용했다고 기록되어 있습니다. "
             "그래도 실제 복용 여부가 헷갈리시면 약통이나 약봉투를 한 번 더 확인해 주세요."
         )
+
+    async def _correct_last_medication_taken_time(
+        self,
+        *,
+        text: str,
+        speaker_id: str,
+        context: dict[str, Any],
+    ) -> str:
+        profile = context.get("user_profile") or {}
+        name = self._display_name(profile)
+        records = await self._load_taken_records(speaker_id)
+        if not records:
+            return f"{name}, 수정할 복용 기록을 찾지 못했습니다. 방금 드셨다면 '먹었어'라고 말씀해 주세요."
+        corrected_at = ReminderService._parse_taken_time_correction(text, now=datetime.now())
+        if not corrected_at:
+            return f"{name}, 몇 시 몇 분으로 고칠지 다시 말씀해 주세요."
+        records[-1]["taken_at"] = corrected_at.isoformat(timespec="seconds")
+        records[-1]["time_corrected_from_text"] = text
+        content = "\n".join("- " + json.dumps(record, ensure_ascii=False, sort_keys=True) for record in records)
+        if content:
+            content += "\n"
+        await self.memory.store.save_user_file(speaker_id, "medication_taken.md", content)
+        meal = str(records[-1].get("meal") or "식후")
+        label = str(records[-1].get("medication_label") or "약")
+        taken_phrase = self._format_taken_medication_phrase(meal, label)
+        taken_time = ReminderService._display_record_datetime(corrected_at, now=datetime.now())
+        return f"알겠습니다. {name}의 {taken_phrase} 복용 시간을 {taken_time}으로 수정했습니다."
 
     async def _load_taken_records(self, speaker_id: str) -> list[dict[str, Any]]:
         content = await self.memory.store.read_user_file(speaker_id, "medication_taken.md")
@@ -1890,6 +2706,15 @@ class EngineOrchestrator:
             if isinstance(payload, dict):
                 records.append(payload)
         return records
+
+    @staticmethod
+    def _parse_taken_datetime(value: Any) -> datetime | None:
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(str(value))
+        except ValueError:
+            return None
 
     @staticmethod
     def _recent_dialog_context(context: dict[str, Any]) -> str:
@@ -2026,6 +2851,16 @@ class EngineOrchestrator:
         return "식후 약"
 
     @staticmethod
+    def _format_taken_medication_phrase(meal: str, medication_label: str) -> str:
+        meal = (meal or "").strip()
+        label = (medication_label or "약").strip()
+        if not meal:
+            return label
+        if label.startswith(meal) or meal in label:
+            return label
+        return f"{meal} {label}".strip()
+
+    @staticmethod
     def _display_name(profile: dict[str, Any]) -> str:
         name = str((profile or {}).get("name") or "").strip()
         return f"{name}님" if name else "사용자님"
@@ -2041,6 +2876,48 @@ class EngineOrchestrator:
         )
         await self.memory.store.save("prescriptions", prescription)
         await self.memory.store.write_flash("prescription_log", self._format_prescription_log(med_names))
+
+    async def _store_spoken_medication_context(
+        self,
+        *,
+        text: str,
+        med_names: list[str],
+        speaker_id: Optional[str],
+    ) -> list[str]:
+        if hasattr(self.memory, "store_spoken_medication_result"):
+            return await self.memory.store_spoken_medication_result(
+                text,
+                med_names,
+                speaker_id=speaker_id,
+            )
+        existing = self._medications_from_prescription_log(
+            await self.memory.store.read_flash("prescription_log")
+        )
+        merged = list(existing)
+        for name in med_names:
+            if name and name not in merged:
+                merged.append(name)
+        if merged:
+            await self.memory.store.write_flash("prescription_log", self._format_prescription_log(merged))
+        return merged
+
+    def _spoken_medication_registration_response(
+        self,
+        med_names: list[str],
+        context: dict[str, Any],
+    ) -> str:
+        med_text = self._friendly_medication_label(med_names)
+        return (
+            f"{self._display_name(context.get('user_profile') or {})}, {med_text}을 현재 복용 약 목록에 추가했습니다. "
+            "복용 시간과 한 번에 드실 양은 약봉투나 처방전 기준으로 확인해 주세요. "
+            "밥을 드신 뒤나 복용 시간이 헷갈릴 때 말씀하시면 이 기록을 기준으로 안내드릴게요."
+        )
+
+    def _extract_spoken_medications_from_text(self, text: str) -> list[str]:
+        extractor = getattr(self.memory, "extract_spoken_medications_from_text", None)
+        if callable(extractor):
+            return extractor(text)
+        return []
 
     @staticmethod
     def _format_prescription_log(med_names: list[str]) -> str:
@@ -2193,6 +3070,8 @@ class EngineOrchestrator:
             return False
         if any(token in compact for token in ("약먹", "약복용", "복용했")):
             return False
+        if any(token in compact for token in ("잘먹었", "잘먹었습니다", "잘먹음", "잘먹고왔")):
+            return True
         meal_signal = any(
             token in compact
             for token in (
@@ -2234,6 +3113,9 @@ class EngineOrchestrator:
 
     @staticmethod
     def _friendly_medication_label(meds: list[str]) -> str:
+        specific = [med for med in meds if med not in {"혈압약", "고혈압약", "약"}]
+        if specific:
+            return ", ".join(specific[:3])
         if any("혈압" in med for med in meds):
             return "혈압약"
         return ", ".join(meds[:3]) or "저장된 약"

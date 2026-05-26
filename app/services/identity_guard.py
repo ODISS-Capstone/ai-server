@@ -119,6 +119,29 @@ async def evaluate_identity_gate(
         state = await memory_engine.load_identity_state(speaker_id)
         profile = state.get("profile") or cleared
         pending_action = ""
+
+    if is_profile_recall_query(text):
+        if not _has_profile_identity(profile) or pending_action in {"registration", "prior_conversation_check"}:
+            saved = await memory_engine.mark_identity_pending(speaker_id, "registration")
+            return IdentityGateResult(
+                allowed=False,
+                reason="needs_registration",
+                response_text=_registration_question_for_text(text),
+                metadata={"speaker_id": speaker_id, "profile": saved},
+            )
+        if pending_action in {"identity_conflict", "reverification"}:
+            saved = await memory_engine.mark_identity_seen(speaker_id, verified=True)
+            return IdentityGateResult(
+                allowed=True,
+                reason="identity_verified",
+                metadata={"speaker_id": speaker_id, "profile": saved},
+            )
+        return IdentityGateResult(
+            allowed=True,
+            reason="identity_verified",
+            metadata={"speaker_id": speaker_id, "profile": profile},
+        )
+
     if is_wake_word_only(text):
         heuristic_identity = {}
     identity_extract: dict[str, Any] = {
@@ -193,12 +216,52 @@ async def evaluate_identity_gate(
             metadata={"speaker_id": speaker_id, "profile": saved},
         )
 
+    if _is_current_profile_negation(text, profile):
+        if _has_identity_core(identity_update) and not _identity_matches_profile(identity_update, profile):
+            saved = await memory_engine.mark_identity_candidate(
+                speaker_id,
+                identity_update,
+                action="confirm_new_identity",
+            )
+            return IdentityGateResult(
+                allowed=False,
+                reason="confirm_new_identity",
+                response_text=_confirm_new_identity_question(identity_update, existing_profile=profile),
+                metadata={
+                    "speaker_id": speaker_id,
+                    "profile": profile,
+                    "identity_candidate": identity_update,
+                    "identity_extract": identity_extract,
+                    "saved_state": saved,
+                },
+            )
+        saved = await memory_engine.mark_identity_pending(speaker_id, "registration")
+        return IdentityGateResult(
+            allowed=False,
+            reason="identity_rejected_needs_registration",
+            response_text=_identity_rejected_registration_question(profile),
+            metadata={
+                "speaker_id": speaker_id,
+                "profile": saved,
+                "pending_identity_judge": {"decision": "different_person", "source": "profile_negation_fast_path"},
+            },
+        )
+
+    if is_profile_recall_query(text) and not _has_profile_identity(profile):
+        saved = await memory_engine.mark_identity_pending(speaker_id, "registration")
+        return IdentityGateResult(
+            allowed=False,
+            reason="needs_registration",
+            response_text=_registration_question_for_text(text),
+            metadata={"speaker_id": speaker_id, "profile": saved},
+        )
+
     if is_profile_recall_query(text) and _has_profile_identity(profile):
         if pending_action == "registration":
             return IdentityGateResult(
                 allowed=False,
                 reason="needs_registration",
-                response_text=_registration_question(),
+                response_text=_registration_question_for_text(text),
                 metadata={"speaker_id": speaker_id, "profile": profile},
             )
         if pending_action in {"identity_conflict", "reverification"}:
@@ -334,7 +397,7 @@ async def evaluate_identity_gate(
         return IdentityGateResult(
             allowed=False,
             reason="needs_registration",
-            response_text=_registration_question(),
+            response_text=_registration_question_for_text(text),
             metadata={"speaker_id": speaker_id, "profile": profile},
         )
 
@@ -694,6 +757,44 @@ def _is_explicit_reregistration_request(text: str) -> bool:
         return True
 
     return False
+
+
+def _is_current_profile_negation(text: str, profile: dict[str, Any]) -> bool:
+    name = str((profile or {}).get("name") or "").strip()
+    if not name:
+        return False
+    compact = re.sub(r"[\s.?!,，。~]+", "", (text or "").strip().lower())
+    normalized_name = re.sub(r"[\s.?!,，。~]+", "", name.lower())
+    if not compact or not normalized_name or normalized_name not in compact:
+        return False
+    negation_signal = any(
+        token in compact
+        for token in (
+            "아니야",
+            "아냐",
+            "아닙니다",
+            "아니에요",
+            "아니예요",
+            "아니고",
+            "아닌데",
+            "아니라",
+        )
+    )
+    speaker_signal = any(
+        token in compact
+        for token in (
+            "나",
+            "내가",
+            "나는",
+            "난",
+            "저",
+            "제가",
+            "저는",
+            "전",
+            "본인",
+        )
+    )
+    return negation_signal and speaker_signal
 
 
 def _should_call_identity_extract_llm(
@@ -1155,6 +1256,12 @@ def _confirm_flash_identity_question(profile: dict[str, Any]) -> str:
 
 def _registration_question() -> str:
     return "이름, 나이, 성별을 한 번에 말씀해 주세요."
+
+
+def _registration_question_for_text(text: str) -> str:
+    if is_profile_recall_query(text):
+        return "아직 지금 말씀하시는 분이 누구신지 모릅니다. 알려주시려면 이름, 나이, 성별을 한 번에 말씀해 주세요."
+    return _registration_question()
 
 
 def _recognized_message(profile: dict[str, Any]) -> str:

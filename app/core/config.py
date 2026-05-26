@@ -59,6 +59,7 @@ class Settings(BaseSettings):
     internal_llm_api_url: Optional[str] = "http://127.0.0.1:11434/v1/chat/completions"
     internal_llm_api_key: Optional[str] = None
     internal_llm_model: str = "qwen3:4b"
+    internal_llm_fallback_models: str = ""
     llm_prompts_path: str = "./app/prompts/llm_prompts.json"
     llm_tools_path: str = "./app/prompts/llm_tools.json"
     internal_llm_timeout_seconds: float = 60.0
@@ -69,11 +70,17 @@ class Settings(BaseSettings):
     internal_llm_reasoning_temperature: float = 0.25
     internal_llm_tool_temperature: float = 0.0
     internal_llm_memory_temperature: float = 0.0
+    internal_llm_reasoning_enabled: Optional[bool] = None
     frontier_llm_judge_temperature: float = 0.0
     conversation_llm_backend: str = "local"  # local | together | auto
     conversation_llm_fallback_enabled: bool = True
     together_conversation_model: Optional[str] = None
+    together_conversation_fallback_models: str = ""
     together_conversation_timeout_seconds: float = 10.0
+    together_reasoning_enabled: Optional[bool] = None
+    together_conversation_reasoning_enabled: Optional[bool] = False
+    together_judge_reasoning_enabled: Optional[bool] = None
+    together_search_reasoning_enabled: Optional[bool] = None
     llm_engine_max_concurrency_internal: int = 1
     llm_engine_max_concurrency_external: int = 1
     llm_engine_max_concurrency_judge: int = 1
@@ -95,7 +102,9 @@ class Settings(BaseSettings):
     together_base_url: str = "https://api.together.ai/v1/chat/completions"
     together_model: str = "Qwen/Qwen3.5-9B"
     together_judge_model: Optional[str] = None
+    together_judge_fallback_models: str = ""
     together_search_model: Optional[str] = None
+    together_search_fallback_models: str = ""
     together_timeout_seconds: float = 6.0
 
     # Frontier provider routing (OpenAI / Together)
