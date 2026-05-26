@@ -956,6 +956,35 @@ def test_identity_registration_completes_without_extra_confirmation(tmp_path, mo
     assert state["profile"]["age"] == "72"
 
 
+def test_identity_registration_keeps_name_when_gender_precedes_age(tmp_path):
+    memory = make_memory(tmp_path)
+
+    run(
+        identity_guard.evaluate_identity_gate(
+            memory_engine=memory,
+            text="오디스.",
+            speaker_id="demo-gender-age-user",
+        )
+    )
+
+    result = run(
+        identity_guard.evaluate_identity_gate(
+            memory_engine=memory,
+            text="김영수 남성 72세 야",
+            speaker_id="demo-gender-age-user",
+        )
+    )
+
+    assert result.reason == "identity_registered"
+    assert "김영수님" in result.response_text
+    assert "남성님" not in result.response_text
+
+    state = run(memory.load_identity_state("demo-gender-age-user"))
+    assert state["profile"]["name"] == "김영수"
+    assert state["profile"]["gender"] == "남성"
+    assert state["profile"]["age"] == "72"
+
+
 def test_identity_registration_accepts_arbitrary_young_profile(tmp_path):
     memory = make_memory(tmp_path)
 
