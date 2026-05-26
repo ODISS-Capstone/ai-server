@@ -1250,7 +1250,24 @@ def _has_stored_medication_guidance_signal(text: str) -> bool:
     compact = re.sub(r"[\s.?!,，。~]+", "", (text or "").strip().lower())
     if not compact:
         return False
-    return any(token in compact for token in ("먹어야", "밥먹었", "식사했", "식사끝", "식후", "그거", "잘먹었", "잘먹었습니다", "잘먹음"))
+    return any(
+        token in compact
+        for token in (
+            "먹어야",
+            "먹으라고",
+            "밥먹었",
+            "밥먹고오",
+            "식사했",
+            "식사끝",
+            "식후",
+            "그거",
+            "잘먹었",
+            "잘먹었습니다",
+            "잘먹음",
+            "알려줘",
+            "알려줄",
+        )
+    )
 
 
 def _is_stored_medication_guidance_request(text: str, meds: list[str] | None = None) -> bool:
@@ -1258,10 +1275,11 @@ def _is_stored_medication_guidance_request(text: str, meds: list[str] | None = N
     if not compact:
         return False
     if any(token in compact for token in ("알림", "알람", "예약", "깨워", "설정", "추가")):
-        return False
+        if not _is_meal_based_notification_guidance_request(text):
+            return False
     if any(token in compact for token in ("먹어도돼", "먹어도되", "같이먹", "동시에", "많이먹", "네개", "4개")):
         return False
-    if any(token in compact for token in ("밥먹었", "식사했", "식사끝", "식후", "저녁먹었", "점심먹었", "아침먹었", "잘먹었", "잘먹었습니다", "잘먹음")):
+    if any(token in compact for token in ("밥먹었", "밥먹고오", "먹고오면", "식사했", "식사끝", "식후", "저녁먹었", "점심먹었", "아침먹었", "잘먹었", "잘먹었습니다", "잘먹음")):
         return True
     if "그거" in compact and any(token in compact for token in ("먹어야", "먹나", "먹으면", "먹을까")):
         return True
@@ -1338,15 +1356,39 @@ def _build_stored_medication_guidance_text(
     meal = _meal_hint_from_text(text)
     compact = re.sub(r"\s+", "", text or "")
     if explicit_meal_guidance:
-        meal_part = f"{meal} 식사 후" if meal else "식사 후"
+        meal_label = f"{meal} 식사" if meal else "식사"
+        if _is_meal_based_notification_guidance_request(text):
+            return (
+                f"{name}, 네. 지금은 {_current_time_phrase()}이라 {meal_label} 후 {med_text} 안내로 기억해둘게요. "
+                f"{meal_label}를 하고 오시면 저에게 '밥 먹었어'라고 말씀해 주세요. "
+                f"그러면 {med_text}을 드시라고 안내드리겠습니다. "
+                "드신 뒤에는 '먹었어'라고 알려주시면 복용 기록으로 남기겠습니다. "
+                "복용량은 약봉투나 제품 포장에 적힌 대로만 드세요."
+            )
         return (
-            f"{name}, 네. 지금 말씀하신 기준으로 {meal_part}에 {med_text}을 드셔야 하는 것으로 기억해둘게요. "
-            f"밥을 드신 뒤 '밥 먹었어'라고 말씀하시면 {med_text} 복용을 안내드리고, "
+            f"{name}, 네. 지금 말씀하신 기준으로 {meal_label} 후 {med_text}을 드셔야 하는 것으로 기억해둘게요. "
+            f"{meal_label}를 하고 오시면 저에게 '밥 먹었어'라고 말씀해 주세요. "
+            f"그러면 {med_text} 복용을 안내드리겠습니다. "
             "드신 뒤에는 '먹었어'라고 말씀하시면 복용 기록으로 남기겠습니다. "
             "복용량은 약봉투나 제품 포장에 적힌 대로만 드세요."
         )
     if _is_meal_guidance_signal(text):
-        meal_part = f"{meal} 식사 후" if meal else "식사 후"
+        meal_label = f"{meal} 식사" if meal else "식사"
+        if _is_meal_based_notification_guidance_request(text):
+            return (
+                f"{name}, 네. 지금은 {_current_time_phrase()}이라 {meal_label} 후 {med_text} 안내로 기억해둘게요. "
+                f"{meal_label}를 하고 오시면 저에게 '밥 먹었어'라고 말씀해 주세요. "
+                f"그러면 {med_text}을 드시라고 안내드리겠습니다. "
+                "드신 뒤에는 '먹었어'라고 알려주시면 복용 기록으로 남기겠습니다. "
+                "복용량은 약봉투나 처방전에 적힌 대로만 드세요."
+            )
+        if _is_after_meal_completion_signal(text):
+            return (
+                f"{name}, 네. {meal_label}를 하셨군요. {med_text}을 드시면 됩니다. "
+                "복용량은 약봉투나 처방전에 적힌 대로만 드세요. "
+                "드신 뒤에는 '먹었어'라고 말씀해 주세요."
+            )
+        meal_part = f"{meal_label} 후"
         return (
             f"{name}, 현재 기록 기준으로 저장된 약은 {med_text}입니다. "
             f"밥을 드신 뒤, 약봉투나 처방전에 식후, 즉 {meal_part} 복용으로 적혀 있다면 정해진 양만 물과 함께 드세요. "
@@ -1461,6 +1503,13 @@ def _meal_hint_from_current_time(now: datetime | None = None) -> str:
     return ""
 
 
+def _current_time_phrase(now: datetime | None = None) -> str:
+    current = now or datetime.now()
+    label = "오전" if current.hour < 12 else "오후"
+    hour = current.hour if 1 <= current.hour <= 12 else current.hour - 12 if current.hour > 12 else 12
+    return f"{label} {hour}시 {current.minute}분" if current.minute else f"{label} {hour}시"
+
+
 def _is_meal_guidance_signal(text: str) -> bool:
     compact = re.sub(r"\s+", "", text or "")
     return any(
@@ -1468,7 +1517,9 @@ def _is_meal_guidance_signal(text: str) -> bool:
         for token in (
             "밥먹었",
             "밥먹고",
+            "밥먹고오",
             "먹고왔",
+            "먹고오면",
             "먹고난",
             "먹고나",
             "식사했",
@@ -1482,6 +1533,47 @@ def _is_meal_guidance_signal(text: str) -> bool:
             "잘먹음",
         )
     )
+
+
+def _is_after_meal_completion_signal(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text or "").lower()
+    if not compact:
+        return False
+    if any(token in compact for token in ("약먹", "약복용", "복용했")):
+        return False
+    future_guidance = any(token in compact for token in ("먹어야", "먹을", "알려줘", "알려줄", "알림해", "챙겨줘", "챙겨줄"))
+    explicit_done = any(token in compact for token in ("밥먹었", "식사했", "식사끝", "식사마쳤", "잘먹었", "잘먹었습니다", "잘먹음"))
+    if future_guidance and not explicit_done:
+        return False
+    meal_signal = any(token in compact for token in ("밥", "식사", "아침", "점심", "저녁", "식후"))
+    done_signal = any(
+        token in compact
+        for token in (
+            "먹었",
+            "먹고왔",
+            "먹고옴",
+            "다먹",
+            "먹음",
+            "식사했",
+            "식사끝",
+            "식사마쳤",
+            "먹고나",
+        )
+    )
+    return meal_signal and done_signal
+
+
+def _is_meal_based_notification_guidance_request(text: str) -> bool:
+    compact = re.sub(r"[\s.?!,，。~]+", "", (text or "").strip().lower())
+    if not compact:
+        return False
+    if not (_is_meal_guidance_signal(text) or any(token in text for token in ("밥", "식사", "식후"))):
+        return False
+    if any(token in compact for token in ("초뒤", "초후", "분뒤", "분후", "시간뒤", "시간후", "오전", "오후")):
+        return False
+    if any(token in compact for token in ("알림추가", "알림설정", "알람설정", "예약", "깨워", "맞춰")):
+        return False
+    return any(token in compact for token in ("알림", "알람", "먹으라고", "챙겨줘", "챙겨줄"))
 
 
 async def _load_wake_profile_fast(speaker_id: str | None) -> dict[str, Any]:

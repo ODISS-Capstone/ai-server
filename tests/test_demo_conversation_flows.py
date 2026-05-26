@@ -4,6 +4,8 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timedelta
 
+import pytest
+
 from app.database.md_store import MDStore
 from app.engines.conversation import ConversationEngine
 from app.engines.llm_judge import LLMJudgeEngine
@@ -1341,7 +1343,8 @@ def test_short_meal_completion_guides_stored_after_meal_medication(tmp_path, mon
     assert "방금 드셨다는" not in result.filler_text
     assert "복용 기록" not in result.filler_text
     assert "혈압약" in result.conversation.response_text
-    assert "식후" in result.conversation.response_text
+    assert "드시면 됩니다" in result.conversation.response_text
+    assert "먹었어" in result.conversation.response_text
     assert "확인된 정보가 제한적" not in result.conversation.response_text
 
 
@@ -1383,7 +1386,14 @@ def test_short_meal_completion_without_medication_context_asks_for_package(tmp_p
     assert "확인된 정보가 제한적" not in result.conversation.response_text
 
 
-def test_named_after_meal_medication_guidance_infers_breakfast_without_stored_med(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "user_text",
+    [
+        "나 밥 먹고 나서 타이레놀 먹어야 되는데 알림 해 줄 수 있어",
+        "어 나 밥 먹고 오면은 타이레놀 먹으라고 알려 줘",
+    ],
+)
+def test_named_after_meal_medication_guidance_infers_breakfast_without_stored_med(tmp_path, monkeypatch, user_text):
     memory = make_memory(tmp_path)
     speaker_id = "named-meal-med-user"
     run(
@@ -1406,11 +1416,16 @@ def test_named_after_meal_medication_guidance_infers_breakfast_without_stored_me
         "_meal_hint_from_current_time",
         staticmethod(lambda now=None: "아침"),
     )
+    monkeypatch.setattr(
+        EngineOrchestrator,
+        "_current_time_phrase",
+        staticmethod(lambda now=None: "오전 8시 9분"),
+    )
 
     orchestrator = make_orchestrator(memory)
     result = run(
         orchestrator.run_turn(
-            text="어 나 밥 먹고 나서 타이레놀 먹어야 되거든 알려 줄 수 있어",
+            text=user_text,
             speaker_id=speaker_id,
             include_judge=False,
             include_delivery_llm=False,
@@ -1421,6 +1436,7 @@ def test_named_after_meal_medication_guidance_infers_breakfast_without_stored_me
     assert result.decision.rationale == "named_medication_meal_guidance"
     assert result.decision.tasks == []
     answer = result.conversation.response_text
+    assert "오전 8시 9분" in answer
     assert "아침 식사 후" in answer
     assert "타이레놀" in answer
     assert "밥 먹었어" in answer

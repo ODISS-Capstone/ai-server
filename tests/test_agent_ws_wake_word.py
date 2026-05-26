@@ -914,9 +914,17 @@ def test_agent_ws_explicit_stored_medication_need_uses_fast_path(
     assert "디오반정" in response_payloads[-1]["response_text"]
 
 
+@pytest.mark.parametrize(
+    "user_text",
+    [
+        "나 밥 먹고 나서 타이레놀 먹어야 되는데 알림 해 줄 수 있어",
+        "어 나 밥 먹고 오면은 타이레놀 먹으라고 알려 줘",
+    ],
+)
 def test_agent_ws_named_after_meal_medication_guidance_infers_breakfast(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
+    user_text: str,
 ) -> None:
     memory = MemoryEngine()
     memory.store = MDStore(str(tmp_path / "md_database"))
@@ -947,6 +955,7 @@ def test_agent_ws_named_after_meal_medication_guidance_infers_breakfast(
     monkeypatch.setattr(agent_ws, "evaluate_identity_gate", fake_identity_gate)
     monkeypatch.setattr(agent_ws.engine_orchestrator, "run_turn", fail_if_orchestrator_called)
     monkeypatch.setattr(agent_ws, "_meal_hint_from_current_time", lambda now=None: "아침")
+    monkeypatch.setattr(agent_ws, "_current_time_phrase", lambda now=None: "오전 8시 9분")
 
     run(
         agent_ws._handle_stt(
@@ -954,7 +963,7 @@ def test_agent_ws_named_after_meal_medication_guidance_infers_breakfast(
             {
                 "type": "stt_result",
                 "speaker_id": "speaker-kim",
-                "text": "어 나 밥 먹고 나서 타이레놀 먹어야 되거든 알려 줄 수 있어",
+                "text": user_text,
             },
             set(),
         )
@@ -964,12 +973,75 @@ def test_agent_ws_named_after_meal_medication_guidance_infers_breakfast(
     response_payloads = [payload for payload in websocket.sent if payload.get("type") == "response"]
     assert response_payloads[-1]["fast_path"] == "named_meal_medication_guidance"
     answer = response_payloads[-1]["response_text"]
+    assert "오전 8시 9분" in answer
     assert "아침 식사 후" in answer
     assert "타이레놀" in answer
     assert "밥 먹었어" in answer
     assert "먹었어" in answer
     prescription_log = run(memory.store.read_flash("prescription_log"))
     assert "타이레놀" in prescription_log
+
+
+def test_agent_ws_after_meal_completion_gives_direct_take_instruction(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    memory = MemoryEngine()
+    memory.store = MDStore(str(tmp_path / "md_database"))
+    memory.structured_memory = StructuredMemoryService(base_path=str(tmp_path / "structured_memory"))
+    run(memory.initialize())
+    run(
+        memory.save_identity_profile(
+            "speaker-kim",
+            {"name": "김영수", "age": "72", "gender": "남성"},
+            mark_verified=True,
+        )
+    )
+    run(
+        memory.store.write_flash(
+            "prescription_log",
+            "# 현재 복용 약 요약\n\n## 약품 목록\n- 타이레놀\n",
+        )
+    )
+    websocket = FakeWebSocket()
+    reminder_service = ReminderService(start_background_tasks=False)
+
+    async def fake_identity_gate(**kwargs):
+        return IdentityGateResult(
+            allowed=True,
+            reason="identity_verified",
+            metadata={"profile": {"name": "김영수", "age": "72", "gender": "남성"}},
+        )
+
+    async def fail_if_orchestrator_called(**kwargs):
+        raise AssertionError("after-meal completion guidance should not call the orchestrator")
+
+    monkeypatch.setattr(agent_ws, "memory_engine", memory)
+    monkeypatch.setattr(agent_ws, "reminder_service", reminder_service)
+    monkeypatch.setattr(agent_ws, "evaluate_identity_gate", fake_identity_gate)
+    monkeypatch.setattr(agent_ws.engine_orchestrator, "run_turn", fail_if_orchestrator_called)
+    monkeypatch.setattr(agent_ws, "_meal_hint_from_current_time", lambda now=None: "아침")
+
+    run(
+        agent_ws._handle_stt(
+            websocket,
+            {
+                "type": "stt_result",
+                "speaker_id": "speaker-kim",
+                "text": "너 나 밥 먹었어",
+            },
+            set(),
+        )
+    )
+
+    assert not any(payload.get("type") == "filler" for payload in websocket.sent)
+    response_payloads = [payload for payload in websocket.sent if payload.get("type") == "response"]
+    assert response_payloads[-1]["fast_path"] == "stored_medication_guidance"
+    answer = response_payloads[-1]["response_text"]
+    assert "아침 식사" in answer
+    assert "타이레놀" in answer
+    assert "드시면 됩니다" in answer
+    assert "먹었어" in answer
 
 
 def test_agent_ws_medication_taken_confirmation_uses_stored_medication(
