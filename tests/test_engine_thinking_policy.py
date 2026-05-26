@@ -108,7 +108,73 @@ def test_internal_reasoning_llm_does_not_force_no_think(monkeypatch):
     assert answer == "핵심"
 
 
-def test_conversation_llm_together_backend_uses_together_provider(monkeypatch):
+def test_openai_compatible_delivery_llm_maps_no_think_to_reasoning_payload(monkeypatch):
+    captured: list[dict] = []
+
+    def fake_client(**kwargs):
+        return _FakeAsyncClient(captured=captured, content="OK", **kwargs)
+
+    monkeypatch.setattr(settings, "internal_llm_api_url", "https://api.together.ai/v1/chat/completions")
+    monkeypatch.setattr(settings, "internal_llm_api_key", "together-key")
+    monkeypatch.setattr(settings, "internal_llm_model", "Qwen/Qwen3.5-35B-A3B")
+    monkeypatch.setattr(settings, "internal_llm_provider", "openai_compatible")
+    monkeypatch.setattr(settings, "internal_llm_reasoning_enabled", None)
+    monkeypatch.setattr(settings, "conversation_llm_backend", "local")
+    monkeypatch.setattr(llm_service.httpx, "AsyncClient", fake_client)
+
+    answer = asyncio.run(
+        llm_service.call_local_delivery_llm(
+            original_query="test",
+            reviewed_message="reviewed",
+        )
+    )
+
+    assert answer
+    assert "chat_template_kwargs" not in captured[0]["json"]
+    assert captured[0]["json"]["reasoning"] == {"enabled": False}
+
+
+def test_internal_llm_model_fallback_tries_next_model(monkeypatch):
+    captured: list[dict] = []
+
+    class FallbackInternalClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, url, **kwargs):
+            captured.append({"url": url, **kwargs})
+            if kwargs["json"]["model"] == "Qwen/bad":
+                request = httpx.Request("POST", url)
+                response = httpx.Response(400, request=request)
+                raise httpx.HTTPStatusError("bad model", request=request, response=response)
+            return _FakeResponse("fallback 핵심")
+
+    monkeypatch.setattr(settings, "internal_llm_api_url", "https://api.together.ai/v1/chat/completions")
+    monkeypatch.setattr(settings, "internal_llm_api_key", None)
+    monkeypatch.setattr(settings, "together_api_key", "together-key")
+    monkeypatch.setattr(settings, "internal_llm_model", "Qwen/bad")
+    monkeypatch.setattr(settings, "internal_llm_fallback_models", "Qwen/good")
+    monkeypatch.setattr(settings, "internal_llm_provider", "openai_compatible")
+    monkeypatch.setattr(settings, "conversation_llm_backend", "local")
+    monkeypatch.setattr(llm_service.httpx, "AsyncClient", lambda **kwargs: FallbackInternalClient())
+
+    answer = asyncio.run(
+        llm_service.call_internal_llm(
+            query_text="질문",
+            llm_doc="",
+            use_tools=False,
+        )
+    )
+
+    assert answer == "fallback 핵심"
+    assert [item["json"]["model"] for item in captured] == ["Qwen/bad", "Qwen/good"]
+    assert captured[0]["headers"]["Authorization"] == "Bearer together-key"
+
+
+def test_delivery_llm_together_backend_uses_together_provider(monkeypatch):
     captured: list[dict] = []
 
     def fake_client(**kwargs):
@@ -121,10 +187,10 @@ def test_conversation_llm_together_backend_uses_together_provider(monkeypatch):
     monkeypatch.setattr("app.services.frontier_llm.httpx.AsyncClient", fake_client)
 
     answer = asyncio.run(
-        llm_service.call_internal_llm(
-            query_text="안녕",
-            llm_doc="",
-            use_tools=False,
+        llm_service.call_local_delivery_llm(
+            original_query="안녕",
+            reviewed_message="검토된 응답",
+            require_disclaimer=False,
         )
     )
 
@@ -134,7 +200,7 @@ def test_conversation_llm_together_backend_uses_together_provider(monkeypatch):
     assert captured[0]["json"]["model"] == "Qwen/Qwen3.5-9B"
 
 
-def test_conversation_llm_auto_falls_back_to_together(monkeypatch):
+def test_delivery_llm_auto_falls_back_to_together(monkeypatch):
     captured_local: list[dict] = []
     captured_together: list[dict] = []
 
@@ -161,10 +227,10 @@ def test_conversation_llm_auto_falls_back_to_together(monkeypatch):
     monkeypatch.setattr(llm_service.httpx, "AsyncClient", lambda **kwargs: DispatchingClient())
 
     answer = asyncio.run(
-        llm_service.call_internal_llm(
-            query_text="안녕",
-            llm_doc="",
-            use_tools=False,
+        llm_service.call_local_delivery_llm(
+            original_query="안녕",
+            reviewed_message="검토된 응답",
+            require_disclaimer=False,
         )
     )
 

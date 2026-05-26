@@ -111,34 +111,33 @@ async def check_internal_llm_health(
             "message": "INTERNAL_LLM_API_URL is not set",
         }
 
-    key = api_key if api_key is not None else settings.internal_llm_api_key
-    headers = {"Content-Type": "application/json"}
-    if key:
-        headers["Authorization"] = f"Bearer {key}"
+    key = _api_key_for_internal_url(
+        url,
+        api_key if api_key is not None else settings.internal_llm_api_key,
+    )
 
     started = perf_counter()
     logger.info("[InternalLLMHealth] check_start model=%s url=%s", selected_model, url)
     try:
         async with httpx.AsyncClient(timeout=timeout_seconds) as client:
-            response = await client.post(
-                url,
-                headers=headers,
-                json={
-                    "model": selected_model,
-                    "messages": [{"role": "user", "content": "ping"}],
-                    "max_tokens": 8,
-                    "temperature": 0,
-                },
+            data = await _post_chat_completion(
+                client,
+                url=url,
+                headers=_json_headers(key),
+                payload=_build_internal_chat_payload(
+                    model=selected_model,
+                    messages=[{"role": "user", "content": "ping"}],
+                    max_tokens=8,
+                    temperature=0,
+                ),
             )
-            response.raise_for_status()
-            data = response.json()
 
         answer = data.get("choices", [{}])[0].get("message", {}).get("content", "") or ""
         elapsed_ms = (perf_counter() - started) * 1000
         logger.info(
             "[InternalLLMHealth] check_ok model=%s status_code=%d answer_chars=%d elapsed_ms=%.1f",
             selected_model,
-            response.status_code,
+            200,
             len(answer),
             elapsed_ms,
         )
@@ -148,7 +147,7 @@ async def check_internal_llm_health(
             "provider": get_internal_llm_provider(),
             "model": selected_model,
             "url": url,
-            "status_code": response.status_code,
+            "status_code": 200,
             "elapsed_ms": round(elapsed_ms, 1),
             "answer_preview": answer[:80],
         }
@@ -288,6 +287,7 @@ async def call_local_delivery_llm(
             temperature=settings.internal_llm_delivery_temperature,
             timeout_seconds=settings.local_delivery_llm_timeout_seconds,
             chat_template_kwargs={"enable_thinking": False},
+            use_conversation_backend=True,
         )
     except Exception as exc:  # noqa: BLE001 - delivery polish must never block final answer
         logger.warning("[DeliveryLLM] failed_fast fallback=true error=%s", exc)
@@ -1410,6 +1410,36 @@ def _json_headers(api_key: Optional[str]) -> dict[str, str]:
     return headers
 
 
+def _api_key_for_internal_url(url: str, api_key: Optional[str]) -> Optional[str]:
+    if api_key:
+        return api_key
+    normalized = (url or "").lower()
+    if "api.together.ai" in normalized:
+        return settings.together_api_key
+    return None
+
+
+def _parse_csv_models(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    models: list[str] = []
+    for item in raw.split(","):
+        model = item.strip()
+        if model and model not in models:
+            models.append(model)
+    return models
+
+
+def _internal_model_candidates(primary: str) -> list[str]:
+    candidates = [primary] if primary else []
+    candidates.extend(_parse_csv_models(settings.internal_llm_fallback_models))
+    deduped: list[str] = []
+    for model in candidates:
+        if model and model not in deduped:
+            deduped.append(model)
+    return deduped or ["qwen"]
+
+
 def _build_internal_chat_payload(
     *,
     model: str,
@@ -1430,9 +1460,32 @@ def _build_internal_chat_payload(
         payload["tools"] = tools
     if tool_choice:
         payload["tool_choice"] = tool_choice
+
+    reasoning_enabled = settings.internal_llm_reasoning_enabled
     if chat_template_kwargs and supports_chat_template_kwargs():
         payload["chat_template_kwargs"] = chat_template_kwargs
+    elif chat_template_kwargs and get_internal_llm_provider() == _OPENAI_COMPATIBLE_PROVIDER:
+        raw_thinking = chat_template_kwargs.get(
+            "enable_thinking",
+            chat_template_kwargs.get("thinking"),
+        )
+        if isinstance(raw_thinking, bool):
+            reasoning_enabled = raw_thinking
+    if reasoning_enabled is not None and get_internal_llm_provider() == _OPENAI_COMPATIBLE_PROVIDER:
+        payload["reasoning"] = {"enabled": reasoning_enabled}
     return payload
+
+
+async def _post_chat_completion(
+    client: httpx.AsyncClient,
+    *,
+    url: str,
+    headers: dict[str, str],
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    response = await client.post(url, headers=headers, json=payload)
+    response.raise_for_status()
+    return response.json()
 
 
 def _strip_reasoning_tags(content: str) -> str:
@@ -1454,43 +1507,52 @@ async def _post_chat_once(
     temperature: Optional[float] = None,
     timeout_seconds: Optional[float] = None,
     chat_template_kwargs: Optional[dict[str, Any]] = None,
+    use_conversation_backend: bool = False,
 ) -> str:
     async def post_local() -> str:
-        started = perf_counter()
-        logger.info(
-            "[ConversationLLM] request_start backend=local model=%s url=%s messages=%d max_tokens=%d",
-            model,
-            url,
-            len(messages),
-            max_tokens,
-        )
-        async with httpx.AsyncClient(timeout=timeout_seconds or settings.internal_llm_timeout_seconds) as client:
-            payload = _build_internal_chat_payload(
-                model=model,
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=(
-                    settings.internal_llm_temperature if temperature is None else temperature
-                ),
-                chat_template_kwargs=chat_template_kwargs,
-            )
-            r = await client.post(
-                url,
-                headers=_json_headers(key),
-                json=payload,
-            )
-            r.raise_for_status()
-            data = r.json()
-            answer = _strip_reasoning_tags(
-                data.get("choices", [{}])[0].get("message", {}).get("content", "") or ""
-            )
+        last_error: Exception | None = None
+        resolved_key = _api_key_for_internal_url(url, key)
+        for selected_model in _internal_model_candidates(model):
+            started = perf_counter()
             logger.info(
-                "[ConversationLLM] request_done backend=local model=%s answer_chars=%d elapsed_ms=%.1f",
-                model,
-                len(answer),
-                (perf_counter() - started) * 1000,
+                "[InternalLLM] request_start model=%s url=%s messages=%d max_tokens=%d",
+                selected_model,
+                url,
+                len(messages),
+                max_tokens,
             )
-            return answer
+            try:
+                async with httpx.AsyncClient(timeout=timeout_seconds or settings.internal_llm_timeout_seconds) as client:
+                    payload = _build_internal_chat_payload(
+                        model=selected_model,
+                        messages=messages,
+                        max_tokens=max_tokens,
+                        temperature=(
+                            settings.internal_llm_temperature if temperature is None else temperature
+                        ),
+                        chat_template_kwargs=chat_template_kwargs,
+                    )
+                    data = await _post_chat_completion(
+                        client,
+                        url=url,
+                        headers=_json_headers(resolved_key),
+                        payload=payload,
+                    )
+                answer = _strip_reasoning_tags(
+                    data.get("choices", [{}])[0].get("message", {}).get("content", "") or ""
+                )
+                logger.info(
+                    "[InternalLLM] request_done model=%s answer_chars=%d elapsed_ms=%.1f",
+                    selected_model,
+                    len(answer),
+                    (perf_counter() - started) * 1000,
+                )
+                return answer
+            except Exception as exc:  # noqa: BLE001 - configured model fallback must continue
+                last_error = exc
+                logger.warning("[InternalLLM] model_failed model=%s error=%s", selected_model, exc)
+        assert last_error is not None
+        raise last_error
 
     async def post_together() -> str:
         started = perf_counter()
@@ -1510,7 +1572,7 @@ async def _post_chat_once(
         )
         return answer
 
-    backend = get_conversation_llm_backend()
+    backend = get_conversation_llm_backend() if use_conversation_backend else "local"
     if backend == "together":
         return await post_together()
     if backend == "auto":

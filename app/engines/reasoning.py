@@ -784,6 +784,8 @@ class ReasoningEngine:
             return False
         if any(token in compact for token in ("약먹", "약복용", "복용했")):
             return False
+        if any(token in compact for token in ("잘먹었", "잘먹었습니다", "잘먹음", "잘먹고왔")):
+            return True
         meal_signal = any(
             token in compact
             for token in (

@@ -83,12 +83,34 @@ SMALLTALK_PATTERNS = {
         "별말씀을요. 언제든 편하게 물어보세요.",
         "도움이 되셨다니 다행이에요.",
     ],
+    "acknowledgement": [
+        "네, 필요하시면 또 말씀해 주세요.",
+        "알겠습니다. 더 필요한 것이 있으면 말씀해 주세요.",
+    ],
 }
 
 GREETING_KEYWORDS = ["안녕", "반가", "여보세요", "하이", "hello"]
 FEELING_BAD_KEYWORDS = ["아프", "어지럽", "안 좋", "힘들", "피곤", "아파", "쑤시"]
 FEELING_GOOD_KEYWORDS = ["좋아", "괜찮", "건강해", "기분 좋"]
 THANKS_KEYWORDS = ["고마", "감사", "땡큐", "thank"]
+ACKNOWLEDGEMENT_KEYWORDS = [
+    "잘했",
+    "수고",
+    "됐어",
+    "됐네",
+    "됐습니다",
+    "알겠",
+    "알았",
+    "오케이",
+    "okay",
+]
+FAST_SMALLTALK_TYPES = {"greeting", "feeling_good", "thanks", "acknowledgement"}
+FAST_SMALLTALK_RESPONSES = {
+    "greeting": "안녕하세요. 무엇을 도와드릴까요?",
+    "feeling_good": "다행이에요. 필요한 것이 있으면 편하게 말씀해 주세요.",
+    "thanks": "별말씀을요. 언제든 편하게 말씀해 주세요.",
+    "acknowledgement": "네, 필요하시면 또 말씀해 주세요.",
+}
 
 
 class ConversationEngine:
@@ -151,6 +173,29 @@ class ConversationEngine:
         if smalltalk_type and smalltalk_type in SMALLTALK_PATTERNS:
             return random.choice(SMALLTALK_PATTERNS[smalltalk_type])
         return None
+
+    def fast_smalltalk_type(self, text: str) -> Optional[str]:
+        """Return deterministic fast-path smalltalk type for low-risk turns."""
+        if classify_patient_safety_situation(text):
+            return None
+        input_data = self.receive_input(text)
+        smalltalk_type = input_data.get("smalltalk_type")
+        if not input_data.get("is_smalltalk") or smalltalk_type not in FAST_SMALLTALK_TYPES:
+            return None
+        return str(smalltalk_type)
+
+    def build_smalltalk_fast_response(
+        self,
+        text: str,
+        user_profile: Optional[dict] = None,
+    ) -> str:
+        """Build a deterministic TTS-ready response without LLM polishing."""
+        smalltalk_type = self.fast_smalltalk_type(text) or "greeting"
+        response = FAST_SMALLTALK_RESPONSES.get(
+            smalltalk_type,
+            "네, 말씀해 주세요.",
+        )
+        return self._ensure_user_prefix(response, user_profile)
 
     def build_wake_word_response(self, user_profile: Optional[dict] = None) -> str:
         """Return a deterministic wake-word acknowledgement.
@@ -368,6 +413,7 @@ class ConversationEngine:
             + FEELING_BAD_KEYWORDS
             + FEELING_GOOD_KEYWORDS
             + THANKS_KEYWORDS
+            + ACKNOWLEDGEMENT_KEYWORDS
         )
         return any(kw in text_lower for kw in all_keywords)
 
@@ -383,6 +429,8 @@ class ConversationEngine:
             return "feeling_good"
         if any(kw in text_lower for kw in THANKS_KEYWORDS):
             return "thanks"
+        if any(kw in text_lower for kw in ACKNOWLEDGEMENT_KEYWORDS):
+            return "acknowledgement"
         return None
 
     @staticmethod
@@ -395,6 +443,10 @@ class ConversationEngine:
                 "처방",
                 "먹어도",
                 "먹으면",
+                "먹을게",
+                "먹을께",
+                "먹겠습니다",
+                "먹을게요",
                 "같이 먹",
                 "드셔도",
                 "부작용",

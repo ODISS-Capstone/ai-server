@@ -107,3 +107,14 @@ def test_medication_question_with_greeting_is_not_treated_as_smalltalk():
     assert input_data["is_smalltalk"] is False
     assert input_data["smalltalk_type"] is None
     assert engine.generate_filler(input_data) is not None
+
+
+def test_acknowledgement_compliment_is_fast_smalltalk():
+    engine = ConversationEngine()
+
+    input_data = engine.receive_input("그래 잘했어")
+
+    assert input_data["is_smalltalk"] is True
+    assert input_data["smalltalk_type"] == "acknowledgement"
+    assert engine.fast_smalltalk_type("그래 잘했어") == "acknowledgement"
+    assert engine.generate_filler(input_data) is None

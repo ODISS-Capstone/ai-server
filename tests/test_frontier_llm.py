@@ -110,6 +110,93 @@ def test_chat_completion_falls_back_to_together(monkeypatch):
     assert any("together.ai" in item["url"] for item in captured)
 
 
+def test_together_model_fallback_tries_next_model(monkeypatch):
+    captured: list[dict] = []
+
+    class FallbackModelClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, url, **kwargs):
+            captured.append({"url": url, **kwargs})
+            if kwargs["json"]["model"] == "Qwen/bad":
+                request = httpx.Request("POST", url)
+                response = httpx.Response(400, request=request)
+                raise httpx.HTTPStatusError("bad model", request=request, response=response)
+            return _FakeResponse("Fallback model answer.")
+
+    monkeypatch.setattr(settings, "openai_api_key", None)
+    monkeypatch.setattr(settings, "together_api_key", "together-key")
+    monkeypatch.setattr(settings, "frontier_llm_enabled_providers", "together")
+    monkeypatch.setattr(settings, "frontier_llm_primary_provider", "together")
+    monkeypatch.setattr(settings, "together_judge_model", "Qwen/bad")
+    monkeypatch.setattr(settings, "together_judge_fallback_models", "Qwen/good")
+    monkeypatch.setattr(frontier_llm.httpx, "AsyncClient", lambda **kwargs: FallbackModelClient())
+
+    result = asyncio.run(
+        frontier_llm.chat_completion(
+            task="judge",
+            messages=[{"role": "user", "content": "query"}],
+            max_tokens=128,
+        )
+    )
+
+    assert result["success"] is True
+    assert result["model"] == "Qwen/good"
+    assert [item["json"]["model"] for item in captured] == ["Qwen/bad", "Qwen/good"]
+
+
+def test_together_judge_payload_uses_reasoning_setting(monkeypatch):
+    captured: list[dict] = []
+
+    def fake_client(**kwargs):
+        return _FakeAsyncClient(captured=captured, **kwargs)
+
+    monkeypatch.setattr(settings, "openai_api_key", None)
+    monkeypatch.setattr(settings, "together_api_key", "together-key")
+    monkeypatch.setattr(settings, "frontier_llm_enabled_providers", "together")
+    monkeypatch.setattr(settings, "frontier_llm_primary_provider", "together")
+    monkeypatch.setattr(settings, "together_judge_reasoning_enabled", True)
+    monkeypatch.setattr(frontier_llm.httpx, "AsyncClient", fake_client)
+
+    result = asyncio.run(
+        frontier_llm.chat_completion(
+            task="judge",
+            messages=[{"role": "user", "content": "query"}],
+            max_tokens=128,
+        )
+    )
+
+    assert result["success"] is True
+    assert captured[0]["json"]["reasoning"] == {"enabled": True}
+
+
+def test_together_conversation_payload_disables_reasoning_by_default(monkeypatch):
+    captured: list[dict] = []
+
+    def fake_client(**kwargs):
+        return _FakeAsyncClient(captured=captured, **kwargs)
+
+    monkeypatch.setattr(settings, "together_api_key", "together-key")
+    monkeypatch.setattr(settings, "together_conversation_model", "google/gemma-4-31B-it")
+    monkeypatch.setattr(settings, "together_conversation_reasoning_enabled", False)
+    monkeypatch.setattr(frontier_llm.httpx, "AsyncClient", fake_client)
+
+    result = asyncio.run(
+        frontier_llm.together_conversation_completion(
+            messages=[{"role": "user", "content": "query"}],
+            max_tokens=128,
+        )
+    )
+
+    assert result["success"] is True
+    assert captured[0]["json"]["model"] == "google/gemma-4-31B-it"
+    assert captured[0]["json"]["reasoning"] == {"enabled": False}
+
+
 def test_chat_completion_returns_error_when_no_provider_configured(monkeypatch):
     monkeypatch.setattr(settings, "openai_api_key", None)
     monkeypatch.setattr(settings, "together_api_key", None)

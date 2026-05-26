@@ -18,10 +18,12 @@ internal_llm:
   api_url: http://127.0.0.1:11434/v1/chat/completions
   api_key: ${INTERNAL_LLM_API_KEY}
   model: qwen3:4b
+  fallback_models: []
   prompts_path: ./app/prompts/llm_prompts.json
   tools_path: ./app/prompts/llm_tools.json
   timeout_seconds: 60.0
   local_delivery_timeout_seconds: 30.0
+  reasoning_enabled:
   temperature:
     default: 0.0
     route: 0.0
@@ -36,7 +38,9 @@ conversation_llm:
   backend: auto                 # local | together | auto
   fallback_enabled: true        # auto에서 local 실패 시 Together 사용
   together_model: Qwen/Qwen3.5-9B
+  together_fallback_models: []
   together_timeout_seconds: 10.0
+  together_reasoning_enabled: false
 
 # ── 엔진 큐 (asyncio 세마포어, 동시 처리 상한) ──
 llm_queue:
@@ -67,7 +71,11 @@ frontier:
     base_url: https://api.together.ai/v1/chat/completions
     model: Qwen/Qwen3.5-9B
     judge_model: Qwen/Qwen3.5-9B
+    judge_fallback_models: []
     search_model: Qwen/Qwen3.5-9B
+    search_fallback_models: []
+    judge_reasoning_enabled:
+    search_reasoning_enabled:
     timeout_seconds: 6.0
 
 # ── 공공데이터 Tool (DUR / HIRA / 건기식) ──

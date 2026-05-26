@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Literal, Optional
 
 import httpx
@@ -75,6 +76,34 @@ def _model_for_provider_task(provider: FrontierProvider, task: FrontierTask) -> 
     return settings.together_model
 
 
+def _parse_csv_models(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    models: list[str] = []
+    for item in raw.split(","):
+        model = item.strip()
+        if model and model not in models:
+            models.append(model)
+    return models
+
+
+def _models_for_provider_task(provider: FrontierProvider, task: FrontierTask) -> list[str]:
+    primary = _model_for_provider_task(provider, task)
+    models = [primary] if primary else []
+    if provider == "together":
+        if task == "conversation":
+            models.extend(_parse_csv_models(settings.together_conversation_fallback_models))
+        elif task == "judge":
+            models.extend(_parse_csv_models(settings.together_judge_fallback_models))
+        elif task == "search":
+            models.extend(_parse_csv_models(settings.together_search_fallback_models))
+    deduped: list[str] = []
+    for model in models:
+        if model and model not in deduped:
+            deduped.append(model)
+    return deduped
+
+
 def _timeout_for_provider_task(provider: FrontierProvider, task: FrontierTask) -> float:
     if task == "conversation":
         if provider == "openai":
@@ -85,6 +114,18 @@ def _timeout_for_provider_task(provider: FrontierProvider, task: FrontierTask) -
             return settings.openai_search_timeout_seconds
         return settings.openai_timeout_seconds
     return settings.together_timeout_seconds
+
+
+def _reasoning_for_provider_task(provider: FrontierProvider, task: FrontierTask) -> Optional[bool]:
+    if provider != "together":
+        return None
+    if task == "conversation" and settings.together_conversation_reasoning_enabled is not None:
+        return settings.together_conversation_reasoning_enabled
+    if task == "judge" and settings.together_judge_reasoning_enabled is not None:
+        return settings.together_judge_reasoning_enabled
+    if task == "search" and settings.together_search_reasoning_enabled is not None:
+        return settings.together_search_reasoning_enabled
+    return settings.together_reasoning_enabled
 
 
 def _chat_url_for_provider(provider: FrontierProvider) -> str:
@@ -122,6 +163,7 @@ def _build_chat_payload(
     messages: list[dict[str, Any]],
     max_tokens: int,
     temperature: float,
+    reasoning_enabled: Optional[bool] = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "model": model,
@@ -133,7 +175,21 @@ def _build_chat_payload(
         payload["max_tokens"] = max_tokens
     if _supports_temperature(model):
         payload["temperature"] = temperature
+    if reasoning_enabled is not None:
+        payload["reasoning"] = {"enabled": reasoning_enabled}
     return payload
+
+
+async def _post_chat_completion(
+    client: httpx.AsyncClient,
+    *,
+    url: str,
+    headers: dict[str, str],
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    response = await client.post(url, headers=headers, json=payload)
+    response.raise_for_status()
+    return response.json()
 
 
 def _queue_engine_for_task(task: FrontierTask) -> str:
@@ -147,12 +203,21 @@ def _queue_engine_for_task(task: FrontierTask) -> str:
 
 
 def _extract_content(data: dict[str, Any]) -> str:
-    return (
+    content = (
         data.get("choices", [{}])[0]
         .get("message", {})
         .get("content", "")
         or ""
     )
+    return _strip_reasoning_tags(content)
+
+
+def _strip_reasoning_tags(content: str) -> str:
+    if "<think" not in (content or "").lower():
+        return content
+    cleaned = re.sub(r"<think\b[^>]*>.*?</think>\s*", "", content, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r"<think\b[^>]*>.*$", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+    return cleaned.strip()
 
 
 async def chat_completion(
@@ -178,7 +243,6 @@ async def chat_completion(
         if not is_provider_configured(provider):
             continue
 
-        model = _model_for_provider_task(provider, task)
         api_key = _api_key_for_provider(provider)
         url = _chat_url_for_provider(provider)
         timeout = _timeout_for_provider_task(provider, task)
@@ -187,47 +251,52 @@ async def chat_completion(
             if temperature is None
             else temperature
         )
-        payload = _build_chat_payload(
-            model=model,
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=resolved_temperature,
-        )
         queue_engine = _queue_engine_for_task(task)
 
-        async def _post(provider_name: FrontierProvider = provider) -> dict[str, Any]:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                response = await client.post(
-                    url,
-                    headers={
-                        "Authorization": f"Bearer {api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json=payload,
-                )
-                response.raise_for_status()
-                data = response.json()
-                data["_frontier_provider"] = provider_name
-                data["_frontier_model"] = model
-                return data
+        for model in _models_for_provider_task(provider, task):
+            payload = _build_chat_payload(
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=resolved_temperature,
+                reasoning_enabled=_reasoning_for_provider_task(provider, task),
+            )
 
-        try:
-            data = await run_with_engine_queue(queue_engine, _post)
-            return {
-                "success": True,
-                "content": _extract_content(data),
-                "provider": data.get("_frontier_provider", provider),
-                "model": data.get("_frontier_model", model),
-                "message": "ok",
-            }
-        except httpx.HTTPStatusError as exc:
-            message = f"{provider} HTTP {exc.response.status_code}"
-            logger.error("[FrontierLLM] %s task=%s", message, task)
-            errors.append(message)
-        except Exception as exc:  # noqa: BLE001 - provider fallback must continue
-            message = f"{provider} error: {exc}"
-            logger.error("[FrontierLLM] %s task=%s", message, task)
-            errors.append(message)
+            async def _post(
+                provider_name: FrontierProvider = provider,
+                selected_model: str = model,
+            ) -> dict[str, Any]:
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    data = await _post_chat_completion(
+                        client,
+                        url=url,
+                        headers={
+                            "Authorization": f"Bearer {api_key}",
+                            "Content-Type": "application/json",
+                        },
+                        payload=payload,
+                    )
+                    data["_frontier_provider"] = provider_name
+                    data["_frontier_model"] = selected_model
+                    return data
+
+            try:
+                data = await run_with_engine_queue(queue_engine, _post)
+                return {
+                    "success": True,
+                    "content": _extract_content(data),
+                    "provider": data.get("_frontier_provider", provider),
+                    "model": data.get("_frontier_model", model),
+                    "message": "ok",
+                }
+            except httpx.HTTPStatusError as exc:
+                message = f"{provider} {model} HTTP {exc.response.status_code}"
+                logger.error("[FrontierLLM] %s task=%s", message, task)
+                errors.append(message)
+            except Exception as exc:  # noqa: BLE001 - provider fallback must continue
+                message = f"{provider} {model} error: {exc}"
+                logger.error("[FrontierLLM] %s task=%s", message, task)
+                errors.append(message)
 
         if not settings.frontier_llm_fallback_enabled:
             break
@@ -259,67 +328,65 @@ async def together_conversation_completion(
             "message": "TOGETHER_API_KEY is not set",
         }
 
-    model = settings.together_conversation_model or settings.together_model
     url = _chat_url_for_provider("together")
     resolved_temperature = (
         settings.internal_llm_delivery_temperature
         if temperature is None
         else temperature
     )
-    payload = _build_chat_payload(
-        model=model,
-        messages=messages,
-        max_tokens=max_tokens,
-        temperature=resolved_temperature,
-    )
 
-    async def _post() -> dict[str, Any]:
-        async with httpx.AsyncClient(
-            timeout=settings.together_conversation_timeout_seconds
-        ) as client:
-            response = await client.post(
-                url,
-                headers={
-                    "Authorization": f"Bearer {settings.together_api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-            )
-            response.raise_for_status()
-            data = response.json()
-            data["_frontier_provider"] = "together"
-            data["_frontier_model"] = model
-            return data
+    errors: list[str] = []
+    for model in _models_for_provider_task("together", "conversation"):
+        payload = _build_chat_payload(
+            model=model,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=resolved_temperature,
+            reasoning_enabled=_reasoning_for_provider_task("together", "conversation"),
+        )
 
-    try:
-        data = await run_with_engine_queue("internal", _post)
-        return {
-            "success": True,
-            "content": _extract_content(data),
-            "provider": "together",
-            "model": model,
-            "message": "ok",
-        }
-    except httpx.HTTPStatusError as exc:
-        message = f"together HTTP {exc.response.status_code}"
-        logger.error("[ConversationLLM] %s", message)
-        return {
-            "success": False,
-            "content": "",
-            "provider": "together",
-            "model": model,
-            "message": message,
-        }
-    except Exception as exc:  # noqa: BLE001 - caller decides fallback behavior
-        message = f"together error: {exc}"
-        logger.error("[ConversationLLM] %s", message)
-        return {
-            "success": False,
-            "content": "",
-            "provider": "together",
-            "model": model,
-            "message": message,
-        }
+        async def _post(selected_model: str = model) -> dict[str, Any]:
+            async with httpx.AsyncClient(
+                timeout=settings.together_conversation_timeout_seconds
+            ) as client:
+                data = await _post_chat_completion(
+                    client,
+                    url=url,
+                    headers={
+                        "Authorization": f"Bearer {settings.together_api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    payload=payload,
+                )
+                data["_frontier_provider"] = "together"
+                data["_frontier_model"] = selected_model
+                return data
+
+        try:
+            data = await run_with_engine_queue("internal", _post)
+            return {
+                "success": True,
+                "content": _extract_content(data),
+                "provider": "together",
+                "model": model,
+                "message": "ok",
+            }
+        except httpx.HTTPStatusError as exc:
+            message = f"together {model} HTTP {exc.response.status_code}"
+            logger.error("[ConversationLLM] %s", message)
+            errors.append(message)
+        except Exception as exc:  # noqa: BLE001 - caller decides fallback behavior
+            message = f"together {model} error: {exc}"
+            logger.error("[ConversationLLM] %s", message)
+            errors.append(message)
+
+    return {
+        "success": False,
+        "content": "",
+        "provider": "together",
+        "model": None,
+        "message": "; ".join(errors) if errors else "Together conversation call failed",
+    }
 
 
 async def check_frontier_llm_health() -> dict[str, Any]:
@@ -334,6 +401,12 @@ async def check_frontier_llm_health() -> dict[str, Any]:
             "model_judge": _model_for_provider_task(provider, "judge"),
             "model_search": _model_for_provider_task(provider, "search"),
             "model_conversation": _model_for_provider_task(provider, "conversation"),
+            "models_judge": _models_for_provider_task(provider, "judge"),
+            "models_search": _models_for_provider_task(provider, "search"),
+            "models_conversation": _models_for_provider_task(provider, "conversation"),
+            "reasoning_judge": _reasoning_for_provider_task(provider, "judge"),
+            "reasoning_search": _reasoning_for_provider_task(provider, "search"),
+            "reasoning_conversation": _reasoning_for_provider_task(provider, "conversation"),
         }
 
     return {

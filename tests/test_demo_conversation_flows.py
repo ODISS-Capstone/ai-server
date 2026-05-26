@@ -299,6 +299,59 @@ def test_prior_conversation_no_leads_to_registration_prompt(tmp_path):
     assert "처음 뵙는" not in second.response_text
 
 
+def test_unknown_profile_recall_says_unknown_before_registration_prompt(tmp_path):
+    memory = make_memory(tmp_path)
+
+    result = run(
+        identity_guard.evaluate_identity_gate(
+            memory_engine=memory,
+            text="나 누군지 알아",
+            speaker_id="unknown-profile-recall-user",
+        )
+    )
+
+    assert result.allowed is False
+    assert result.reason == "needs_registration"
+    assert "아직" in result.response_text
+    assert "누구신지 모릅니다" in result.response_text
+    assert "이름, 나이, 성별" in result.response_text
+
+
+def test_initial_profile_recall_skips_prior_conversation_llm(tmp_path, monkeypatch):
+    memory = make_memory(tmp_path)
+    speaker_id = "initial-profile-recall-user"
+    run(
+        identity_guard.evaluate_identity_gate(
+            memory_engine=memory,
+            text="오디스",
+            speaker_id=speaker_id,
+        )
+    )
+
+    async def fail_if_identity_llm_called(**kwargs):
+        raise AssertionError("profile recall should not call identity extraction LLM")
+
+    async def fail_if_prior_judge_called(**kwargs):
+        raise AssertionError("profile recall should not call prior conversation judge")
+
+    monkeypatch.setattr(identity_guard, "extract_identity_profile_with_llm", fail_if_identity_llm_called)
+    monkeypatch.setattr(identity_guard, "judge_prior_conversation_turn", fail_if_prior_judge_called)
+
+    result = run(
+        identity_guard.evaluate_identity_gate(
+            memory_engine=memory,
+            text="내가 누구야",
+            speaker_id=speaker_id,
+        )
+    )
+
+    assert result.allowed is False
+    assert result.reason == "needs_registration"
+    assert "아직" in result.response_text
+    assert "누구신지 모릅니다" in result.response_text
+    assert "일전에 대화" not in result.response_text
+
+
 def test_new_speaker_uses_flash_profile_before_registration_prompt(tmp_path):
     memory = make_memory(tmp_path)
     run(
@@ -413,6 +466,8 @@ def test_explicit_reregistration_request_prompts_for_new_identity(tmp_path, monk
 
     assert recall.allowed is False
     assert recall.reason == "needs_registration"
+    assert "아직" in recall.response_text
+    assert "누구신지 모릅니다" in recall.response_text
     assert "홍길동" not in recall.response_text
 
 
@@ -439,6 +494,40 @@ def test_different_person_reregistration_request_does_not_return_blank(tmp_path)
     assert result.response_text
     assert result.reason == "identity_rejected_needs_registration"
     assert state.get("pending_identity_action") == "registration"
+
+
+def test_current_profile_name_negation_starts_registration_without_llm(tmp_path, monkeypatch):
+    memory = make_memory(tmp_path)
+    run(
+        memory.save_identity_profile(
+            "profile-negation-user",
+            {"name": "김영수", "gender": "남성", "age": "72"},
+            mark_verified=True,
+        )
+    )
+    calls = []
+
+    async def fake_judge_identity_conflict(**kwargs):
+        calls.append(kwargs)
+        return {"conflict": False, "source": "should_not_be_called"}
+
+    monkeypatch.setattr(identity_guard, "judge_identity_conflict", fake_judge_identity_conflict)
+
+    result = run(
+        identity_guard.evaluate_identity_gate(
+            memory_engine=memory,
+            text="아니야 나 김영수 아니야",
+            speaker_id="profile-negation-user",
+        )
+    )
+
+    state = run(memory.load_identity_state("profile-negation-user"))
+    assert result.allowed is False
+    assert result.reason == "identity_rejected_needs_registration"
+    assert "김영수님으로 보지 않겠습니다" in result.response_text
+    assert "새로 등록할 이름, 나이, 성별" in result.response_text
+    assert state.get("pending_identity_action") == "registration"
+    assert calls == []
 
 
 def test_profile_consistency_conflict_uses_llm_judge_not_keyword_heuristic(tmp_path, monkeypatch):
@@ -1072,7 +1161,7 @@ def test_new_medication_received_routes_to_ocr_capture(tmp_path):
     assert "확인된 정보가 제한적" not in result.conversation.response_text
 
 
-def test_meal_medication_guidance_uses_llm_route_without_ocr(tmp_path, monkeypatch):
+def test_meal_medication_guidance_uses_deterministic_fast_path_without_ocr(tmp_path, monkeypatch):
     memory = make_memory(tmp_path)
     speaker_id = "meal-route-user"
     run(
@@ -1089,21 +1178,9 @@ def test_meal_medication_guidance_uses_llm_route_without_ocr(tmp_path, monkeypat
         )
     )
     orchestrator = make_orchestrator(memory)
-    labels = iter(["meal_medication_prep", "after_meal_medication"])
-    calls = []
 
     async def fake_classify_route(**kwargs):
-        label = next(labels)
-        calls.append({**kwargs, "label": label})
-        return {
-            "usable": True,
-            "route_label": label,
-            "mode": "MEMORY_ONLY",
-            "intent": "medication_query",
-            "task_types": [],
-            "rationale": "test_llm_route",
-            "source": "test_local_llm",
-        }
+        raise AssertionError(f"meal guidance should not call local LLM route: {kwargs!r}")
 
     monkeypatch.setattr(
         "app.services.engine_orchestrator.classify_reasoning_route_with_llm",
@@ -1129,15 +1206,19 @@ def test_meal_medication_guidance_uses_llm_route_without_ocr(tmp_path, monkeypat
         )
     )
 
-    assert len(calls) == 2
-    assert prep.decision.rationale == "local_llm_route:meal_medication_prep"
-    assert after_meal.decision.rationale == "local_llm_route:after_meal_medication"
+    assert prep.decision.rationale == "stored_medication_meal_guidance"
+    assert after_meal.decision.rationale == "stored_medication_meal_guidance"
     assert prep.decision.tasks == []
     assert after_meal.decision.tasks == []
     assert "밥을 드신 뒤" in prep.conversation.response_text
     assert "혈압약" in after_meal.conversation.response_text
     assert not prep.execution_results.get("task_results", {}).get("ocr_requested")
     assert not after_meal.execution_results.get("task_results", {}).get("ocr_requested")
+    assert any(
+        event.action == "skip_route_classification"
+        and event.metadata.get("route_skipped_reason") == "stored_medication_meal_guidance"
+        for event in prep.engine_trace
+    )
 
 
 def test_after_meal_question_with_wake_word_uses_stored_medication_first(tmp_path, monkeypatch):
@@ -1319,7 +1400,7 @@ def test_medication_record_challenge_confirms_existing_record(tmp_path, monkeypa
     assert "아직 기록" not in answer
 
 
-def test_llm_routed_noise_and_ack_are_ignored_without_tts(tmp_path, monkeypatch):
+def test_llm_routed_noise_is_ignored_but_ack_uses_smalltalk_fast_path(tmp_path, monkeypatch):
     memory = make_memory(tmp_path)
     run(
         memory.save_identity_profile(
@@ -1366,10 +1447,9 @@ def test_llm_routed_noise_and_ack_are_ignored_without_tts(tmp_path, monkeypatch)
         )
     )
 
-    assert ack.conversation.response_type == "ignored"
-    assert ack.conversation.response_text == ""
-    assert ack.conversation.requires_tts is False
-    assert ack.execution_results.get("suppressed") is True
+    assert ack.conversation.response_type == "smalltalk"
+    assert ack.conversation.requires_tts is True
+    assert ack.decision.rationale == "smalltalk_detected"
     assert fragment.conversation.response_type == "ignored"
     assert fragment.conversation.response_text == ""
     assert fragment.conversation.requires_tts is False
@@ -1432,6 +1512,7 @@ def test_reminder_service_override_dispatch_and_taken_record(tmp_path):
         )
     )
     assert "복용했다고 말씀하셨습니다" in recalled
+    assert "오후 12시" in recalled
 
 
 def test_reminder_story_setup_wait_taken_and_recall(tmp_path):
@@ -1517,7 +1598,17 @@ def test_reminder_story_setup_wait_taken_and_recall(tmp_path):
             user_profile={"name": "김영수"},
         )
     )
-    assert "오늘 식후 혈압약을 복용했다고 말씀하셨습니다" in recall
+    assert "오늘 오후 12시 3분에 식후 혈압약을 복용했다고 말씀하셨습니다" in recall
+
+    time_recall = run(
+        service.handle_user_text(
+            memory_engine=memory,
+            speaker_id="demo-kim",
+            text="몇 시에 먹었지",
+            user_profile={"name": "김영수"},
+        )
+    )
+    assert "오늘 오후 12시 3분에 식후 혈압약" in time_recall
 
 
 def make_orchestrator(memory: MemoryEngine) -> EngineOrchestrator:
@@ -1528,6 +1619,158 @@ def make_orchestrator(memory: MemoryEngine) -> EngineOrchestrator:
         conversation_engine=ConversationEngine(),
         llm_judge=judge,
     )
+
+
+def test_spoken_medication_registration_updates_prescription_memory(tmp_path):
+    memory = make_memory(tmp_path)
+
+    assert memory.extract_spoken_medications_from_text("나 디오반정 가지고 있거든 한번 확인해 줘") == ["디오반정"]
+    assert memory.extract_spoken_medications_from_text("나 혈압 양 디오반") == ["디오반정"]
+    assert memory.extract_spoken_medications_from_text("혈압약 디오반 먹어도 돼?") == []
+
+    merged = run(
+        memory.store_spoken_medication_result(
+            "나 디오반정 가지고 있거든 한번 확인해 줘",
+            ["디오반정"],
+            speaker_id="speaker-hyun",
+        )
+    )
+    prescription_log = run(memory.store.read_flash("prescription_log"))
+
+    assert "디오반정" in merged
+    assert "디오반정" in prescription_log
+
+
+def test_orchestrator_medication_safety_question_skips_delivery_llm(tmp_path, monkeypatch):
+    memory = make_memory(tmp_path)
+    speaker_id = "medication-safety-user"
+    run(
+        memory.save_identity_profile(
+            speaker_id,
+            {"name": "김영수", "age": "72", "gender": "남성"},
+            mark_verified=True,
+        )
+    )
+    run(
+        memory.store.write_flash(
+            "prescription_log",
+            "# 현재 복용 약 요약\n\n## 약품 목록\n- 디오반정\n",
+        )
+    )
+
+    async def fail_if_route_llm_called(**kwargs):
+        raise AssertionError("medication safety fast path should not call route LLM")
+
+    async def fail_if_delivery_llm_called(**kwargs):
+        raise AssertionError("medication safety fast path should not call delivery LLM")
+
+    monkeypatch.setattr(
+        "app.services.engine_orchestrator.classify_reasoning_route_with_llm",
+        fail_if_route_llm_called,
+    )
+    monkeypatch.setattr(
+        "app.services.engine_orchestrator.call_local_delivery_llm",
+        fail_if_delivery_llm_called,
+    )
+
+    orchestrator = make_orchestrator(memory)
+    result = run(
+        orchestrator.run_turn(
+            text="오디스 내가 디오반정을 내게 동시에 먹어도 될까",
+            speaker_id=speaker_id,
+            include_judge=False,
+            include_delivery_llm=True,
+            run_identity_gate=True,
+        )
+    )
+
+    assert result.decision.mode == ReasoningMode.MEMORY_ONLY
+    assert result.decision.rationale == "medication_safety_fast_path"
+    assert result.decision.tasks == []
+    assert result.filler_text == ""
+    answer = result.conversation.response_text
+    assert "김영수님" in answer
+    assert "디오반정" in answer
+    assert "한 번에" in answer
+    assert "119" in answer
+    assert "디곡신" not in answer
+    assert "方才" not in answer
+    assert "主治" not in answer
+
+
+def test_orchestrator_spoken_medication_registration_and_vague_followup(tmp_path):
+    memory = make_memory(tmp_path)
+    run(
+        memory.save_identity_profile(
+            "speaker-hyun",
+            {"name": "정현기", "age": "23", "gender": "남성"},
+            mark_verified=True,
+        )
+    )
+    orchestrator = make_orchestrator(memory)
+
+    add_result = run(
+        orchestrator.run_turn(
+            text="나 디오반정 가지고 있거든 한번 확인해 줘",
+            speaker_id="speaker-hyun",
+            include_judge=False,
+            include_delivery_llm=False,
+            run_identity_gate=True,
+        )
+    )
+
+    assert add_result.decision.rationale == "spoken_medication_registration"
+    assert "디오반정" in add_result.conversation.response_text
+    prescription_log = run(memory.store.read_flash("prescription_log"))
+    assert "디오반정" in prescription_log
+
+    followup_result = run(
+        orchestrator.run_turn(
+            text="오늘 그거 먹어야 돼",
+            speaker_id="speaker-hyun",
+            include_judge=False,
+            include_delivery_llm=False,
+            run_identity_gate=True,
+        )
+    )
+
+    assert followup_result.decision.rationale == "stored_medication_vague_guidance"
+    assert "디오반정" in followup_result.conversation.response_text
+    assert "한 번 더 드시지 마세요" in followup_result.conversation.response_text
+
+
+def test_orchestrator_profile_memory_ack_ignores_medication_context(tmp_path):
+    memory = make_memory(tmp_path)
+    run(
+        memory.save_identity_profile(
+            "speaker-kim",
+            {"name": "김영수", "age": "72", "gender": "남성"},
+            mark_verified=True,
+        )
+    )
+    run(
+        memory.store.write_flash(
+            "prescription_log",
+            "# 현재 복용 약 요약\n\n## 약품 목록\n- 타이레놀\n",
+        )
+    )
+    orchestrator = make_orchestrator(memory)
+
+    result = run(
+        orchestrator.run_turn(
+            text="알았어 나 잘 기억해 줘",
+            speaker_id="speaker-kim",
+            include_judge=False,
+            include_delivery_llm=False,
+            run_identity_gate=True,
+        )
+    )
+
+    assert result.decision.rationale == "profile_memory_ack"
+    assert result.conversation.response_type == "profile_recall"
+    assert "김영수님" in result.conversation.response_text
+    assert "타이레놀" not in result.conversation.response_text
+    assert "의사·약사" not in result.conversation.response_text
 
 
 def test_orchestrator_profile_recall_after_name_mismatch(tmp_path):
