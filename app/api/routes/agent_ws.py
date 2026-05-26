@@ -862,15 +862,29 @@ async def _handle_stored_medication_guidance_request(
     speaker_id: str | None,
     identity_gate,
 ) -> bool:
-    """Answer vague meal/that-med requests from stored medication context."""
+    """Answer vague meal/that-med requests from stored or explicitly named medication context."""
     if not speaker_id or not _has_stored_medication_guidance_signal(text):
         return False
     context = await _load_context_with_identity_profile(speaker_id, identity_gate)
-    meds = _medications_from_prescription_log(context.get("prescription_log", ""))
+    stored_meds = _medications_from_prescription_log(context.get("prescription_log", ""))
+    explicit_meds = _explicit_medications_from_text(text)
+    meds = explicit_meds or stored_meds
     if not meds or not _is_stored_medication_guidance_request(text, meds):
         return False
 
-    response_text = _build_stored_medication_guidance_text(text, meds, context)
+    explicit_meal_guidance = bool(explicit_meds and _is_meal_guidance_signal(text))
+    if explicit_meal_guidance:
+        await memory_engine.store_spoken_medication_result(
+            text,
+            explicit_meds,
+            speaker_id=speaker_id,
+        )
+    response_text = _build_stored_medication_guidance_text(
+        text,
+        meds,
+        context,
+        explicit_meal_guidance=explicit_meal_guidance,
+    )
     response = conversation_engine.build_response(
         {
             "text": response_text,
@@ -882,7 +896,7 @@ async def _handle_stored_medication_guidance_request(
         {
             "type": "response",
             **response,
-            "fast_path": "stored_medication_guidance",
+            "fast_path": "named_meal_medication_guidance" if explicit_meal_guidance else "stored_medication_guidance",
             "medications": meds,
         }
     )
@@ -1316,11 +1330,21 @@ def _build_stored_medication_guidance_text(
     text: str,
     meds: list[str],
     context: dict[str, Any],
+    *,
+    explicit_meal_guidance: bool = False,
 ) -> str:
     name = _display_name_from_context(context)
     med_text = _friendly_medication_label(meds)
     meal = _meal_hint_from_text(text)
     compact = re.sub(r"\s+", "", text or "")
+    if explicit_meal_guidance:
+        meal_part = f"{meal} 식사 후" if meal else "식사 후"
+        return (
+            f"{name}, 네. 지금 말씀하신 기준으로 {meal_part}에 {med_text}을 드셔야 하는 것으로 기억해둘게요. "
+            f"밥을 드신 뒤 '밥 먹었어'라고 말씀하시면 {med_text} 복용을 안내드리고, "
+            "드신 뒤에는 '먹었어'라고 말씀하시면 복용 기록으로 남기겠습니다. "
+            "복용량은 약봉투나 제품 포장에 적힌 대로만 드세요."
+        )
     if _is_meal_guidance_signal(text):
         meal_part = f"{meal} 식사 후" if meal else "식사 후"
         return (
@@ -1344,6 +1368,27 @@ def _medications_from_prescription_log(content: str) -> list[str]:
             if name and name not in meds:
                 meds.append(name)
     return meds[:8]
+
+
+def _explicit_medications_from_text(text: str) -> list[str]:
+    cleaned = strip_wake_words(text)
+    compact = re.sub(r"[\s.?!,，。~]+", "", cleaned.lower())
+    meds: list[str] = []
+    for med in extract_medication_suffix_tokens(cleaned):
+        if med not in meds:
+            meds.append(med)
+    aliases = {
+        "타이레놀": "타이레놀",
+        "아세트아미노펜": "아세트아미노펜",
+        "디오반": "디오반정",
+        "와파린": "와파린",
+        "아스피린": "아스피린",
+        "로사르탄": "로사르탄정",
+    }
+    for alias, canonical in aliases.items():
+        if alias in compact and canonical not in meds:
+            meds.append(canonical)
+    return meds[:5]
 
 
 def _display_name_from_context(context: dict[str, Any]) -> str:
@@ -1400,6 +1445,19 @@ def _meal_hint_from_text(text: str) -> str:
     for meal in ("아침", "점심", "저녁"):
         if meal in text:
             return meal
+    if _is_meal_guidance_signal(text) or any(token in text for token in ("밥", "식사", "식후")):
+        return _meal_hint_from_current_time()
+    return ""
+
+
+def _meal_hint_from_current_time(now: datetime | None = None) -> str:
+    hour = (now or datetime.now()).hour
+    if 4 <= hour < 11:
+        return "아침"
+    if 11 <= hour < 16:
+        return "점심"
+    if 16 <= hour < 22:
+        return "저녁"
     return ""
 
 

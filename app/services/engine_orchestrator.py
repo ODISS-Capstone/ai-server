@@ -2263,7 +2263,8 @@ class EngineOrchestrator:
     ) -> dict[str, Any]:
         if classify_patient_safety_situation(text):
             return {}
-        meds = self._medications_from_context(context)
+        explicit_meds = self._explicit_medications_from_text(text)
+        meds = explicit_meds or self._medications_from_context(context)
         if not meds:
             return {}
         if not self._is_stored_medication_guidance_request(text, meds):
@@ -2275,6 +2276,17 @@ class EngineOrchestrator:
         if self._is_meal_medication_prep_request(text) or self._is_after_meal_medication_request(text):
             meal = self._meal_hint_from_text(text)
             meal_part = f"{meal} 식사 후" if meal else "식사 후"
+            if explicit_meds:
+                return {
+                    "rationale": "named_medication_meal_guidance",
+                    "response_text": (
+                        f"{name}, 네. 지금 말씀하신 기준으로 {meal_part}에 {med_text}을 드셔야 하는 것으로 기억해둘게요. "
+                        f"밥을 드신 뒤 '밥 먹었어'라고 말씀하시면 {med_text} 복용을 안내드리고, "
+                        "드신 뒤에는 '먹었어'라고 말씀하시면 복용 기록으로 남기겠습니다. "
+                        "복용량은 약봉투나 제품 포장에 적힌 대로만 드세요."
+                    ),
+                    "medications": meds,
+                }
             return {
                 "rationale": "stored_medication_meal_guidance",
                 "response_text": (
@@ -2972,6 +2984,27 @@ class EngineOrchestrator:
         return meds[:8]
 
     @staticmethod
+    def _explicit_medications_from_text(text: str) -> list[str]:
+        cleaned = strip_wake_words(text)
+        compact = re.sub(r"[\s.?!,，。~]+", "", cleaned.lower())
+        meds: list[str] = []
+        for med in extract_medication_suffix_tokens(cleaned):
+            if med not in meds:
+                meds.append(med)
+        aliases = {
+            "타이레놀": "타이레놀",
+            "아세트아미노펜": "아세트아미노펜",
+            "디오반": "디오반정",
+            "와파린": "와파린",
+            "아스피린": "아스피린",
+            "로사르탄": "로사르탄정",
+        }
+        for alias, canonical in aliases.items():
+            if alias in compact and canonical not in meds:
+                meds.append(canonical)
+        return meds[:5]
+
+    @staticmethod
     def _is_lifestyle_memory_text(text: str) -> bool:
         return "산책" in text and "보리차" in text
 
@@ -3096,6 +3129,19 @@ class EngineOrchestrator:
         for meal in ("아침", "점심", "저녁"):
             if meal in text:
                 return meal
+        if EngineOrchestrator._is_after_meal_medication_request(text) or any(token in text for token in ("밥", "식사", "식후")):
+            return EngineOrchestrator._meal_hint_from_current_time()
+        return ""
+
+    @staticmethod
+    def _meal_hint_from_current_time(now: datetime | None = None) -> str:
+        hour = (now or datetime.now()).hour
+        if 4 <= hour < 11:
+            return "아침"
+        if 11 <= hour < 16:
+            return "점심"
+        if 16 <= hour < 22:
+            return "저녁"
         return ""
 
     @staticmethod

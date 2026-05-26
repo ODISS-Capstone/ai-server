@@ -1383,6 +1383,51 @@ def test_short_meal_completion_without_medication_context_asks_for_package(tmp_p
     assert "확인된 정보가 제한적" not in result.conversation.response_text
 
 
+def test_named_after_meal_medication_guidance_infers_breakfast_without_stored_med(tmp_path, monkeypatch):
+    memory = make_memory(tmp_path)
+    speaker_id = "named-meal-med-user"
+    run(
+        memory.save_identity_profile(
+            speaker_id,
+            {"name": "김영수", "gender": "남성", "age": "72"},
+            mark_verified=True,
+        )
+    )
+
+    async def fake_classify_route(**kwargs):
+        raise AssertionError(f"named meal guidance should not call local LLM route: {kwargs!r}")
+
+    monkeypatch.setattr(
+        "app.services.engine_orchestrator.classify_reasoning_route_with_llm",
+        fake_classify_route,
+    )
+    monkeypatch.setattr(
+        EngineOrchestrator,
+        "_meal_hint_from_current_time",
+        staticmethod(lambda now=None: "아침"),
+    )
+
+    orchestrator = make_orchestrator(memory)
+    result = run(
+        orchestrator.run_turn(
+            text="어 나 밥 먹고 나서 타이레놀 먹어야 되거든 알려 줄 수 있어",
+            speaker_id=speaker_id,
+            include_judge=False,
+            include_delivery_llm=False,
+            run_identity_gate=True,
+        )
+    )
+
+    assert result.decision.rationale == "named_medication_meal_guidance"
+    assert result.decision.tasks == []
+    answer = result.conversation.response_text
+    assert "아침 식사 후" in answer
+    assert "타이레놀" in answer
+    assert "밥 먹었어" in answer
+    assert "먹었어" in answer
+    assert "현재 저장된 식후 복용약 기록이 없습니다" not in answer
+
+
 def test_medication_record_challenge_confirms_existing_record(tmp_path, monkeypatch):
     memory = make_memory(tmp_path)
     speaker_id = "record-challenge-user"
