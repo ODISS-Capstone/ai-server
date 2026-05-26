@@ -209,6 +209,14 @@ ELDERLY_DIALOG_SCENARIOS = [
         "no_filler": True,
     },
     {
+        "id": "plain_sudden_chest_pain",
+        "text": "어 나 갑자기 가슴이 아파 어떡하지",
+        "mode": ReasoningMode.FRONTIER_FIRST,
+        "tasks": ["emergency_alert"],
+        "must": ["119", "응급실"],
+        "no_filler": True,
+    },
+    {
         "id": "profile_recall",
         "text": "내 이름이 뭐지?",
         "mode": ReasoningMode.MEMORY_ONLY,

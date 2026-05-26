@@ -242,7 +242,11 @@ def test_registered_smalltalk_acknowledgement_uses_fast_path_without_filler(
     assert "out_of_scope" not in payload["response_text"]
 
 
-def test_symptom_utterance_does_not_use_smalltalk_fast_path(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("text", ["가슴이 답답해", "어 나 갑자기 가슴이 아파 어떡하지"])
+def test_symptom_utterance_does_not_use_smalltalk_fast_path(
+    monkeypatch: pytest.MonkeyPatch,
+    text: str,
+) -> None:
     fake_memory = FakeMemoryEngine()
     websocket = FakeWebSocket()
     calls: list[str] = []
@@ -281,7 +285,7 @@ def test_symptom_utterance_does_not_use_smalltalk_fast_path(monkeypatch: pytest.
             {
                 "type": "stt_result",
                 "speaker_id": "speaker-kim",
-                "text": "가슴이 답답해",
+                "text": text,
             },
             set(),
         )
