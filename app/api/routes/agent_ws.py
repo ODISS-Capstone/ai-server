@@ -557,7 +557,7 @@ async def _handle_profile_memory_ack_fast_path(
     response = conversation_engine.build_response(
         {
             "text": response_text,
-            "type": "profile_recall",
+            "type": "profile_memory_ack",
             "requires_tts": True,
         }
     )
@@ -1354,16 +1354,8 @@ def _display_name_from_context(context: dict[str, Any]) -> str:
 
 def _build_profile_memory_ack_response(profile: dict[str, Any]) -> str:
     name = str((profile or {}).get("name") or "").strip()
-    age = str((profile or {}).get("age") or "").strip()
-    gender = str((profile or {}).get("gender") or "").strip()
     if name:
-        details = []
-        if gender:
-            details.append(gender)
-        if age:
-            details.append(f"{age}세")
-        detail_text = f" ({', '.join(details)})" if details else ""
-        return f"네, {name}님{detail_text}으로 기억하고 있습니다."
+        return f"네, 알겠습니다. 앞으로 {name}님 정보로 잘 기억하겠습니다."
     return "아직 등록된 이름이 없습니다. 이름, 나이, 성별을 말씀해 주시면 기억하겠습니다."
 
 

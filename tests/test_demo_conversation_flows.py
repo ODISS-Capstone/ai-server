@@ -1796,8 +1796,9 @@ def test_orchestrator_profile_memory_ack_ignores_medication_context(tmp_path):
     )
 
     assert result.decision.rationale == "profile_memory_ack"
-    assert result.conversation.response_type == "profile_recall"
-    assert "김영수님" in result.conversation.response_text
+    assert result.conversation.response_type == "profile_memory_ack"
+    assert "앞으로 김영수님 정보로 잘 기억하겠습니다" in result.conversation.response_text
+    assert "남성, 72세" not in result.conversation.response_text
     assert "타이레놀" not in result.conversation.response_text
     assert "의사·약사" not in result.conversation.response_text
 

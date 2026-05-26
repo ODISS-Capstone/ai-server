@@ -319,7 +319,7 @@ class EngineOrchestrator:
             }
             conversation = ConversationComposeResponse(
                 response_text=profile_memory_ack["response_text"],
-                response_type="profile_recall",
+                response_type="profile_memory_ack",
                 requires_tts=True,
             )
             trace_engine(
@@ -2077,18 +2077,10 @@ class EngineOrchestrator:
             return {}
         profile = context.get("user_profile") or {}
         name = str(profile.get("name") or "").strip()
-        age = str(profile.get("age") or "").strip()
-        gender = str(profile.get("gender") or "").strip()
         if not name:
             response = "아직 등록된 이름이 없습니다. 이름, 나이, 성별을 말씀해 주시면 기억하겠습니다."
         else:
-            details = []
-            if gender:
-                details.append(gender)
-            if age:
-                details.append(f"{age}세")
-            detail_text = f" ({', '.join(details)})" if details else ""
-            response = f"네, {name}님{detail_text}으로 기억하고 있습니다."
+            response = f"네, 알겠습니다. 앞으로 {name}님 정보로 잘 기억하겠습니다."
         return {
             "rationale": "profile_memory_ack",
             "response_text": response,

@@ -1278,8 +1278,9 @@ def test_agent_ws_profile_memory_ack_does_not_use_medication_context(
 
     assert not any(payload.get("type") == "filler" for payload in websocket.sent)
     assert websocket.sent[-1]["fast_path"] == "profile_memory_ack"
-    assert websocket.sent[-1]["response_type"] == "profile_recall"
-    assert "김영수님" in websocket.sent[-1]["response_text"]
+    assert websocket.sent[-1]["response_type"] == "profile_memory_ack"
+    assert "앞으로 김영수님 정보로 잘 기억하겠습니다" in websocket.sent[-1]["response_text"]
+    assert "남성, 72세" not in websocket.sent[-1]["response_text"]
     assert "타이레놀" not in websocket.sent[-1]["response_text"]
     assert "의사·약사" not in websocket.sent[-1]["response_text"]
 
