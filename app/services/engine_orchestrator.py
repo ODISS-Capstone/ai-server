@@ -319,7 +319,7 @@ class EngineOrchestrator:
             }
             conversation = ConversationComposeResponse(
                 response_text=profile_memory_ack["response_text"],
-                response_type="profile_recall",
+                response_type="profile_memory_ack",
                 requires_tts=True,
             )
             trace_engine(
@@ -2077,18 +2077,10 @@ class EngineOrchestrator:
             return {}
         profile = context.get("user_profile") or {}
         name = str(profile.get("name") or "").strip()
-        age = str(profile.get("age") or "").strip()
-        gender = str(profile.get("gender") or "").strip()
         if not name:
             response = "아직 등록된 이름이 없습니다. 이름, 나이, 성별을 말씀해 주시면 기억하겠습니다."
         else:
-            details = []
-            if gender:
-                details.append(gender)
-            if age:
-                details.append(f"{age}세")
-            detail_text = f" ({', '.join(details)})" if details else ""
-            response = f"네, {name}님{detail_text}으로 기억하고 있습니다."
+            response = f"네, 알겠습니다. 앞으로 {name}님 정보로 잘 기억하겠습니다."
         return {
             "rationale": "profile_memory_ack",
             "response_text": response,
@@ -2271,7 +2263,8 @@ class EngineOrchestrator:
     ) -> dict[str, Any]:
         if classify_patient_safety_situation(text):
             return {}
-        meds = self._medications_from_context(context)
+        explicit_meds = self._explicit_medications_from_text(text)
+        meds = explicit_meds or self._medications_from_context(context)
         if not meds:
             return {}
         if not self._is_stored_medication_guidance_request(text, meds):
@@ -2282,7 +2275,54 @@ class EngineOrchestrator:
         trace_engine("ME_RAG", "MemoryEngine", "stored_medication_guidance")
         if self._is_meal_medication_prep_request(text) or self._is_after_meal_medication_request(text):
             meal = self._meal_hint_from_text(text)
-            meal_part = f"{meal} 식사 후" if meal else "식사 후"
+            meal_label = f"{meal} 식사" if meal else "식사"
+            if explicit_meds:
+                if self._is_meal_based_notification_guidance_request(text):
+                    return {
+                        "rationale": "named_medication_meal_guidance",
+                        "response_text": (
+                            f"{name}, 네. 지금은 {self._current_time_phrase()}이라 {meal_label} 후 {med_text} 안내로 기억해둘게요. "
+                            f"{meal_label}를 하고 오시면 저에게 '밥 먹었어'라고 말씀해 주세요. "
+                            f"그러면 {med_text}을 드시라고 안내드리겠습니다. "
+                            "드신 뒤에는 '먹었어'라고 알려주시면 복용 기록으로 남기겠습니다. "
+                            "복용량은 약봉투나 제품 포장에 적힌 대로만 드세요."
+                        ),
+                        "medications": meds,
+                    }
+                return {
+                    "rationale": "named_medication_meal_guidance",
+                    "response_text": (
+                        f"{name}, 네. 지금 말씀하신 기준으로 {meal_label} 후 {med_text}을 드셔야 하는 것으로 기억해둘게요. "
+                        f"{meal_label}를 하고 오시면 저에게 '밥 먹었어'라고 말씀해 주세요. "
+                        f"그러면 {med_text} 복용을 안내드리겠습니다. "
+                        "드신 뒤에는 '먹었어'라고 말씀하시면 복용 기록으로 남기겠습니다. "
+                        "복용량은 약봉투나 제품 포장에 적힌 대로만 드세요."
+                    ),
+                    "medications": meds,
+                }
+            if self._is_meal_based_notification_guidance_request(text):
+                return {
+                    "rationale": "stored_medication_meal_guidance",
+                    "response_text": (
+                        f"{name}, 네. 지금은 {self._current_time_phrase()}이라 {meal_label} 후 {med_text} 안내로 기억해둘게요. "
+                        f"{meal_label}를 하고 오시면 저에게 '밥 먹었어'라고 말씀해 주세요. "
+                        f"그러면 {med_text}을 드시라고 안내드리겠습니다. "
+                        "드신 뒤에는 '먹었어'라고 알려주시면 복용 기록으로 남기겠습니다. "
+                        "복용량은 약봉투나 처방전에 적힌 대로만 드세요."
+                    ),
+                    "medications": meds,
+                }
+            if self._is_after_meal_completion_signal(text):
+                return {
+                    "rationale": "stored_medication_meal_guidance",
+                    "response_text": (
+                        f"{name}, 네. {meal_label}를 하셨군요. {med_text}을 드시면 됩니다. "
+                        "복용량은 약봉투나 처방전에 적힌 대로만 드세요. "
+                        "드신 뒤에는 '먹었어'라고 말씀해 주세요."
+                    ),
+                    "medications": meds,
+                }
+            meal_part = f"{meal_label} 후"
             return {
                 "rationale": "stored_medication_meal_guidance",
                 "response_text": (
@@ -2308,10 +2348,11 @@ class EngineOrchestrator:
         if not compact:
             return False
         if any(token in compact for token in ("알림", "알람", "예약", "깨워", "설정", "추가")):
-            return False
+            if not EngineOrchestrator._is_meal_based_notification_guidance_request(text):
+                return False
         if any(token in compact for token in ("먹어도돼", "먹어도되", "같이먹", "동시에", "많이먹", "네개", "4개")):
             return False
-        if any(token in compact for token in ("밥먹었", "식사했", "식사끝", "식후", "저녁먹었", "점심먹었", "아침먹었", "잘먹었", "잘먹었습니다", "잘먹음")):
+        if any(token in compact for token in ("밥먹었", "밥먹고오", "먹고오면", "식사했", "식사끝", "식후", "저녁먹었", "점심먹었", "아침먹었", "잘먹었", "잘먹었습니다", "잘먹음")):
             return True
         if "그거" in compact and any(token in compact for token in ("먹어야", "먹나", "먹으면", "먹을까")):
             return True
@@ -2980,6 +3021,27 @@ class EngineOrchestrator:
         return meds[:8]
 
     @staticmethod
+    def _explicit_medications_from_text(text: str) -> list[str]:
+        cleaned = strip_wake_words(text)
+        compact = re.sub(r"[\s.?!,，。~]+", "", cleaned.lower())
+        meds: list[str] = []
+        for med in extract_medication_suffix_tokens(cleaned):
+            if med not in meds:
+                meds.append(med)
+        aliases = {
+            "타이레놀": "타이레놀",
+            "아세트아미노펜": "아세트아미노펜",
+            "디오반": "디오반정",
+            "와파린": "와파린",
+            "아스피린": "아스피린",
+            "로사르탄": "로사르탄정",
+        }
+        for alias, canonical in aliases.items():
+            if alias in compact and canonical not in meds:
+                meds.append(canonical)
+        return meds[:5]
+
+    @staticmethod
     def _is_lifestyle_memory_text(text: str) -> bool:
         return "산책" in text and "보리차" in text
 
@@ -3049,6 +3111,13 @@ class EngineOrchestrator:
         return f"{label} {display_hour}시 {minute}분" if minute else f"{label} {display_hour}시"
 
     @staticmethod
+    def _current_time_phrase(now: datetime | None = None) -> str:
+        current = now or datetime.now()
+        label = "오전" if current.hour < 12 else "오후"
+        hour = current.hour if 1 <= current.hour <= 12 else current.hour - 12 if current.hour > 12 else 12
+        return f"{label} {hour}시 {current.minute}분" if current.minute else f"{label} {hour}시"
+
+    @staticmethod
     def _is_meal_medication_prep_request(text: str) -> bool:
         return "밥" in text and "나중" in text and any(token in text for token in ("뭐 먹", "알려"))
 
@@ -3057,10 +3126,11 @@ class EngineOrchestrator:
         compact = re.sub(r"\s+", "", text or "")
         if EngineOrchestrator._is_after_meal_completion_signal(text):
             return True
+        med_signal = "약" in text or bool(EngineOrchestrator._explicit_medications_from_text(text))
         return (
             any(token in text for token in ("밥", "식후", "식사"))
-            and "약" in text
-            and any(token in compact for token in ("먹고왔", "먹었", "먹고난", "먹고나", "무슨약", "어떤약", "뭐먹", "먹어야"))
+            and med_signal
+            and any(token in compact for token in ("먹고왔", "먹고오", "먹었", "먹고난", "먹고나", "먹으라고", "무슨약", "어떤약", "뭐먹", "먹어야"))
         )
 
     @staticmethod
@@ -3069,6 +3139,10 @@ class EngineOrchestrator:
         if not compact:
             return False
         if any(token in compact for token in ("약먹", "약복용", "복용했")):
+            return False
+        future_guidance = any(token in compact for token in ("먹어야", "먹을", "알려줘", "알려줄", "알림해", "챙겨줘", "챙겨줄"))
+        explicit_done = any(token in compact for token in ("밥먹었", "식사했", "식사끝", "식사마쳤", "잘먹었", "잘먹었습니다", "잘먹음"))
+        if future_guidance and not explicit_done:
             return False
         if any(token in compact for token in ("잘먹었", "잘먹었습니다", "잘먹음", "잘먹고왔")):
             return True
@@ -3104,7 +3178,37 @@ class EngineOrchestrator:
         for meal in ("아침", "점심", "저녁"):
             if meal in text:
                 return meal
+        if EngineOrchestrator._is_after_meal_medication_request(text) or any(token in text for token in ("밥", "식사", "식후")):
+            return EngineOrchestrator._meal_hint_from_current_time()
         return ""
+
+    @staticmethod
+    def _meal_hint_from_current_time(now: datetime | None = None) -> str:
+        hour = (now or datetime.now()).hour
+        if 4 <= hour < 11:
+            return "아침"
+        if 11 <= hour < 16:
+            return "점심"
+        if 16 <= hour < 22:
+            return "저녁"
+        return ""
+
+    @staticmethod
+    def _is_meal_based_notification_guidance_request(text: str) -> bool:
+        compact = re.sub(r"[\s.?!,，。~]+", "", (text or "").strip().lower())
+        if not compact:
+            return False
+        if not (
+            EngineOrchestrator._is_after_meal_medication_request(text)
+            or EngineOrchestrator._is_after_meal_completion_signal(text)
+            or any(token in text for token in ("밥", "식사", "식후"))
+        ):
+            return False
+        if any(token in compact for token in ("초뒤", "초후", "분뒤", "분후", "시간뒤", "시간후", "오전", "오후")):
+            return False
+        if any(token in compact for token in ("알림추가", "알림설정", "알람설정", "예약", "깨워", "맞춰")):
+            return False
+        return any(token in compact for token in ("알림", "알람", "먹으라고", "챙겨줘", "챙겨줄"))
 
     @staticmethod
     def _is_current_medication_record_recall(text: str) -> bool:

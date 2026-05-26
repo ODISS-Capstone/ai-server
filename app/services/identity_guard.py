@@ -700,6 +700,10 @@ def _normalize_korean_person_name(name: str) -> str:
 
 def _looks_like_invalid_identity_name(name: str) -> bool:
     return name in {
+        "남자",
+        "여자",
+        "남성",
+        "여성",
         "남자고",
         "여자고",
         "남성이고",
