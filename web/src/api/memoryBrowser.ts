@@ -4,12 +4,14 @@ import type {
   PatientRecordsResponse,
   PatientSearchResponse,
 } from "./types";
+import { storedToken } from "./assistant";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL?.replace(/\/$/, "") ?? "";
-const TOKEN = import.meta.env.VITE_MEMORY_BROWSER_TOKEN ?? "";
+const FALLBACK_TOKEN = import.meta.env.VITE_MEMORY_BROWSER_TOKEN ?? "";
 
 function authHeaders(): HeadersInit {
   const headers: HeadersInit = { Accept: "application/json" };
+  const TOKEN = storedToken() || FALLBACK_TOKEN;
   if (TOKEN) {
     headers.Authorization = `Bearer ${TOKEN}`;
   }

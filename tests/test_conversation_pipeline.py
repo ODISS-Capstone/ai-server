@@ -32,6 +32,7 @@ def test_prompt_registry_has_judge_and_local_delivery_prompts(tmp_path):
 
 def test_judge_final_review_falls_back_without_openai_key(monkeypatch):
     monkeypatch.setattr(settings, "openai_api_key", None)
+    monkeypatch.setattr(settings, "together_api_key", None)
     engine = LLMJudgeEngine()
 
     result = asyncio.run(
@@ -118,3 +119,66 @@ def test_acknowledgement_compliment_is_fast_smalltalk():
     assert input_data["smalltalk_type"] == "acknowledgement"
     assert engine.fast_smalltalk_type("그래 잘했어") == "acknowledgement"
     assert engine.generate_filler(input_data) is None
+
+
+def test_assistant_presence_and_unsupported_requests_are_answered():
+    engine = ConversationEngine()
+
+    presence = engine.receive_input("어딨어")
+    news = engine.receive_input("오늘 뉴스 알려줘")
+
+    assert presence["is_smalltalk"] is True
+    assert presence["smalltalk_type"] == "presence"
+    assert "여기" in engine.build_assistant_response("어딨어")
+    assert news["is_smalltalk"] is True
+    assert news["smalltalk_type"] == "unsupported_but_answered"
+    assert "복약" in engine.build_assistant_response("오늘 뉴스 알려줘")
+
+
+def test_assistant_suggestion_capability_and_companion_are_specific():
+    engine = ConversationEngine()
+
+    suggestion = engine.receive_input("아니 뭐 하면 좋을까")
+    capability = engine.receive_input("너 뭐 할 수 있어")
+    companion = engine.receive_input("심심해")
+
+    assert suggestion["is_smalltalk"] is True
+    assert suggestion["smalltalk_type"] == "assistant_suggestion"
+    suggestion_response = engine.build_assistant_response("아니 뭐 하면 좋을까")
+    assert "드실 약 확인" in suggestion_response
+    assert "복약 알림" in suggestion_response
+    assert "약봉투 사진" in suggestion_response
+    assert capability["smalltalk_type"] == "assistant_capability"
+    assert "복약 확인" in engine.build_assistant_response("너 뭐 할 수 있어")
+    assert companion["smalltalk_type"] == "assistant_companion"
+    assert "곁에서" in engine.build_assistant_response("심심해")
+
+
+def test_assistant_suggestion_uses_meal_context_when_available(monkeypatch):
+    engine = ConversationEngine()
+    monkeypatch.setattr(
+        ConversationEngine,
+        "_current_meal_label",
+        staticmethod(lambda now=None: "아침"),
+    )
+
+    response = engine.build_assistant_response(
+        "뭐 하지",
+        context={"prescription_log": "# 현재 복용 약 요약\n\n## 약품 목록\n- 타이레놀\n"},
+    )
+
+    assert "아침 식후 약 확인" in response
+    assert "복약 알림" in response
+    assert "약봉투 사진" in response
+
+
+def test_symptom_words_are_not_treated_as_smalltalk():
+    engine = ConversationEngine()
+
+    input_data = engine.receive_input("갑자기 가슴이 아파 어떡하지")
+    suggestion_like = engine.receive_input("가슴 아픈데 뭐 하지")
+
+    assert input_data["is_smalltalk"] is False
+    assert input_data["smalltalk_type"] is None
+    assert suggestion_like["is_smalltalk"] is False
+    assert suggestion_like["smalltalk_type"] is None

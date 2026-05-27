@@ -6,16 +6,64 @@ import re
 # Keep in sync with local_agent/src/edge_node/vad.py WAKE_WORDS
 WAKE_WORDS: tuple[str, ...] = (
     "오디스야",
+    "오디세이",
+    "오딧세이",
+    "오디스요",
+    "오디스아",
+    "오디스여",
     "오디스",
+    "오디세",
+    "오딧스",
+    "오딧세",
+    "오디즈",
+    "오디쓰",
+    "오디수",
+    "오티스",
+    "오티즈",
+    "오티쓰",
+    "오티세",
+    "오티세이",
+    "오지스",
+    "오지즈",
+    "오지쓰",
+    "우디스",
+    "우디즈",
+    "오리스",
+    "보리스",
+    "보리쓰",
+    "보디스",
+    "보디즈",
     "저기",
     "얘야",
-    "오디",
     "어디스",
+    "어딧스",
+)
+
+WAKE_WORD_ONLY_ALIASES: tuple[str, ...] = (
+    "야",
+    "오디",
+    "여보세요",
+    "들려",
+    "잘들려",
+    "듣고있어",
+    "듣고있니",
+    "내말들려",
+    "어디서",
+)
+
+_WAKE_WORD_FUZZY_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"[오어우]\s*디\s*[스즈쓰수]"),
+    re.compile(r"오\s*딧\s*[스세]"),
+    re.compile(r"오\s*티\s*[스즈쓰]"),
+    re.compile(r"오\s*지\s*[스즈쓰]"),
+    re.compile(r"보\s*리\s*[스쓰]"),
+    re.compile(r"보\s*디\s*[스즈]"),
 )
 
 NON_MEDICATION_TOKENS: frozenset[str] = frozenset(
     {
         *WAKE_WORDS,
+        *WAKE_WORD_ONLY_ALIASES,
         "네",
         "예",
         "응",
@@ -40,8 +88,13 @@ def strip_wake_words(text: str) -> str:
     cleaned = (text or "").strip()
     if not cleaned:
         return ""
+    if _compact_call_text(cleaned) in WAKE_WORD_ONLY_ALIASES:
+        return ""
     for wake in sorted(WAKE_WORDS, key=len, reverse=True):
         cleaned = cleaned.replace(wake, " ")
+    cleaned = re.sub(r"^\s*(야|오디)[\s,.!?~，。]+", " ", cleaned)
+    for pattern in _WAKE_WORD_FUZZY_PATTERNS:
+        cleaned = pattern.sub(" ", cleaned, count=1)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,.!?~")
     return cleaned
 
@@ -51,10 +104,18 @@ def is_wake_word_only(text: str) -> bool:
     raw = (text or "").strip()
     if not raw:
         return False
-    if not any(wake and wake in raw for wake in WAKE_WORDS):
+    if _compact_call_text(raw) in WAKE_WORD_ONLY_ALIASES:
+        return True
+    if not any(wake and wake in raw for wake in WAKE_WORDS) and not any(
+        pattern.search(raw) for pattern in _WAKE_WORD_FUZZY_PATTERNS
+    ):
         return False
     normalized = strip_wake_words(raw)
     return not normalized
+
+
+def _compact_call_text(text: str) -> str:
+    return re.sub(r"[\s\t\r\n.,;:!?~'\"`，。]+", "", (text or "").strip().lower())
 
 
 OCR_CAPTURE_OBJECT_TOKENS: tuple[str, ...] = (

@@ -79,6 +79,7 @@ def setup_function() -> None:
     agent_ws._queued_ocr_request_by_speaker.clear()
     agent_ws._wake_profile_cache_by_speaker.clear()
     agent_ws._identity_pending_action_cache_by_speaker.clear()
+    agent_ws._dialog_state_by_speaker.clear()
 
 
 def make_real_memory(tmp_path) -> MemoryEngine:
@@ -129,6 +130,353 @@ def test_registered_wake_word_uses_profile_and_skips_orchestrator(monkeypatch: p
     assert "어르신" not in websocket.sent[-1]["response_text"]
     assert "약" not in websocket.sent[-1]["response_text"]
     assert fake_memory.seen == []
+
+
+def test_agent_ws_presence_smalltalk_is_answered_without_orchestrator(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_memory = FakeMemoryEngine()
+    websocket = FakeWebSocket()
+
+    async def fail_if_identity_gate_called(**kwargs):
+        raise AssertionError("assistant social turn should not call the identity gate")
+
+    async def fail_if_orchestrator_called(**kwargs):
+        raise AssertionError("assistant social turn should not call the orchestrator")
+
+    monkeypatch.setattr(agent_ws, "memory_engine", fake_memory)
+    monkeypatch.setattr(agent_ws, "reminder_service", FakeReminderService())
+    monkeypatch.setattr(agent_ws, "evaluate_identity_gate", fail_if_identity_gate_called)
+    monkeypatch.setattr(agent_ws.engine_orchestrator, "run_turn", fail_if_orchestrator_called)
+
+    run(
+        agent_ws._handle_stt(
+            websocket,
+            {
+                "type": "stt_result",
+                "speaker_id": "speaker-kim",
+                "text": "어딨어",
+            },
+            set(),
+        )
+    )
+
+    assert websocket.sent[-1]["type"] == "response"
+    assert websocket.sent[-1]["response_type"] == "smalltalk"
+    assert websocket.sent[-1]["requires_tts"] is True
+    assert websocket.sent[-1]["route_reason"] == "presence"
+    assert "여기 있어요" in websocket.sent[-1]["response_text"]
+
+
+def test_agent_ws_unsupported_request_is_answered_without_ignore(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_memory = FakeMemoryEngine()
+    websocket = FakeWebSocket()
+
+    async def fail_if_identity_gate_called(**kwargs):
+        raise AssertionError("unsupported assistant turn should not call the identity gate")
+
+    async def fail_if_orchestrator_called(**kwargs):
+        raise AssertionError("unsupported assistant turn should not call the orchestrator")
+
+    monkeypatch.setattr(agent_ws, "memory_engine", fake_memory)
+    monkeypatch.setattr(agent_ws, "reminder_service", FakeReminderService())
+    monkeypatch.setattr(agent_ws, "evaluate_identity_gate", fail_if_identity_gate_called)
+    monkeypatch.setattr(agent_ws.engine_orchestrator, "run_turn", fail_if_orchestrator_called)
+
+    run(
+        agent_ws._handle_stt(
+            websocket,
+            {
+                "type": "stt_result",
+                "speaker_id": "speaker-kim",
+                "text": "오늘 뉴스 알려줘",
+            },
+            set(),
+        )
+    )
+
+    assert websocket.sent[-1]["type"] == "response"
+    assert websocket.sent[-1]["response_type"] == "smalltalk"
+    assert websocket.sent[-1]["requires_tts"] is True
+    assert "복약" in websocket.sent[-1]["response_text"]
+
+
+def test_agent_ws_assistant_suggestion_uses_fast_path_without_identity_or_orchestrator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_memory = FakeMemoryEngine()
+    websocket = FakeWebSocket()
+
+    async def fail_if_identity_gate_called(**kwargs):
+        raise AssertionError("assistant suggestion should not call the identity gate")
+
+    async def fail_if_orchestrator_called(**kwargs):
+        raise AssertionError("assistant suggestion should not call the orchestrator")
+
+    monkeypatch.setattr(agent_ws, "memory_engine", fake_memory)
+    monkeypatch.setattr(agent_ws, "reminder_service", FakeReminderService())
+    monkeypatch.setattr(agent_ws, "evaluate_identity_gate", fail_if_identity_gate_called)
+    monkeypatch.setattr(agent_ws.engine_orchestrator, "run_turn", fail_if_orchestrator_called)
+
+    run(
+        agent_ws._handle_stt(
+            websocket,
+            {
+                "type": "stt_result",
+                "speaker_id": "speaker-kim",
+                "text": "아니 뭐 하면 좋을까",
+            },
+            set(),
+        )
+    )
+
+    assert websocket.sent[-1]["type"] == "response"
+    assert websocket.sent[-1]["response_type"] == "smalltalk"
+    assert websocket.sent[-1]["requires_tts"] is True
+    assert websocket.sent[-1]["fast_path"] == "smalltalk"
+    assert websocket.sent[-1]["active_flow"] == "assistant_social"
+    assert websocket.sent[-1]["route_reason"] == "assistant_suggestion"
+    assert "드실 약 확인" in websocket.sent[-1]["response_text"]
+    assert "복약 알림" in websocket.sent[-1]["response_text"]
+    assert "약봉투 사진" in websocket.sent[-1]["response_text"]
+
+
+def test_agent_ws_anonymous_assistant_suggestion_does_not_force_registration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_memory = FakeMemoryEngine()
+    websocket = FakeWebSocket()
+
+    async def fail_if_identity_gate_called(**kwargs):
+        raise AssertionError("anonymous assistant suggestion should not ask for registration")
+
+    async def fail_if_orchestrator_called(**kwargs):
+        raise AssertionError("anonymous assistant suggestion should not call the orchestrator")
+
+    monkeypatch.setattr(agent_ws, "memory_engine", fake_memory)
+    monkeypatch.setattr(agent_ws, "reminder_service", FakeReminderService())
+    monkeypatch.setattr(agent_ws, "evaluate_identity_gate", fail_if_identity_gate_called)
+    monkeypatch.setattr(agent_ws.engine_orchestrator, "run_turn", fail_if_orchestrator_called)
+
+    run(
+        agent_ws._handle_stt(
+            websocket,
+            {
+                "type": "stt_result",
+                "speaker_id": None,
+                "text": "뭐 하지",
+            },
+            set(),
+        )
+    )
+
+    assert websocket.sent[-1]["type"] == "response"
+    assert websocket.sent[-1]["response_type"] == "smalltalk"
+    assert "이름, 나이, 성별" not in websocket.sent[-1]["response_text"]
+    assert "약봉투 사진" in websocket.sent[-1]["response_text"]
+
+
+def test_agent_ws_pending_identity_suggestion_keeps_registration_flow(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    fake_memory = make_real_memory(tmp_path)
+    speaker_id = "speaker-pending-suggestion"
+    run(
+        fake_memory.save_identity_profile(
+            speaker_id,
+            {"name": "김영수", "age": "72", "gender": "남성"},
+            mark_verified=True,
+        )
+    )
+    run(fake_memory.mark_identity_pending(speaker_id, "registration"))
+    websocket = FakeWebSocket()
+
+    async def fail_if_orchestrator_called(**kwargs):
+        raise AssertionError("pending identity assistant suggestion should not call the orchestrator")
+
+    monkeypatch.setattr(agent_ws, "memory_engine", fake_memory)
+    monkeypatch.setattr(agent_ws, "reminder_service", ReminderService(start_background_tasks=False))
+    monkeypatch.setattr(agent_ws.engine_orchestrator, "run_turn", fail_if_orchestrator_called)
+
+    run(
+        agent_ws._handle_stt(
+            websocket,
+            {
+                "type": "stt_result",
+                "speaker_id": speaker_id,
+                "text": "뭐 하면 좋을까",
+            },
+            set(),
+        )
+    )
+
+    response_payloads = [payload for payload in websocket.sent if payload.get("type") == "response"]
+    assert response_payloads[-1]["response_type"] == "identity_check"
+    assert response_payloads[-1]["identity_gate"]["reason"] == "needs_registration"
+    assert "먼저 이름, 나이, 성별" in response_payloads[-1]["response_text"]
+    assert "복약 확인" in response_payloads[-1]["response_text"]
+    assert response_payloads[-1].get("fast_path") != "smalltalk"
+
+
+def test_agent_ws_repeat_control_repeats_last_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_memory = FakeMemoryEngine()
+    websocket = FakeWebSocket()
+    state = agent_ws._speaker_state("speaker-repeat")
+    state.last_assistant_text = "김영수님, 오늘 아침 식후 약은 혈압약입니다."
+    state.last_response_type = "medical_response"
+    state.last_response_can_repeat = True
+
+    async def fail_if_identity_gate_called(**kwargs):
+        raise AssertionError("repeat control should not call the identity gate")
+
+    async def fail_if_orchestrator_called(**kwargs):
+        raise AssertionError("repeat control should not call the orchestrator")
+
+    monkeypatch.setattr(agent_ws, "memory_engine", fake_memory)
+    monkeypatch.setattr(agent_ws, "reminder_service", FakeReminderService())
+    monkeypatch.setattr(agent_ws, "evaluate_identity_gate", fail_if_identity_gate_called)
+    monkeypatch.setattr(agent_ws.engine_orchestrator, "run_turn", fail_if_orchestrator_called)
+
+    run(
+        agent_ws._handle_stt(
+            websocket,
+            {
+                "type": "stt_result",
+                "speaker_id": "speaker-repeat",
+                "text": "다시 말해줘",
+            },
+            set(),
+        )
+    )
+
+    assert websocket.sent[-1]["type"] == "response"
+    assert websocket.sent[-1]["fast_path"] == "assistant_repeat"
+    assert websocket.sent[-1]["response_text"] == "김영수님, 오늘 아침 식후 약은 혈압약입니다."
+
+
+@pytest.mark.parametrize(
+    "wake_text",
+    ["오디세", "오디", "오티스", "오티즈", "오지스", "보리스", "보디스", "오 디 스", "야", "들려?"],
+)
+def test_agent_ws_wake_word_stt_variant_uses_wake_fast_path(
+    monkeypatch: pytest.MonkeyPatch,
+    wake_text: str,
+) -> None:
+    fake_memory = FakeMemoryEngine()
+    websocket = FakeWebSocket()
+
+    async def fail_if_identity_gate_called(**kwargs):
+        raise AssertionError("STT wake-word variant should not call the identity gate")
+
+    async def fail_if_orchestrator_called(**kwargs):
+        raise AssertionError("STT wake-word variant should not call the orchestrator")
+
+    monkeypatch.setattr(agent_ws, "memory_engine", fake_memory)
+    monkeypatch.setattr(agent_ws, "reminder_service", FakeReminderService())
+    monkeypatch.setattr(agent_ws, "evaluate_identity_gate", fail_if_identity_gate_called)
+    monkeypatch.setattr(agent_ws.engine_orchestrator, "run_turn", fail_if_orchestrator_called)
+
+    run(
+        agent_ws._handle_stt(
+            websocket,
+            {
+                "type": "stt_result",
+                "speaker_id": "speaker-kim",
+                "text": wake_text,
+            },
+            set(),
+        )
+    )
+
+    assert not any(payload.get("type") == "filler" for payload in websocket.sent)
+    assert websocket.sent[-1]["type"] == "response"
+    assert websocket.sent[-1]["response_type"] == "wake_word_ack"
+    assert websocket.sent[-1]["response_text"] == "네, 김영수님. 말씀하세요."
+
+
+def test_agent_ws_profile_recall_skips_medication_routing(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_memory = FakeMemoryEngine()
+    websocket = FakeWebSocket()
+
+    async def fail_if_identity_gate_called(**kwargs):
+        raise AssertionError("profile recall should not wait for identity gate")
+
+    async def fail_if_orchestrator_called(**kwargs):
+        raise AssertionError("profile recall should not call the orchestrator")
+
+    monkeypatch.setattr(agent_ws, "memory_engine", fake_memory)
+    monkeypatch.setattr(agent_ws, "reminder_service", FakeReminderService())
+    monkeypatch.setattr(agent_ws, "evaluate_identity_gate", fail_if_identity_gate_called)
+    monkeypatch.setattr(agent_ws.engine_orchestrator, "run_turn", fail_if_orchestrator_called)
+
+    run(
+        agent_ws._handle_stt(
+            websocket,
+            {
+                "type": "stt_result",
+                "speaker_id": "speaker-kim",
+                "text": "지금 나 누군지 알아",
+            },
+            set(),
+        )
+    )
+
+    assert not any(payload.get("type") == "filler" for payload in websocket.sent)
+    assert websocket.sent[-1]["type"] == "response"
+    assert websocket.sent[-1]["response_type"] == "profile_recall"
+    assert websocket.sent[-1]["fast_path"] == "profile_recall"
+    assert "김영수님" in websocket.sent[-1]["response_text"]
+    assert "남성" in websocket.sent[-1]["response_text"]
+    assert "72세" in websocket.sent[-1]["response_text"]
+    assert "임의로" not in websocket.sent[-1]["response_text"]
+    assert "약봉투" not in websocket.sent[-1]["response_text"]
+
+
+def test_agent_ws_turn_id_is_echoed_and_diagnostic_log_is_saved(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    fake_memory = FakeMemoryEngine()
+    diagnostic_store = MDStore(str(tmp_path / "md_database"))
+    websocket = FakeWebSocket()
+
+    async def fail_if_identity_gate_called(**kwargs):
+        raise AssertionError("wake-word turn should not call the identity gate")
+
+    async def fail_if_orchestrator_called(**kwargs):
+        raise AssertionError("wake-word turn should not call the orchestrator")
+
+    monkeypatch.setattr(agent_ws, "memory_engine", fake_memory)
+    monkeypatch.setattr(agent_ws, "reminder_service", FakeReminderService())
+    monkeypatch.setattr(agent_ws, "md_store", diagnostic_store)
+    monkeypatch.setattr(agent_ws, "evaluate_identity_gate", fail_if_identity_gate_called)
+    monkeypatch.setattr(agent_ws.engine_orchestrator, "run_turn", fail_if_orchestrator_called)
+
+    run(
+        agent_ws._handle_stt(
+            websocket,
+            {
+                "type": "stt_result",
+                "speaker_id": "speaker-kim",
+                "session_id": "session-web",
+                "turn_id": "turn-web-1",
+                "text": "오디스",
+                "client_context": {"source": "speech", "speaking": False},
+            },
+            set(),
+        )
+    )
+
+    payload = websocket.sent[-1]
+    assert payload["turn_id"] == "turn-web-1"
+    assert payload["session_id"] == "session-web"
+    assert isinstance(payload["ws_elapsed_ms"], int)
+
+    entries = run(diagnostic_store.list_entries("assistant_diagnostics"))
+    assert len(entries) == 1
+    content = run(diagnostic_store.read_entry(entries[0]))
+    assert "turn-web-1" in content
+    assert "오디스" in content
+    assert "wake_word_ack" in content
 
 
 def test_registered_smalltalk_greeting_uses_fast_path_and_skips_orchestrator(
@@ -807,6 +1155,61 @@ def test_agent_ws_medication_safety_question_skips_filler_and_llm(
     assert "方才" not in answer
     assert "主治" not in answer
     assert len(answer) < 260
+
+
+def test_agent_ws_simple_tylenol_suitability_is_short_not_overdose(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    fake_memory = make_real_memory(tmp_path)
+    run(
+        fake_memory.save_identity_profile(
+            "speaker-kim",
+            {"name": "김영수", "age": "72", "gender": "남성"},
+            mark_verified=True,
+        )
+    )
+    websocket = FakeWebSocket()
+    reminder_service = ReminderService(start_background_tasks=False)
+
+    async def fake_identity_gate(**kwargs):
+        return IdentityGateResult(
+            allowed=True,
+            reason="identity_verified",
+            metadata={"profile": {"name": "김영수", "age": "72", "gender": "남성"}},
+        )
+
+    async def fail_if_orchestrator_called(**kwargs):
+        raise AssertionError("simple medication suitability should use the fast path")
+
+    monkeypatch.setattr(agent_ws, "memory_engine", fake_memory)
+    monkeypatch.setattr(agent_ws, "reminder_service", reminder_service)
+    monkeypatch.setattr(agent_ws, "evaluate_identity_gate", fake_identity_gate)
+    monkeypatch.setattr(agent_ws.engine_orchestrator, "run_turn", fail_if_orchestrator_called)
+
+    run(
+        agent_ws._handle_stt(
+            websocket,
+            {
+                "type": "stt_result",
+                "speaker_id": "speaker-kim",
+                "text": "내가 지금 타이레놀 먹어도 될까",
+            },
+            set(),
+        )
+    )
+
+    assert not any(payload.get("type") == "filler" for payload in websocket.sent)
+    response_payloads = [payload for payload in websocket.sent if payload.get("type") == "response"]
+    assert response_payloads[-1]["fast_path"] == "medication_safety_fast_path"
+    answer = response_payloads[-1]["response_text"]
+    assert "타이레놀" in answer
+    assert "용량" in answer
+    assert "시간" in answer
+    assert "여러 알" not in answer
+    assert "저혈압" not in answer
+    assert "119" not in answer
+    assert len(answer) < 150
 
 
 def test_agent_ws_stored_medication_guidance_handles_vague_that_one(

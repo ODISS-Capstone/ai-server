@@ -87,13 +87,49 @@ SMALLTALK_PATTERNS = {
         "네, 필요하시면 또 말씀해 주세요.",
         "알겠습니다. 더 필요한 것이 있으면 말씀해 주세요.",
     ],
+    "presence": [
+        "여기 있어요. 말씀하시면 바로 도와드릴게요.",
+        "네, 듣고 있어요. 편하게 말씀해 주세요.",
+    ],
+    "status": [
+        "말씀 기다리고 있어요. 복약이나 컨디션이 걱정되면 바로 말해주세요.",
+        "곁에서 듣고 있어요. 필요한 걸 말씀해 주세요.",
+    ],
+    "comfort": [
+        "괜찮습니다. 천천히 말씀하셔도 제가 알아듣도록 확인할게요.",
+        "헷갈리실 수 있어요. 짧게 말씀해 주시면 제가 이어서 도와드릴게요.",
+    ],
+    "assistant_suggestion": [
+        "제가 도와드릴 수 있는 건 세 가지예요. 드실 약 확인, 복약 알림 설정, 약봉투 사진 확인 중 하나를 말씀해 주세요.",
+    ],
+    "assistant_capability": [
+        "저는 복약 확인, 복약 알림 설정, 약봉투 사진 확인을 도와드릴 수 있어요. 필요한 걸 그대로 말씀해 주세요.",
+    ],
+    "assistant_companion": [
+        "제가 곁에서 듣고 있을게요. 심심하시면 가볍게 이야기하셔도 되고, 약이나 컨디션이 걱정되면 바로 말씀해 주세요.",
+    ],
+    "repeat_request": [
+        "방금 말씀을 다시 짧게 말씀드릴게요.",
+    ],
+    "unsupported_but_answered": [
+        "제가 지금은 그 기능을 자세히 처리하긴 어렵지만, 복약이나 컨디션은 바로 도와드릴게요.",
+        "그건 아직 잘 도와드리기 어렵습니다. 대신 약, 알림, 컨디션 확인은 바로 도와드릴게요.",
+    ],
+    "unclear": [
+        "네, 듣고 있어요. 원하시는 걸 한 번만 더 짧게 말씀해 주세요.",
+        "제가 놓쳤을 수 있어요. 다시 한 번 말씀해 주세요.",
+    ],
 }
 
 GREETING_KEYWORDS = ["안녕", "반가", "여보세요", "하이", "hello"]
-FEELING_BAD_KEYWORDS = ["아프", "어지럽", "안 좋", "힘들", "피곤", "아파", "쑤시"]
+FEELING_BAD_KEYWORDS = ["안 좋", "힘들", "피곤", "지쳐", "귀찮", "우울", "외로", "심심"]
 FEELING_GOOD_KEYWORDS = ["좋아", "괜찮", "건강해", "기분 좋"]
 THANKS_KEYWORDS = ["고마", "감사", "땡큐", "thank"]
 ACKNOWLEDGEMENT_KEYWORDS = [
+    "네",
+    "예",
+    "응",
+    "그래",
     "잘했",
     "수고",
     "됐어",
@@ -104,12 +140,108 @@ ACKNOWLEDGEMENT_KEYWORDS = [
     "오케이",
     "okay",
 ]
-FAST_SMALLTALK_TYPES = {"greeting", "feeling_good", "thanks", "acknowledgement"}
+PRESENCE_KEYWORDS = ["어딨어", "어디 있어", "어디있", "거기 있어", "듣고 있어", "있어"]
+STATUS_KEYWORDS = ["뭐해", "뭐 해", "뭐하고", "뭐 하고", "뭐하니", "준비됐"]
+SUGGESTION_KEYWORDS = [
+    "뭐 하면 좋",
+    "뭐하면 좋",
+    "뭐 하지",
+    "뭐하지",
+    "뭘 하면",
+    "뭘해야",
+    "뭐 해야",
+    "뭐해야",
+    "어떻게 하면",
+    "도와줘",
+    "도와 줄",
+    "도와줄",
+    "뭐부터",
+]
+CAPABILITY_KEYWORDS = [
+    "뭐 할 수 있어",
+    "뭘 할 수 있어",
+    "뭐해줄 수",
+    "뭐 해줄 수",
+    "뭐 도와줄",
+    "뭘 도와줄",
+    "무엇을 도와",
+    "할 수 있는",
+]
+COMPANION_KEYWORDS = ["말동무", "얘기하자", "이야기하자", "심심", "혼자 있어", "혼자있", "외로"]
+COMFORT_KEYWORDS = ["모르겠", "헷갈", "어렵", "귀찮", "불안해"]
+REPEAT_REQUEST_KEYWORDS = ["다시 말", "한번 더", "한 번 더", "못 들", "못들", "방금 뭐", "다시 알려"]
+UNSUPPORTED_REQUEST_KEYWORDS = [
+    "뉴스",
+    "날씨",
+    "노래",
+    "음악",
+    "검색",
+    "유튜브",
+    "전화",
+    "문자",
+    "카톡",
+    "맛집",
+    "계산",
+    "주식",
+    "환율",
+]
+SYMPTOM_OR_EMERGENCY_KEYWORDS = [
+    "가슴",
+    "숨",
+    "호흡",
+    "흉통",
+    "쓰러",
+    "의식",
+    "마비",
+    "경련",
+    "어지러",
+    "아프",
+    "아파",
+    "두통",
+    "머리",
+    "복통",
+    "배가",
+    "배아",
+    "토할",
+    "구토",
+    "열나",
+    "열이",
+    "피가",
+    "출혈",
+    "응급",
+    "119",
+]
+FAST_SMALLTALK_TYPES = {
+    "greeting",
+    "feeling_bad",
+    "feeling_good",
+    "thanks",
+    "acknowledgement",
+    "presence",
+    "status",
+    "comfort",
+    "assistant_suggestion",
+    "assistant_capability",
+    "assistant_companion",
+    "repeat_request",
+    "unsupported_but_answered",
+    "unclear",
+}
 FAST_SMALLTALK_RESPONSES = {
     "greeting": "안녕하세요. 무엇을 도와드릴까요?",
+    "feeling_bad": "많이 불편하셨겠어요. 복약이나 컨디션을 확인해드릴까요?",
     "feeling_good": "다행이에요. 필요한 것이 있으면 편하게 말씀해 주세요.",
     "thanks": "별말씀을요. 언제든 편하게 말씀해 주세요.",
     "acknowledgement": "네, 필요하시면 또 말씀해 주세요.",
+    "presence": "여기 있어요. 말씀하시면 바로 도와드릴게요.",
+    "status": "말씀 기다리고 있어요. 필요한 걸 말씀해 주세요.",
+    "comfort": "괜찮습니다. 천천히 말씀하셔도 돼요.",
+    "assistant_suggestion": "제가 도와드릴 수 있는 건 세 가지예요. 드실 약 확인, 복약 알림 설정, 약봉투 사진 확인 중 하나를 말씀해 주세요.",
+    "assistant_capability": "저는 복약 확인, 복약 알림 설정, 약봉투 사진 확인을 도와드릴 수 있어요. 필요한 걸 그대로 말씀해 주세요.",
+    "assistant_companion": "제가 곁에서 듣고 있을게요. 약이나 컨디션이 걱정되면 바로 말씀해 주세요.",
+    "repeat_request": "제가 방금 한 말을 다시 짧게 말씀드릴게요.",
+    "unsupported_but_answered": "그 기능은 아직 어렵지만, 복약이나 컨디션은 바로 도와드릴게요.",
+    "unclear": "네, 듣고 있어요. 한 번만 더 짧게 말씀해 주세요.",
 }
 
 
@@ -118,13 +250,19 @@ class ConversationEngine:
 
     def __init__(self):
         self.system_prompt = (
-            "당신은 나이와 무관하게 복약 관리가 필요한 사용자를 돕는 따뜻한 AI 도우미입니다.\n"
+            "당신은 복약을 중심으로 생활 대화를 받아주는 음성 AI 비서입니다.\n"
+            "- 사용자의 말을 무시하지 않습니다. 무음, 헛기침, 명백한 STT 잡음이 아니면 짧게라도 응답합니다.\n"
+            "- 대화 맥락을 유지하고, '그거', '먹었어', '다시 말해줘' 같은 생략 발화를 직전 상황 기준으로 해석합니다.\n"
             "- 존댓말을 사용하고, 짧고 쉬운 문장으로 말합니다.\n"
+            "- 음성으로 듣기 좋게 1~3문장으로 답하고, 마크다운·번호 목록·굵은 글씨를 쓰지 않습니다.\n"
+            "- 중국어·영어를 섞지 않고 자연스러운 한국어만 사용합니다.\n"
             "- 이름이 있으면 이름을 사용하고, 없으면 '사용자님'이라고 부릅니다.\n"
             "- 사용자가 직접 말했거나 프로필에 저장된 경우가 아니면 나이, 질환, 호칭을 추측하지 않습니다.\n"
             "- 보호자가 대신 말하면 사용자 본인 정보와 복약 관리 대상자 정보를 섞지 않습니다.\n"
             "- 만성질환자나 복약 사용자라는 이유만으로 '어르신'이라고 부르지 않습니다.\n"
             "- 의학 전문 용어를 쉬운 말로 바꿉니다.\n"
+            "- 인사, 감사, 알림, 기록, 프로필 확인에는 의료 고지를 붙이지 않습니다.\n"
+            "- 응급이나 복약 안전 문제는 첫 문장에 행동 지시를 말합니다.\n"
             "- 의료 안전 판단이 필요한 경우에만 '정확한 판단은 의사·약사 상담이 필요합니다'를 포함합니다."
         )
 
@@ -172,6 +310,9 @@ class ConversationEngine:
         smalltalk_type = input_data.get("smalltalk_type")
         if smalltalk_type and smalltalk_type in SMALLTALK_PATTERNS:
             return random.choice(SMALLTALK_PATTERNS[smalltalk_type])
+        text = str(input_data.get("text") or "")
+        if text.strip():
+            return self.build_assistant_response(text)
         return None
 
     def fast_smalltalk_type(self, text: str) -> Optional[str]:
@@ -188,13 +329,41 @@ class ConversationEngine:
         self,
         text: str,
         user_profile: Optional[dict] = None,
+        context: Optional[dict] = None,
     ) -> str:
         """Build a deterministic TTS-ready response without LLM polishing."""
         smalltalk_type = self.fast_smalltalk_type(text) or "greeting"
+        if smalltalk_type == "assistant_suggestion":
+            return self._ensure_user_prefix(
+                self._build_assistant_suggestion_response(context),
+                user_profile,
+            )
         response = FAST_SMALLTALK_RESPONSES.get(
             smalltalk_type,
             "네, 말씀해 주세요.",
         )
+        return self._ensure_user_prefix(response, user_profile)
+
+    def assistant_response_type(self, text: str) -> str:
+        """Return the deterministic assistant route for non-medical turns."""
+        return self._classify_smalltalk(text) or "unclear"
+
+    def build_assistant_response(
+        self,
+        text: str,
+        user_profile: Optional[dict] = None,
+        *,
+        fallback_type: Optional[str] = None,
+        context: Optional[dict] = None,
+    ) -> str:
+        """Build a short TTS-ready assistant response for low-risk non-medical turns."""
+        response_type = fallback_type or self.assistant_response_type(text)
+        if response_type == "assistant_suggestion":
+            return self._ensure_user_prefix(
+                self._build_assistant_suggestion_response(context),
+                user_profile,
+            )
+        response = FAST_SMALLTALK_RESPONSES.get(response_type, FAST_SMALLTALK_RESPONSES["unclear"])
         return self._ensure_user_prefix(response, user_profile)
 
     def build_wake_word_response(self, user_profile: Optional[dict] = None) -> str:
@@ -204,6 +373,14 @@ class ConversationEngine:
         are not medical questions. Keep the response short and profile-aware.
         """
         return f"네, {self._honorific(user_profile)}. 말씀하세요."
+
+    def is_profile_recall_text(self, text: str) -> bool:
+        """Return True when the user asks who ODISS thinks they are."""
+        return self._is_profile_recall_text(text)
+
+    def build_profile_recall_response(self, user_profile: Optional[dict] = None) -> str:
+        """Build a deterministic identity-memory response for fast paths."""
+        return self._profile_recall_response(user_profile)
 
     # ── CE_Tone: 사용자 맞춤형 언어 순화 및 최적화 ──
 
@@ -347,11 +524,20 @@ class ConversationEngine:
             )
 
         if not source:
+            if contract.decision.mode == ReasoningMode.MEMORY_ONLY and contract.decision.intent == "smalltalk":
+                return ConversationComposeResponse(
+                    response_text=self.build_assistant_response(
+                        contract.input_text,
+                        contract.user_profile,
+                    ),
+                    response_type="smalltalk",
+                    requires_tts=True,
+                )
             fallback = "사용자님, 현재 기록만으로는 정확한 판단이 어렵습니다."
             if contract.decision.mode == ReasoningMode.MEMORY_ONLY:
                 fallback = (
-                    "사용자님, 지금은 가벼운 안내만 가능한 상태예요. "
-                    "복용 중인 약 이름이나 처방전을 알려주시면 더 정확히 도와드릴 수 있어요."
+                    "사용자님, 제가 바로 확인할 내용이 부족합니다. "
+                    "약 이름이나 원하시는 일을 한 번만 더 짧게 말씀해 주세요."
                 )
             return ConversationComposeResponse(
                 response_text=self.apply_tone(
@@ -406,6 +592,8 @@ class ConversationEngine:
             return True
 
         text_lower = text.lower().strip()
+        if self._has_symptom_or_emergency_signal(text_lower):
+            return False
         if self._has_medication_or_task_signal(text_lower):
             return False
         all_keywords = (
@@ -414,15 +602,41 @@ class ConversationEngine:
             + FEELING_GOOD_KEYWORDS
             + THANKS_KEYWORDS
             + ACKNOWLEDGEMENT_KEYWORDS
+            + PRESENCE_KEYWORDS
+            + STATUS_KEYWORDS
+            + SUGGESTION_KEYWORDS
+            + CAPABILITY_KEYWORDS
+            + COMPANION_KEYWORDS
+            + COMFORT_KEYWORDS
+            + REPEAT_REQUEST_KEYWORDS
+            + UNSUPPORTED_REQUEST_KEYWORDS
         )
         return any(kw in text_lower for kw in all_keywords)
 
     def _classify_smalltalk(self, text: str) -> Optional[str]:
         text_lower = text.lower().strip()
+        if self._has_symptom_or_emergency_signal(text_lower):
+            return None
         if self._has_medication_or_task_signal(text_lower):
             return None
         if any(kw in text_lower for kw in GREETING_KEYWORDS):
             return "greeting"
+        if any(kw in text_lower for kw in REPEAT_REQUEST_KEYWORDS):
+            return "repeat_request"
+        if any(kw in text_lower for kw in SUGGESTION_KEYWORDS):
+            return "assistant_suggestion"
+        if any(kw in text_lower for kw in CAPABILITY_KEYWORDS):
+            return "assistant_capability"
+        if any(kw in text_lower for kw in COMPANION_KEYWORDS):
+            return "assistant_companion"
+        if any(kw in text_lower for kw in PRESENCE_KEYWORDS):
+            return "presence"
+        if any(kw in text_lower for kw in STATUS_KEYWORDS):
+            return "status"
+        if any(kw in text_lower for kw in UNSUPPORTED_REQUEST_KEYWORDS):
+            return "unsupported_but_answered"
+        if any(kw in text_lower for kw in COMFORT_KEYWORDS):
+            return "comfort"
         if any(kw in text_lower for kw in FEELING_BAD_KEYWORDS):
             return "feeling_bad"
         if any(kw in text_lower for kw in FEELING_GOOD_KEYWORDS):
@@ -433,6 +647,60 @@ class ConversationEngine:
             return "acknowledgement"
         return None
 
+    def _build_assistant_suggestion_response(self, context: Optional[dict] = None) -> str:
+        stored_meds = self._stored_medication_names_from_context(context)
+        meal = self._current_meal_label()
+        if stored_meds and meal:
+            return (
+                f"제가 도와드릴 수 있는 건 세 가지예요. {meal} 식후 약 확인, 복약 알림 설정, "
+                "약봉투 사진 확인 중 하나를 말씀해 주세요."
+            )
+        if stored_meds:
+            return (
+                "제가 도와드릴 수 있는 건 세 가지예요. 드실 약 확인, 복약 알림 설정, "
+                "약봉투 사진 확인 중 하나를 말씀해 주세요."
+            )
+        return (
+            "제가 도와드릴 수 있는 건 세 가지예요. 드실 약 확인을 위해 약 이름 말하기, 복약 알림 설정, "
+            "약봉투 사진 확인 중 하나를 말씀해 주세요."
+        )
+
+    @staticmethod
+    def _current_meal_label(now: Optional[datetime] = None) -> str:
+        hour = (now or datetime.now()).hour
+        if 5 <= hour <= 10:
+            return "아침"
+        if 11 <= hour <= 14:
+            return "점심"
+        if 17 <= hour <= 21:
+            return "저녁"
+        return ""
+
+    @staticmethod
+    def _stored_medication_names_from_context(context: Optional[dict]) -> list[str]:
+        if not context:
+            return []
+        prescription_log = str(context.get("prescription_log") or "")
+        if not prescription_log.strip():
+            return []
+        names: list[str] = []
+        for line in prescription_log.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("-"):
+                continue
+            item = re.sub(r"^-\s*", "", stripped).strip()
+            item = re.split(r"[:：|(/]", item, maxsplit=1)[0].strip()
+            if item and item not in names:
+                names.append(item)
+        return names
+
+    @staticmethod
+    def _has_symptom_or_emergency_signal(text: str) -> bool:
+        lowered = (text or "").lower()
+        if classify_patient_safety_situation(lowered):
+            return True
+        return any(token in lowered for token in SYMPTOM_OR_EMERGENCY_KEYWORDS)
+
     @staticmethod
     def _has_medication_or_task_signal(text: str) -> bool:
         return any(
@@ -440,6 +708,7 @@ class ConversationEngine:
             for token in (
                 "약",
                 "복용",
+                "먹",
                 "처방",
                 "먹어도",
                 "먹으면",

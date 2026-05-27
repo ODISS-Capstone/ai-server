@@ -13,12 +13,15 @@ import json
 import logging
 import asyncio
 import re
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from time import perf_counter
 from typing import Any
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
+from app.api.routes.assistant_auth import websocket_assistant_token_allowed
+from app.database.md_store import md_store
 from app.engines.conversation import ConversationEngine
 from app.engines.memory import MemoryEngine
 from app.engines.reasoning import ReasoningEngine
@@ -55,6 +58,24 @@ _queued_ocr_request_by_speaker: dict[str, dict[str, Any]] = {}
 _bootstrapped_speakers: set[str] = set()
 _wake_profile_cache_by_speaker: dict[str, dict[str, Any]] = {}
 _identity_pending_action_cache_by_speaker: dict[str, str] = {}
+
+
+@dataclass
+class AssistantDialogState:
+    active_flow: str = "none"
+    last_user_text: str = ""
+    last_assistant_text: str = ""
+    last_response_type: str = ""
+    last_medication_candidates: list[str] = field(default_factory=list)
+    last_guided_medication: str = ""
+    last_meal_context: str = ""
+    last_reminder: dict[str, Any] = field(default_factory=dict)
+    last_ocr_candidates: list[str] = field(default_factory=list)
+    awaiting_confirmation: str = ""
+    last_response_can_repeat: bool = False
+
+
+_dialog_state_by_speaker: dict[str, AssistantDialogState] = {}
 OCR_PENDING_TTL = timedelta(minutes=5)
 ANONYMOUS_OCR_KEY = "__anonymous__"
 WEBSOCKET_IDLE_TIMEOUT_SEC = 65.0
@@ -84,6 +105,271 @@ OCR_PROGRESS_FILLERS = (
     "사진 속 글자를 확인하고 있습니다. 잠시만 기다려주세요.",
     "약 이름을 확인하고 있습니다. 잠시만 기다려주세요.",
 )
+DIAGNOSTIC_LOG_CATEGORY = "assistant_diagnostics"
+DIAGNOSTIC_PREVIEW_CHARS = 1200
+
+
+class _WsTurnTrace:
+    """Per-turn trace persisted for web assistant debugging.
+
+    This intentionally stores only turn-level metadata and WebSocket payloads.
+    The browser can export the same turn_id, while the server keeps the route
+    and timing needed to debug misrouted assistant behavior.
+    """
+
+    def __init__(self, message: dict[str, Any]) -> None:
+        self.turn_id = str(message.get("turn_id") or "").strip()
+        self.session_id = str(message.get("session_id") or "").strip()
+        self.speaker_id = str(message.get("speaker_id") or "").strip()
+        self.text = str(message.get("text") or "").strip()
+        self.message_type = str(message.get("type") or "").strip()
+        self.client_sent_at = str(message.get("client_sent_at") or "").strip()
+        client_context = message.get("client_context")
+        self.client_context = client_context if isinstance(client_context, dict) else {}
+        self.normalized_text = _normalize_assistant_text(self.text)
+        self.initial_dialog_state = _dialog_state_snapshot(self.speaker_id)
+        self.enabled = bool(self.turn_id or self.session_id)
+        self.started_at = datetime.now().isoformat()
+        self._started_perf = perf_counter()
+        self.events: list[dict[str, Any]] = []
+        self.outbound: list[dict[str, Any]] = []
+        self.error: str = ""
+
+    def elapsed_ms(self) -> int:
+        return round((perf_counter() - self._started_perf) * 1000)
+
+    def mark(self, event: str, **data: Any) -> None:
+        if not self.enabled:
+            return
+        self.events.append(
+            {
+                "event": event,
+                "elapsed_ms": self.elapsed_ms(),
+                **data,
+            }
+        )
+
+    def record_outbound(self, payload: dict[str, Any]) -> None:
+        if not self.enabled:
+            return
+        self.outbound.append(
+            {
+                "elapsed_ms": self.elapsed_ms(),
+                "type": payload.get("type"),
+                "response_type": payload.get("response_type"),
+                "fast_path": payload.get("fast_path"),
+                "stage": payload.get("stage"),
+                "reason": payload.get("reason"),
+                "requires_tts": payload.get("requires_tts"),
+                "text": _preview_text(
+                    payload.get("response_text")
+                    or payload.get("text")
+                    or payload.get("message")
+                    or payload.get("reason")
+                    or ""
+                ),
+                "raw": payload,
+            }
+        )
+
+    def final_route(self) -> str:
+        for payload in reversed(self.outbound):
+            if payload.get("fast_path"):
+                return str(payload["fast_path"])
+            if payload.get("response_type"):
+                return str(payload["response_type"])
+            if payload.get("reason"):
+                return str(payload["reason"])
+            if payload.get("type"):
+                return str(payload["type"])
+        if self.error:
+            return "exception"
+        return "unknown"
+
+    def final_route_reason(self) -> str:
+        for payload in reversed(self.outbound):
+            if payload.get("route_reason"):
+                return str(payload["route_reason"])
+            if payload.get("reason"):
+                return str(payload["reason"])
+            identity_gate = payload.get("identity_gate")
+            if isinstance(identity_gate, dict) and identity_gate.get("reason"):
+                return str(identity_gate["reason"])
+        return ""
+
+    def to_payload(self) -> dict[str, Any]:
+        llm_called = any(
+            bool(event.get("llm_called"))
+            or str(event.get("component") or "").lower().endswith("llm")
+            and event.get("status") != "skipped"
+            for event in self.events
+        )
+        filler_sent = any(payload.get("type") == "filler" for payload in self.outbound)
+        return {
+            "turn_id": self.turn_id,
+            "session_id": self.session_id,
+            "speaker_id": self.speaker_id,
+            "message_type": self.message_type,
+            "user_text": self.text,
+            "normalized_text": self.normalized_text,
+            "started_at": self.started_at,
+            "elapsed_ms": self.elapsed_ms(),
+            "final_route": self.final_route(),
+            "route_reason": self.final_route_reason(),
+            "llm_called": llm_called,
+            "filler_sent": filler_sent,
+            "dialog_state_initial": self.initial_dialog_state,
+            "dialog_state_final": _dialog_state_snapshot(self.speaker_id),
+            "client_sent_at": self.client_sent_at,
+            "client_context": self.client_context,
+            "events": self.events,
+            "outbound": self.outbound,
+            "error": self.error,
+        }
+
+
+class _TraceWebSocket:
+    def __init__(self, websocket: WebSocket, trace: _WsTurnTrace) -> None:
+        self._websocket = websocket
+        self._trace = trace
+
+    async def send_json(self, payload: dict[str, Any]) -> None:
+        enriched = dict(payload)
+        if self._trace.enabled:
+            if self._trace.turn_id:
+                enriched.setdefault("turn_id", self._trace.turn_id)
+            if self._trace.session_id:
+                enriched.setdefault("session_id", self._trace.session_id)
+            enriched.setdefault("normalized_text", self._trace.normalized_text)
+            enriched.setdefault("active_flow", _infer_active_flow_from_payload(enriched))
+            enriched.setdefault("ws_elapsed_ms", self._trace.elapsed_ms())
+        if self._trace.speaker_id:
+            _update_dialog_state_from_outbound(self._trace.speaker_id, enriched)
+        self._trace.record_outbound(enriched)
+        await self._websocket.send_json(enriched)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._websocket, name)
+
+
+def _trace_mark(websocket: WebSocket, event: str, **data: Any) -> None:
+    trace = getattr(websocket, "_trace", None)
+    if trace is not None:
+        trace.mark(event, **data)
+
+
+async def _persist_turn_diagnostic(trace: _WsTurnTrace) -> None:
+    if not trace.enabled:
+        return
+    try:
+        await md_store.initialize()
+        stored_at = datetime.now().isoformat()
+        payload = trace.to_payload()
+        content = (
+            "# ODISS Assistant Diagnostic Turn\n"
+            f"> stored_at: {stored_at}\n"
+            f"> session_id: {trace.session_id}\n"
+            f"> speaker_id: {trace.speaker_id}\n"
+            f"> turn_id: {trace.turn_id}\n\n"
+            "## Summary\n"
+            f"- user_text: {trace.text}\n"
+            f"- final_route: {trace.final_route()}\n"
+            f"- elapsed_ms: {payload['elapsed_ms']}\n"
+            f"- outbound_count: {len(trace.outbound)}\n\n"
+            "## Raw\n"
+            "```json\n"
+            f"{json.dumps(payload, ensure_ascii=False, indent=2, default=str)}\n"
+            "```\n"
+        )
+        path = await md_store.save(DIAGNOSTIC_LOG_CATEGORY, content)
+        logger.info("[AssistantDiagnostic] saved turn_id=%s path=%s", trace.turn_id, path)
+    except Exception as exc:  # noqa: BLE001 - diagnostics must not break conversation
+        logger.warning("[AssistantDiagnostic] save_failed turn_id=%s error=%r", trace.turn_id, exc)
+
+
+def _preview_text(value: Any) -> str:
+    text = str(value or "")
+    if len(text) <= DIAGNOSTIC_PREVIEW_CHARS:
+        return text
+    return text[:DIAGNOSTIC_PREVIEW_CHARS] + "...(truncated)"
+
+
+def _speaker_state(speaker_id: str | None) -> AssistantDialogState:
+    key = speaker_id or ANONYMOUS_OCR_KEY
+    state = _dialog_state_by_speaker.get(key)
+    if state is None:
+        state = AssistantDialogState()
+        _dialog_state_by_speaker[key] = state
+    return state
+
+
+def _dialog_state_snapshot(speaker_id: str | None) -> dict[str, Any]:
+    state = _speaker_state(speaker_id)
+    return {
+        "active_flow": state.active_flow,
+        "last_user_text": state.last_user_text,
+        "last_assistant_text": _preview_text(state.last_assistant_text),
+        "last_response_type": state.last_response_type,
+        "last_medication_candidates": list(state.last_medication_candidates),
+        "last_guided_medication": state.last_guided_medication,
+        "last_meal_context": state.last_meal_context,
+        "last_reminder": state.last_reminder,
+        "last_ocr_candidates": list(state.last_ocr_candidates),
+        "awaiting_confirmation": state.awaiting_confirmation,
+        "last_response_can_repeat": state.last_response_can_repeat,
+    }
+
+
+def _normalize_assistant_text(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip().lower())
+
+
+def _infer_active_flow_from_payload(payload: dict[str, Any]) -> str:
+    if payload.get("active_flow"):
+        return str(payload["active_flow"])
+    fast_path = str(payload.get("fast_path") or "")
+    response_type = str(payload.get("response_type") or payload.get("type") or "")
+    if fast_path in {"relative_alarm", "missed_one_shot_check"} or response_type == "reminder":
+        if "taken" in fast_path or "record" in fast_path:
+            return "medication_record"
+        return "reminder"
+    if "ocr" in fast_path or response_type == "ocr_request":
+        return "ocr"
+    if "identity" in response_type or "profile" in response_type:
+        return "identity"
+    if response_type in {"smalltalk", "wake_word_ack"}:
+        return "assistant_social"
+    if response_type in {"medical_response", "medication_query"}:
+        return "medication_workflow"
+    return "none"
+
+
+def _update_dialog_state_from_outbound(speaker_id: str | None, payload: dict[str, Any]) -> None:
+    state = _speaker_state(speaker_id)
+    response_text = str(payload.get("response_text") or payload.get("text") or payload.get("message") or "")
+    payload_type = str(payload.get("type") or "")
+    response_type = str(payload.get("response_type") or payload_type or "")
+    if payload_type == "filler":
+        return
+    if response_text and payload_type != "filler":
+        state.last_assistant_text = response_text
+        state.last_response_type = response_type
+        state.last_response_can_repeat = True
+    state.active_flow = _infer_active_flow_from_payload(payload)
+    meds = payload.get("medications")
+    if isinstance(meds, list):
+        state.last_medication_candidates = [str(item) for item in meds if str(item).strip()]
+        if state.active_flow == "medication_workflow" and state.last_medication_candidates:
+            state.last_guided_medication = state.last_medication_candidates[0]
+    if payload.get("reminder_kind") or payload.get("delay_seconds") or payload.get("run_at"):
+        state.last_reminder = {
+            "reminder_kind": payload.get("reminder_kind"),
+            "delay_seconds": payload.get("delay_seconds"),
+            "run_at": payload.get("run_at"),
+        }
+    ocr_candidates = payload.get("ocr_candidates")
+    if isinstance(ocr_candidates, list):
+        state.last_ocr_candidates = [str(item) for item in ocr_candidates if str(item).strip()]
 
 
 @router.websocket("/ws/chat")
@@ -100,6 +386,9 @@ async def websocket_chat(websocket: WebSocket):
       { "type": "ocr_request", "message": "..." }   # 처방전 촬영 요청
       { "type": "reminder", "text": "...", ... }     # 예약 복약 알림
     """
+    if not websocket_assistant_token_allowed(websocket):
+        await websocket.close(code=1008)
+        return
     await websocket.accept()
     logger.info("WebSocket connected")
     active_speakers: set[str] = set()
@@ -162,6 +451,30 @@ async def websocket_chat(websocket: WebSocket):
 
 
 async def _handle_stt(websocket: WebSocket, message: dict, active_speakers: set[str]) -> None:
+    trace = _WsTurnTrace(message)
+    traced_websocket = _TraceWebSocket(websocket, trace)
+    if trace.speaker_id:
+        state = _speaker_state(trace.speaker_id)
+        state.last_user_text = trace.text
+    trace.mark(
+        "input_received",
+        text=trace.text,
+        normalized_text=trace.normalized_text,
+        message_type=trace.message_type,
+        active_flow=_speaker_state(trace.speaker_id).active_flow,
+        client_context=trace.client_context,
+    )
+    try:
+        await _handle_stt_impl(traced_websocket, message, active_speakers)
+    except Exception as exc:
+        trace.error = repr(exc)
+        trace.mark("exception", error=trace.error)
+        raise
+    finally:
+        await _persist_turn_diagnostic(trace)
+
+
+async def _handle_stt_impl(websocket: WebSocket, message: dict, active_speakers: set[str]) -> None:
     """STT 결과를 받아 전체 파이프라인 실행."""
     text = message.get("text", "").strip()
     speaker_id = message.get("speaker_id")
@@ -186,8 +499,16 @@ async def _handle_stt(websocket: WebSocket, message: dict, active_speakers: set[
         await _handle_wake_word_fast_path(websocket, speaker_id, active_speakers)
         return
 
+    if await _should_handle_assistant_control_fast_path(text, speaker_id):
+        await _handle_assistant_control_fast_path(websocket, text, speaker_id, active_speakers)
+        return
+
     if _should_handle_profile_memory_ack_fast_path(text):
         await _handle_profile_memory_ack_fast_path(websocket, text, speaker_id, active_speakers)
+        return
+
+    if await _should_handle_profile_recall_fast_path(text, speaker_id):
+        await _handle_profile_recall_fast_path(websocket, text, speaker_id, active_speakers)
         return
 
     if await _should_handle_smalltalk_fast_path(text, speaker_id):
@@ -231,11 +552,28 @@ async def _handle_stt(websocket: WebSocket, message: dict, active_speakers: set[
     )
     if not identity_gate.allowed:
         if identity_gate.response_type == "ignored" and not identity_gate.response_text:
+            profile = ((identity_gate.metadata or {}).get("profile") or {}) if identity_gate else {}
+            response_text = conversation_engine.build_assistant_response(
+                text,
+                profile,
+                fallback_type="acknowledgement"
+                if _assistant_control_kind(text) in {"affirmative", "negative"}
+                else "unclear",
+            )
+            response = conversation_engine.build_response(
+                {
+                    "text": response_text,
+                    "type": "smalltalk",
+                    "requires_tts": True,
+                }
+            )
             await websocket.send_json(
                 {
-                    "type": "ignored",
-                    "reason": identity_gate.reason,
-                    "requires_tts": False,
+                    "type": "response",
+                    **response,
+                    "fast_path": "identity_ignored_converted",
+                    "active_flow": "assistant_social",
+                    "route_reason": identity_gate.reason,
                     "identity_gate": {
                         "reason": identity_gate.reason,
                         "metadata": identity_gate.metadata or {},
@@ -245,7 +583,7 @@ async def _handle_stt(websocket: WebSocket, message: dict, active_speakers: set[
             return
         response = conversation_engine.build_response(
             {
-                "text": identity_gate.response_text,
+                "text": _identity_response_text_for_assistant_request(text, identity_gate),
                 "type": identity_gate.response_type,
                 "requires_tts": True,
             }
@@ -366,6 +704,25 @@ async def _handle_stt(websocket: WebSocket, message: dict, active_speakers: set[
             allow_frontier_memory_fallback=True,
             preloaded_context=context,
         )
+        _trace_mark(
+            websocket,
+            "orchestrator_result",
+            decision_intent=turn.decision.intent,
+            decision_rationale=turn.decision.rationale,
+            response_type=turn.conversation.response_type,
+            active_flow=_infer_active_flow_from_payload(
+                {
+                    "type": "response",
+                    "response_type": turn.conversation.response_type,
+                }
+            ),
+            llm_called=any(
+                event.component in {"LocalLLM", "QwenDelivery", "FrontierLLM"}
+                and event.status != "skipped"
+                for event in getattr(turn, "engine_trace", [])
+            ),
+            filler=bool(immediate_filler or pre_filler or turn.filler_text),
+        )
     finally:
         await _cancel_progress_task(progress_task)
 
@@ -373,11 +730,25 @@ async def _handle_stt(websocket: WebSocket, message: dict, active_speakers: set[
         await _send_runtime_filler(websocket, turn.filler_text, stage=_processing_stage_for_text(text))
 
     if not turn.conversation.requires_tts and not turn.conversation.response_text:
+        fallback_text = conversation_engine.build_assistant_response(
+            text,
+            (getattr(turn, "context", {}) or {}).get("user_profile") or {},
+            fallback_type="unsupported_but_answered",
+        )
+        response = conversation_engine.build_response(
+            {
+                "text": fallback_text,
+                "type": "smalltalk",
+                "requires_tts": True,
+            }
+        )
         await websocket.send_json(
             {
-                "type": "ignored",
-                "reason": turn.decision.rationale,
-                "requires_tts": False,
+                "type": "response",
+                **response,
+                "fast_path": "ignored_converted",
+                "active_flow": "assistant_social",
+                "route_reason": turn.decision.rationale,
             }
         )
         return
@@ -440,6 +811,119 @@ async def _handle_wake_word_fast_path(
         asyncio.create_task(_refresh_wake_word_state_background(speaker_id))
 
 
+def _identity_response_text_for_assistant_request(text: str, identity_gate) -> str:
+    response_text = str(getattr(identity_gate, "response_text", "") or "")
+    reason = str(getattr(identity_gate, "reason", "") or "")
+    assistant_type = conversation_engine.assistant_response_type(text)
+    if assistant_type == "assistant_suggestion" and reason in {
+        "needs_registration",
+        "prior_conversation_check",
+        "reverification",
+        "identity_rejected_needs_registration",
+    }:
+        return "먼저 이름, 나이, 성별을 알려주시면 그다음 복약 확인, 알림 설정, 약봉투 사진 확인을 도와드릴게요."
+    return response_text
+
+
+def _assistant_control_kind(text: str) -> str:
+    lowered = (text or "").strip().lower()
+    compact = re.sub(r"[\s.?!,，。~]+", "", lowered)
+    if not compact:
+        return ""
+    if any(token in lowered for token in ("다시 말", "한번 더", "한 번 더", "못 들", "못들", "방금 뭐", "다시 알려")):
+        return "repeat"
+    if any(token in lowered for token in ("카메라", "사진", "촬영", "ocr", "오씨알")) and any(
+        token in lowered for token in ("꺼", "끄", "닫", "치워", "취소", "그만", "안 해", "안해", "필요 없", "필요없")
+    ):
+        return "camera_cancel"
+    if compact in {"그만", "됐어", "됐습니다", "잠깐만", "잠깐", "기다려", "멈춰"}:
+        return "stop"
+    if compact in {"아니", "아냐", "아니요", "아니야"}:
+        return "negative"
+    if compact in {"네", "예", "응", "어", "그래", "맞아"}:
+        return "affirmative"
+    return ""
+
+
+async def _should_handle_assistant_control_fast_path(text: str, speaker_id: str | None) -> bool:
+    kind = _assistant_control_kind(text)
+    if not kind:
+        return False
+    if kind in {"negative", "affirmative"} and await _has_pending_identity_action_fast(speaker_id):
+        return False
+    if kind in {"negative", "affirmative"}:
+        state = _speaker_state(speaker_id)
+        return state.active_flow in {"assistant_social", "none"} and bool(state.last_assistant_text)
+    return True
+
+
+async def _handle_assistant_control_fast_path(
+    websocket: WebSocket,
+    text: str,
+    speaker_id: str | None,
+    active_speakers: set[str],
+) -> None:
+    started = perf_counter()
+    if speaker_id:
+        async def send_reminder(payload: dict[str, Any]) -> None:
+            await websocket.send_json(payload)
+
+        reminder_service.register_connection(speaker_id, send_reminder)
+        active_speakers.add(speaker_id)
+
+    profile = await _load_wake_profile_fast(speaker_id)
+    state = _speaker_state(speaker_id)
+    kind = _assistant_control_kind(text)
+    if kind == "repeat" and state.last_assistant_text:
+        response_text = state.last_assistant_text
+        response_type = state.last_response_type or "assistant_control"
+        fast_path = "assistant_repeat"
+    elif kind == "camera_cancel":
+        state.active_flow = "none"
+        state.awaiting_confirmation = ""
+        response_text = "사진 확인을 중단할게요. 필요하시면 다시 말씀해 주세요."
+        response_type = "assistant_control"
+        fast_path = "assistant_camera_cancel"
+    elif kind == "stop":
+        state.active_flow = "none"
+        state.awaiting_confirmation = ""
+        response_text = conversation_engine.build_assistant_response(
+            text,
+            profile,
+            fallback_type="acknowledgement",
+        )
+        response_type = "assistant_control"
+        fast_path = "assistant_stop"
+    else:
+        response_text = conversation_engine.build_assistant_response(
+            text,
+            profile,
+            fallback_type="acknowledgement",
+        )
+        response_type = "smalltalk"
+        fast_path = "assistant_acknowledgement"
+    response = conversation_engine.build_response(
+        {
+            "text": response_text,
+            "type": response_type,
+            "requires_tts": True,
+        }
+    )
+    await websocket.send_json(
+        {
+            "type": "response",
+            **response,
+            "fast_path": fast_path,
+            "active_flow": "assistant_control" if kind in {"repeat", "stop"} else "assistant_social",
+            "route_reason": kind,
+            "server_elapsed_ms": round((perf_counter() - started) * 1000, 1),
+        }
+    )
+
+    if speaker_id:
+        asyncio.create_task(_refresh_wake_word_state_background(speaker_id))
+
+
 async def _should_handle_smalltalk_fast_path(text: str, speaker_id: str | None) -> bool:
     if _has_pending_ocr_confirmation(speaker_id):
         return False
@@ -488,7 +972,18 @@ async def _handle_smalltalk_fast_path(
         active_speakers.add(speaker_id)
 
     profile = await _load_wake_profile_fast(speaker_id)
-    response_text = conversation_engine.build_smalltalk_fast_response(text, profile)
+    smalltalk_type = conversation_engine.fast_smalltalk_type(text)
+    context: dict[str, Any] = {}
+    if smalltalk_type == "assistant_suggestion" and speaker_id:
+        try:
+            context = await asyncio.wait_for(
+                memory_engine.load_context(speaker_id),
+                timeout=WAKE_PROFILE_LOOKUP_TIMEOUT_SEC,
+            )
+        except Exception as exc:  # noqa: BLE001 - suggestion must stay responsive
+            logger.debug("[SmalltalkFastPath] suggestion_context_lookup_skipped speaker=%s error=%r", speaker_id, exc)
+            context = {}
+    response_text = conversation_engine.build_smalltalk_fast_response(text, profile, context)
     response = conversation_engine.build_response(
         {
             "text": response_text,
@@ -501,6 +996,8 @@ async def _handle_smalltalk_fast_path(
             "type": "response",
             **response,
             "fast_path": "smalltalk",
+            "active_flow": "assistant_social",
+            "route_reason": conversation_engine.assistant_response_type(text),
             "server_elapsed_ms": round((perf_counter() - started) * 1000, 1),
         }
     )
@@ -566,6 +1063,52 @@ async def _handle_profile_memory_ack_fast_path(
             "type": "response",
             **response,
             "fast_path": "profile_memory_ack",
+            "server_elapsed_ms": round((perf_counter() - started) * 1000, 1),
+        }
+    )
+
+    if speaker_id:
+        asyncio.create_task(_refresh_wake_word_state_background(speaker_id))
+
+
+async def _should_handle_profile_recall_fast_path(text: str, speaker_id: str | None) -> bool:
+    if not conversation_engine.is_profile_recall_text(text):
+        return False
+    if await _has_pending_identity_action_fast(speaker_id):
+        return False
+    return True
+
+
+async def _handle_profile_recall_fast_path(
+    websocket: WebSocket,
+    text: str,
+    speaker_id: str | None,
+    active_speakers: set[str],
+) -> None:
+    """Answer identity recall before medication/reminder routing can misclassify it."""
+    del text
+    started = perf_counter()
+    if speaker_id:
+        async def send_reminder(payload: dict[str, Any]) -> None:
+            await websocket.send_json(payload)
+
+        reminder_service.register_connection(speaker_id, send_reminder)
+        active_speakers.add(speaker_id)
+
+    profile = await _load_wake_profile_fast(speaker_id)
+    response_text = conversation_engine.build_profile_recall_response(profile)
+    response = conversation_engine.build_response(
+        {
+            "text": response_text,
+            "type": "profile_recall",
+            "requires_tts": True,
+        }
+    )
+    await websocket.send_json(
+        {
+            "type": "response",
+            **response,
+            "fast_path": "profile_recall",
             "server_elapsed_ms": round((perf_counter() - started) * 1000, 1),
         }
     )
@@ -1215,6 +1758,9 @@ def _build_medication_safety_question_text(
     med_text = _friendly_medication_label(meds) if meds else "그 약"
     compact = _compact_text(strip_wake_words(text))
     other_med_signal = any(token in compact for token in ("다른약", "같이먹", "함께먹", "병용", "상호작용"))
+    acetaminophen_signal = any(
+        token in compact for token in ("타이레놀", "아세트아미노펜")
+    ) or any("타이레놀" in med or "아세트아미노펜" in med for med in meds)
     multi_dose_signal = any(
         token in compact
         for token in (
@@ -1236,13 +1782,27 @@ def _build_medication_safety_question_text(
     )
     if other_med_signal and not multi_dose_signal:
         return (
-            f"{name}, {med_text}을 다른 약과 같이 드셔도 되는지는 같이 드시려는 약 이름이 필요합니다. "
-            "확인 전에는 임의로 같이 드시지 말고, 약봉투나 처방전을 들고 의사나 약사에게 먼저 확인해 주세요."
+            f"{name}, 같이 드실 약 이름이 필요합니다. "
+            "확인 전에는 임의로 같이 드시지 말고 약사에게 먼저 확인해 주세요."
+        )
+    if not multi_dose_signal:
+        if acetaminophen_signal:
+            return (
+                f"{name}, 약봉투에 적힌 용량과 시간이 맞으면 타이레놀은 드셔도 됩니다. "
+                "이미 드셨거나 감기약·진통제를 같이 드셨다면 먼저 약사에게 확인하세요."
+            )
+        return (
+            f"{name}, 약봉투에 적힌 용량과 시간이 맞으면 드셔도 됩니다. "
+            "이미 드셨거나 헷갈리면 한 번 더 드시지 마세요."
+        )
+    if acetaminophen_signal:
+        return (
+            f"{name}, 타이레놀은 한 번에 많이 드시면 간 손상 위험이 있습니다. "
+            "약봉투의 1회 용량을 넘기지 말고, 이미 많이 드셨다면 약사나 119에 확인하세요."
         )
     return (
-        f"{name}, {med_text}은 처방된 양보다 한 번에 더 드시면 위험할 수 있습니다. "
-        "지금 여러 알을 동시에 드시려는 상황이면 드시지 말고, 약봉투에 적힌 1회 복용량을 먼저 확인해 주세요. "
-        "이미 많이 드셨거나 어지러움, 심한 저혈압 느낌, 실신할 것 같은 증상이 있으면 119나 응급실에 연락하세요."
+        f"{name}, {med_text}은 한 번에 더 드시면 위험할 수 있습니다. "
+        "정해진 1회 용량만 드시고, 이미 많이 드셨거나 이상 증상이 있으면 119에 연락하세요."
     )
 
 
@@ -1396,9 +1956,9 @@ def _build_stored_medication_guidance_text(
             "이미 드셨거나 헷갈리면 한 번 더 드시지 말고 약봉투나 약통을 먼저 확인해 주세요."
         )
     return (
-        f"{name}, 현재 저장된 약은 {med_text}입니다. "
-        "오늘 드셔야 하는지와 시간은 약봉투나 처방전에 적힌 복용법을 기준으로 확인해야 합니다. "
-        "복용 시간이 맞고 아직 안 드셨다면 정해진 양만 드세요. 이미 드셨거나 헷갈리면 한 번 더 드시지 마세요."
+        f"{name}, 저장된 약은 {med_text}입니다. "
+        "드실 시간과 용량은 약봉투 기준으로 확인해 주세요. "
+        "헷갈리면 한 번 더 드시지 마세요."
     )
 
 
@@ -1639,6 +2199,9 @@ async def _send_runtime_filler(websocket: WebSocket, text: str, *, stage: str) -
 def _immediate_filler_for_text(text: str) -> str:
     if not _should_send_immediate_filler(text):
         return ""
+    safety = classify_patient_safety_situation(text)
+    if safety and safety.severity == "emergency":
+        return ""
     stage = _processing_stage_for_text(text)
     preview = conversation_engine.receive_input(text)
     generated = conversation_engine.generate_filler(preview)
@@ -1771,11 +2334,9 @@ def _is_incomplete_or_noise_utterance(text: str) -> bool:
     if compact in {"이오디오는", "이오는", "한국어음성입니다", "이오디오는한국어음성입니다"}:
         return True
     if compact in {
-        "어",
         "음",
         "음음",
         "어어",
-        "네",
         "딸깍",
         "찰칵",
         "흠",
@@ -1789,7 +2350,7 @@ def _is_incomplete_or_noise_utterance(text: str) -> bool:
     }:
         return True
     tokens = raw.split()
-    filler_tokens = {"어", "음", "그", "저", "이거", "그거", "아", "흠", "흐음", "으음", "네", "나"}
+    filler_tokens = {"어", "음", "그", "저", "이거", "그거", "아", "흠", "흐음", "으음", "나"}
     if tokens and all(token in filler_tokens for token in tokens):
         return True
     if 2 <= len(tokens) <= 5 and tokens[-1] in {"그", "저", "이거", "그거"}:
@@ -1820,6 +2381,12 @@ def _has_actionable_signal(text: str) -> bool:
             "녹용",
             "비타민",
             "누구",
+            "어디",
+            "뭐해",
+            "뉴스",
+            "날씨",
+            "다시",
+            "못 들",
             "안녕",
             "고마",
         )
@@ -1841,6 +2408,24 @@ def _redact_ocr_context(text: str) -> str:
 
 
 async def _handle_ocr(websocket: WebSocket, message: dict) -> None:
+    trace = _WsTurnTrace({**message, "text": "OCR image upload"})
+    traced_websocket = _TraceWebSocket(websocket, trace)
+    trace.mark(
+        "ocr_received",
+        message_type=str(message.get("type") or ""),
+        client_context=trace.client_context,
+    )
+    try:
+        await _handle_ocr_impl(traced_websocket, message)
+    except Exception as exc:
+        trace.error = repr(exc)
+        trace.mark("exception", error=trace.error)
+        raise
+    finally:
+        await _persist_turn_diagnostic(trace)
+
+
+async def _handle_ocr_impl(websocket: WebSocket, message: dict) -> None:
     """OCR 결과를 받아 메모리에 저장 및 DUR 동기화."""
     ocr_data = message.get("data", {})
     speaker_id = message.get("speaker_id")

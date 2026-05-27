@@ -15,11 +15,29 @@ from app.services.medication_extraction import (
 
 def test_strip_wake_words_removes_odiss():
     assert strip_wake_words("오디스, 내가 누구인지 말해봐.") == "내가 누구인지 말해봐"
+    assert strip_wake_words("오티스, 혈압약 먹어도 돼?") == "혈압약 먹어도 돼"
+    assert strip_wake_words("오 디 스, 혈압약 먹어도 돼?") == "혈압약 먹어도 돼"
+    assert strip_wake_words("보디스, 혈압약 먹어도 돼?") == "혈압약 먹어도 돼"
     assert strip_wake_words("오디스") == ""
+    assert strip_wake_words("오디 혈압약 먹어도 돼?") == "혈압약 먹어도 돼"
+    assert strip_wake_words("야, 혈압약 먹어도 돼?") == "혈압약 먹어도 돼"
+    assert strip_wake_words("먹어야 하는 약") == "먹어야 하는 약"
+    assert strip_wake_words("오디오가 안 들려") == "오디오가 안 들려"
     assert is_non_medication_token("오디스")
     assert not is_wake_word_only("")
     assert not is_wake_word_only("?")
     assert is_wake_word_only("오디스?")
+    assert is_wake_word_only("보리스")
+    assert is_wake_word_only("오티스")
+    assert is_wake_word_only("오지스?")
+    assert is_wake_word_only("오 디 스")
+    assert is_wake_word_only("오디")
+    assert is_wake_word_only("오티즈")
+    assert is_wake_word_only("보디스")
+    assert is_wake_word_only("야")
+    assert is_wake_word_only("들려?")
+    assert is_wake_word_only("내 말 들려?")
+    assert not is_wake_word_only("오디스 혈압약 먹어도 돼?")
 
 
 def test_ocr_capture_request_detects_new_medication_package_language():

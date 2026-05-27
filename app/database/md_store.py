@@ -31,6 +31,8 @@ PERMANENT_CATEGORIES = [
     "medication_log",
     "dur_linkage",
     "health_supplement",
+    "feedback",
+    "assistant_diagnostics",
 ]
 
 FLASH_FILES = {

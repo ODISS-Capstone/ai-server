@@ -561,7 +561,7 @@ class EngineOrchestrator:
         if fast_smalltalk_type:
             response_builder = getattr(self.conversation, "build_smalltalk_fast_response", None)
             response_text = (
-                response_builder(query_text, context.get("user_profile") or {})
+                response_builder(query_text, context.get("user_profile") or {}, context)
                 if callable(response_builder)
                 else "안녕하세요. 무엇을 도와드릴까요?"
             )
@@ -787,6 +787,42 @@ class EngineOrchestrator:
         )
 
         if self._should_suppress_turn(text=query_text, decision=decision, input_data=input_data):
+            if is_wake_word_only(query_text):
+                trace_engine(
+                    "CE_Response",
+                    "ConversationEngine",
+                    "suppress_wake_word_only_turn",
+                    response_type="ignored",
+                    requires_tts=False,
+                )
+                conversation = ConversationComposeResponse(
+                    response_text="",
+                    response_type="ignored",
+                    requires_tts=False,
+                )
+                return EnginePipelineResult(
+                    input_data=input_data,
+                    context=context,
+                    identity_gate=identity_gate_info,
+                    decision=decision,
+                    evidence=self._empty_evidence(query_text),
+                    execution_results={
+                        "intent": decision.intent,
+                        "query": query_text,
+                        "task_results": {},
+                        "emergency": False,
+                        "suppressed": True,
+                    },
+                    filler_text="",
+                    core_message="",
+                    judge_review={},
+                    reviewed_message="",
+                    delivery_message="",
+                    conversation=conversation,
+                    engine_trace=engine_trace,
+                    memory_trace=memory_trace,
+                    tool_trace=tool_trace,
+                )
             recovery: dict[str, Any] = {}
             if not self._is_llm_ignore_route(decision):
                 recovery = await self._recover_suppressed_medical_followup(
@@ -838,33 +874,46 @@ class EngineOrchestrator:
             trace_engine(
                 "CE_Response",
                 "ConversationEngine",
-                "suppress_out_of_scope_turn",
-                response_type="ignored",
-                requires_tts=False,
+                "assistant_fallback_for_non_medical_turn",
+                response_type="smalltalk",
+                requires_tts=True,
+            )
+            response_text = self.conversation.build_assistant_response(
+                query_text,
+                context.get("user_profile") or {},
+                fallback_type="unsupported_but_answered"
+                if "unknown" in str(getattr(decision, "rationale", ""))
+                else None,
+            )
+            assistant_decision = ReasoningRouteDecision(
+                mode=ReasoningMode.MEMORY_ONLY,
+                intent="smalltalk",
+                rationale="assistant_answered_former_suppressed_turn",
+                tasks=[],
             )
             conversation = ConversationComposeResponse(
-                response_text="",
-                response_type="ignored",
-                requires_tts=False,
+                response_text=response_text,
+                response_type="smalltalk",
+                requires_tts=True,
             )
             return EnginePipelineResult(
                 input_data=input_data,
                 context=context,
                 identity_gate=identity_gate_info,
-                decision=decision,
+                decision=assistant_decision,
                 evidence=self._empty_evidence(query_text),
                 execution_results={
-                    "intent": decision.intent,
+                    "intent": "smalltalk",
                     "query": query_text,
-                    "task_results": {},
+                    "task_results": {"assistant_fallback": True},
                     "emergency": False,
-                    "suppressed": True,
+                    "suppressed": False,
                 },
                 filler_text="",
-                core_message="",
+                core_message=response_text,
                 judge_review={},
-                reviewed_message="",
-                delivery_message="",
+                reviewed_message=response_text,
+                delivery_message=response_text,
                 conversation=conversation,
                 engine_trace=engine_trace,
                 memory_trace=memory_trace,
@@ -1190,8 +1239,6 @@ class EngineOrchestrator:
     def _should_suppress_turn(*, text: str, decision: Any, input_data: dict[str, Any]) -> bool:
         if is_wake_word_only(text):
             return True
-        if getattr(decision, "rationale", "") == "out_of_scope_smalltalk_suppressed":
-            return True
         if (
             decision.intent == "unknown"
             and decision.mode == ReasoningMode.MEMORY_ONLY
@@ -1244,7 +1291,7 @@ class EngineOrchestrator:
             "ocr_result_requires_prescription_logging",
             "medication_memory_recall_available",
             "smalltalk_detected",
-            "out_of_scope_smalltalk_suppressed",
+            "assistant_general_smalltalk",
             "emergency_policy_first",
             "ocr_capture_requested",
             "stored_medication_meal_guidance",
@@ -1565,9 +1612,7 @@ class EngineOrchestrator:
             return f"{name}님이십니다. 현재 저장된 정보는 {detail_text}입니다."
 
         if decision.intent == "smalltalk":
-            return self.conversation.generate_smalltalk(
-                self.conversation.receive_input(text)
-            ) or ""
+            return self.conversation.build_assistant_response(text, profile, context=context)
 
         profile_update = (
             self.memory.extract_identity_from_text(text)
@@ -2224,6 +2269,9 @@ class EngineOrchestrator:
         med_text = cls._friendly_medication_label(meds) if meds else "그 약"
         compact = cls._compact_text(strip_wake_words(text))
         other_med_signal = any(token in compact for token in ("다른약", "같이먹", "함께먹", "병용", "상호작용"))
+        acetaminophen_signal = any(
+            token in compact for token in ("타이레놀", "아세트아미노펜")
+        ) or any("타이레놀" in med or "아세트아미노펜" in med for med in meds)
         multi_dose_signal = any(
             token in compact
             for token in (
@@ -2245,13 +2293,27 @@ class EngineOrchestrator:
         )
         if other_med_signal and not multi_dose_signal:
             return (
-                f"{name}, {med_text}을 다른 약과 같이 드셔도 되는지는 같이 드시려는 약 이름이 필요합니다. "
-                "확인 전에는 임의로 같이 드시지 말고, 약봉투나 처방전을 들고 의사나 약사에게 먼저 확인해 주세요."
+                f"{name}, 같이 드실 약 이름이 필요합니다. "
+                "확인 전에는 임의로 같이 드시지 말고 약사에게 먼저 확인해 주세요."
+            )
+        if not multi_dose_signal:
+            if acetaminophen_signal:
+                return (
+                    f"{name}, 약봉투에 적힌 용량과 시간이 맞으면 타이레놀은 드셔도 됩니다. "
+                    "이미 드셨거나 감기약·진통제를 같이 드셨다면 먼저 약사에게 확인하세요."
+                )
+            return (
+                f"{name}, 약봉투에 적힌 용량과 시간이 맞으면 드셔도 됩니다. "
+                "이미 드셨거나 헷갈리면 한 번 더 드시지 마세요."
+            )
+        if acetaminophen_signal:
+            return (
+                f"{name}, 타이레놀은 한 번에 많이 드시면 간 손상 위험이 있습니다. "
+                "약봉투의 1회 용량을 넘기지 말고, 이미 많이 드셨다면 약사나 119에 확인하세요."
             )
         return (
-            f"{name}, {med_text}은 처방된 양보다 한 번에 더 드시면 위험할 수 있습니다. "
-            "지금 여러 알을 동시에 드시려는 상황이면 드시지 말고, 약봉투에 적힌 1회 복용량을 먼저 확인해 주세요. "
-            "이미 많이 드셨거나 어지러움, 심한 저혈압 느낌, 실신할 것 같은 증상이 있으면 119나 응급실에 연락하세요."
+            f"{name}, {med_text}은 한 번에 더 드시면 위험할 수 있습니다. "
+            "정해진 1회 용량만 드시고, 이미 많이 드셨거나 이상 증상이 있으면 119에 연락하세요."
         )
 
     def _handle_stored_medication_guidance_turn(
@@ -2336,9 +2398,9 @@ class EngineOrchestrator:
         return {
             "rationale": "stored_medication_vague_guidance",
             "response_text": (
-                f"{name}, 현재 저장된 약은 {med_text}입니다. "
-                "오늘 드셔야 하는지와 시간은 약봉투나 처방전에 적힌 복용법을 기준으로 확인해야 합니다. "
-                "복용 시간이 맞고 아직 안 드셨다면 정해진 양만 드세요. 이미 드셨거나 헷갈리면 한 번 더 드시지 마세요."
+                f"{name}, 저장된 약은 {med_text}입니다. "
+                "드실 시간과 용량은 약봉투 기준으로 확인해 주세요. "
+                "헷갈리면 한 번 더 드시지 마세요."
             ),
             "medications": meds,
         }

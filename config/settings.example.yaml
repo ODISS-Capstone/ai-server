@@ -144,3 +144,9 @@ memory_browser:
     - http://127.0.0.1:5173
   api_prefix: /api/memory
   frontend_dev_port: 5173
+
+# ── 배포용 ODISS 웹 AI 비서 ──
+assistant_web:
+  token: ${ASSISTANT_WEB_TOKEN}    # production/staging → required
+  dist_path: ./web/dist
+  route_prefix: /app

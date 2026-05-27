@@ -44,7 +44,7 @@ class IntentType:
 
 
 MEDICATION_KEYWORDS = [
-    "약", "복용", "먹어도", "먹으면", "같이 먹", "드셔도", "먹고", "처방", "부작용",
+    "약", "복용", "먹", "먹어도", "먹으면", "같이 먹", "드셔도", "먹고", "처방", "부작용",
     "금기", "주의", "효과", "효능", "용량", "언제",
     "와파린", "아스피린", "혈압약", "당뇨약", "인슐린",
 ]
@@ -67,11 +67,17 @@ EMERGENCY_KEYWORDS = [
     "응급",
     "119",
     "가슴 통증",
+    "가슴 아",
+    "가슴이 아",
+    "가슴이 아파",
     "가슴이 답답",
     "가슴 답답",
     "가슴 압박",
     "가슴이 조",
     "가슴이 눌",
+    "숨이 막",
+    "숨막",
+    "숨을 못",
     "흉통",
     "뇌졸중",
     "마비",
@@ -310,8 +316,8 @@ class ReasoningEngine:
         if intent == IntentType.SMALLTALK:
             return ReasoningRouteDecision(
                 mode=ReasoningMode.MEMORY_ONLY,
-                intent=IntentType.UNKNOWN,
-                rationale="out_of_scope_smalltalk_suppressed",
+                intent=IntentType.SMALLTALK,
+                rationale="assistant_general_smalltalk",
                 tasks=[],
             )
 

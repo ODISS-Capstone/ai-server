@@ -158,6 +158,7 @@ def test_memory_browser_requires_token_when_configured(memory_db, monkeypatch):
         {"name": "김영수", "age": "72", "gender": "남성", "conditions": []},
     )
     monkeypatch.setattr(settings, "memory_browser_token", "required-token")
+    monkeypatch.setattr(settings, "app_env", "production")
 
     client = TestClient(app)
     unauthorized = client.get("/api/memory/patients?name=김영수")
@@ -168,3 +169,22 @@ def test_memory_browser_requires_token_when_configured(memory_db, monkeypatch):
         headers={"Authorization": "Bearer required-token"},
     )
     assert authorized.status_code == 200
+
+
+def test_memory_browser_accepts_assistant_web_token(memory_db, monkeypatch):
+    store, _ = memory_db
+    _write_patient(
+        store,
+        "patient-kim",
+        {"name": "김영수", "age": "72", "gender": "남성", "conditions": []},
+    )
+    monkeypatch.setattr(settings, "memory_browser_token", "memory-token")
+    monkeypatch.setattr(settings, "assistant_web_token", "assistant-token")
+    monkeypatch.setattr(settings, "app_env", "production")
+
+    client = TestClient(app)
+    response = client.get(
+        "/api/memory/patients?name=김영수",
+        headers={"Authorization": "Bearer assistant-token"},
+    )
+    assert response.status_code == 200

@@ -12,13 +12,15 @@
 import logging
 import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from app.api import dur, health, query, upload
-from app.api.routes import agent_ws, memory_browser_api, ocr_api, stt_api
+from app.api.routes import agent_ws, feedback_api, memory_browser_api, ocr_api, stt_api
 from app.core.config import settings
 from app.core.logging_config import configure_logging
 from app.database.md_store import md_store
@@ -86,7 +88,7 @@ if cors_origins:
         CORSMiddleware,
         allow_origins=cors_origins,
         allow_credentials=True,
-        allow_methods=["GET", "OPTIONS"],
+        allow_methods=["GET", "POST", "OPTIONS"],
         allow_headers=["Authorization", "Content-Type"],
     )
 
@@ -101,6 +103,13 @@ app.include_router(agent_ws.router, tags=["websocket"])
 app.include_router(ocr_api.router)
 app.include_router(stt_api.router)
 app.include_router(memory_browser_api.router)
+app.include_router(feedback_api.router)
+
+web_dist = Path(settings.assistant_web_dist_path)
+if web_dist.exists() and web_dist.is_dir():
+    app.mount("/app", StaticFiles(directory=str(web_dist), html=True), name="assistant-web")
+else:
+    logger.info("Assistant web dist not mounted; directory not found: %s", web_dist)
 
 
 @app.get("/")

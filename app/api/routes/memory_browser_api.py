@@ -7,6 +7,7 @@ from typing import Annotated, Optional
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 
 from app.core.config import settings
+from app.api.routes.assistant_auth import validate_assistant_token
 from app.services.memory_browser import MemoryBrowserService
 
 router = APIRouter(prefix="/api/memory", tags=["memory-browser"])
@@ -16,8 +17,17 @@ memory_browser = MemoryBrowserService()
 async def verify_memory_browser_token(
     authorization: Annotated[Optional[str], Header()] = None,
 ) -> None:
-    expected = (settings.memory_browser_token or "").strip()
-    if not expected:
+    if settings.app_env.lower() in {"development", "dev", "local"} and not authorization:
+        return
+    expected_tokens = {
+        token
+        for token in (
+            (settings.memory_browser_token or "").strip(),
+            (settings.assistant_web_token or "").strip(),
+        )
+        if token
+    }
+    if not expected_tokens:
         if settings.app_env.lower() in {"development", "dev", "local"}:
             return
         raise HTTPException(status_code=503, detail="Memory browser token is not configured")
@@ -25,7 +35,7 @@ async def verify_memory_browser_token(
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing bearer token")
     token = authorization.removeprefix("Bearer ").strip()
-    if token != expected:
+    if not validate_assistant_token(token, include_memory_browser=True):
         raise HTTPException(status_code=403, detail="Invalid bearer token")
 
 
