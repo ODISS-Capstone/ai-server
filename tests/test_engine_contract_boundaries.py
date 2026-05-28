@@ -44,8 +44,8 @@ def test_reasoning_route_execution_modes_are_contractual():
         ReasoningRouteInput(text="오늘 뉴스 요약해줘", is_smalltalk=False, context={})
     )
     assert out_of_scope.mode == ReasoningMode.MEMORY_ONLY
-    assert out_of_scope.intent == IntentType.UNKNOWN
-    assert out_of_scope.rationale == "out_of_scope_smalltalk_suppressed"
+    assert out_of_scope.intent == IntentType.SMALLTALK
+    assert out_of_scope.rationale == "assistant_general_smalltalk"
 
 
 def test_conversation_contract_never_exposes_think_token():

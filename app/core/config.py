@@ -127,6 +127,10 @@ class Settings(BaseSettings):
     memory_browser_token: Optional[str] = None
     memory_browser_cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
 
+    # Deployable assistant web app
+    assistant_web_token: Optional[str] = None
+    assistant_web_dist_path: str = "./web/dist"
+
     # TTS / STT (optional — Clova)
     clova_stt_client_id: Optional[str] = None
     clova_stt_client_secret: Optional[str] = None

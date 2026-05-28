@@ -270,11 +270,8 @@ class ReminderService:
         if self._start_background_tasks if start_tasks is None else start_tasks:
             self._start_one_shot_task(reminder)
         if medication_label == "알림":
-            return f"네, {name}. {self._display_duration(delay)} 뒤에 알림을 알려드릴게요."
-        return (
-            f"네, {name}. {self._display_duration(delay)} 뒤에 "
-            f"{medication_label} 드실 시간이라고 알려드릴게요."
-        )
+            return f"네, {self._display_duration(delay)} 뒤에 알림 드릴게요."
+        return f"네, {self._display_duration(delay)} 뒤에 {medication_label} 알려드릴게요."
 
     def start_setup(
         self,
@@ -899,11 +896,7 @@ class ReminderService:
         if reminder.medication_label == "알림":
             text = f"{recipient}, 요청하신 알림 시간입니다."
         else:
-            text = (
-                f"{recipient}, 요청하신 시간이 되었습니다. "
-                f"{reminder.medication_label}을 복용하실 시간입니다. "
-                "약을 드신 뒤에는 \"먹었어\"라고 말씀해 주세요."
-            )
+            text = f"{recipient}, {reminder.medication_label} 드실 시간입니다."
         payload = {
             "type": "reminder",
             "text": text,

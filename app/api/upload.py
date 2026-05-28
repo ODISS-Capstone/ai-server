@@ -1,12 +1,17 @@
 """이미지/음성 업로드 및 OCR·STT 연동 API."""
-from fastapi import APIRouter, File, UploadFile, HTTPException
+from fastapi import APIRouter, Depends, File, UploadFile, HTTPException
 
+from app.api.routes.assistant_auth import verify_assistant_web_token
 from app.schemas.ocr import OcrResponse
 from app.schemas.voice import SttResponse
 from app.services import ocr as ocr_service
 from app.services import voice as voice_service
 
-router = APIRouter(prefix="/upload", tags=["upload"])
+router = APIRouter(
+    prefix="/upload",
+    tags=["upload"],
+    dependencies=[Depends(verify_assistant_web_token)],
+)
 
 
 @router.post("/image", response_model=OcrResponse)

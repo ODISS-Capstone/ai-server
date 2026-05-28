@@ -178,7 +178,7 @@ def test_medication_guidance_turn_does_not_overwrite_profile_name(tmp_path, monk
     assert "김영수님" in result.conversation.response_text
 
 
-def test_suppressed_medical_followup_is_recovered_by_local_llm(tmp_path, monkeypatch):
+def test_medical_followup_is_answered_without_silent_suppression(tmp_path, monkeypatch):
     memory = make_memory(tmp_path)
     run(
         memory.save_identity_profile(
@@ -227,8 +227,8 @@ def test_suppressed_medical_followup_is_recovered_by_local_llm(tmp_path, monkeyp
         )
     )
 
-    assert calls
-    assert result.decision.rationale == "local_llm_medical_followup_recovery"
+    assert not calls
+    assert result.decision.intent == "medication_query"
     assert "먼저 확인" in result.conversation.response_text
     assert result.conversation.requires_tts is True
 
@@ -1540,10 +1540,10 @@ def test_llm_routed_noise_is_ignored_but_ack_uses_smalltalk_fast_path(tmp_path, 
     assert ack.conversation.response_type == "smalltalk"
     assert ack.conversation.requires_tts is True
     assert ack.decision.rationale == "smalltalk_detected"
-    assert fragment.conversation.response_type == "ignored"
-    assert fragment.conversation.response_text == ""
-    assert fragment.conversation.requires_tts is False
-    assert fragment.execution_results.get("suppressed") is True
+    assert fragment.conversation.response_type == "smalltalk"
+    assert fragment.conversation.response_text
+    assert fragment.conversation.requires_tts is True
+    assert fragment.execution_results.get("suppressed") is not True
 
 
 def test_reminder_service_override_dispatch_and_taken_record(tmp_path):
@@ -1786,6 +1786,56 @@ def test_orchestrator_medication_safety_question_skips_delivery_llm(tmp_path, mo
     assert "디곡신" not in answer
     assert "方才" not in answer
     assert "主治" not in answer
+
+
+def test_orchestrator_simple_tylenol_suitability_is_not_overdose_warning(tmp_path, monkeypatch):
+    memory = make_memory(tmp_path)
+    speaker_id = "medication-safety-user"
+    run(
+        memory.save_identity_profile(
+            speaker_id,
+            {"name": "김영수", "age": "72", "gender": "남성"},
+            mark_verified=True,
+        )
+    )
+
+    async def fail_if_route_llm_called(**kwargs):
+        raise AssertionError("simple medication suitability should not call route LLM")
+
+    async def fail_if_delivery_llm_called(**kwargs):
+        raise AssertionError("simple medication suitability should not call delivery LLM")
+
+    monkeypatch.setattr(
+        "app.services.engine_orchestrator.classify_reasoning_route_with_llm",
+        fail_if_route_llm_called,
+    )
+    monkeypatch.setattr(
+        "app.services.engine_orchestrator.call_local_delivery_llm",
+        fail_if_delivery_llm_called,
+    )
+
+    orchestrator = make_orchestrator(memory)
+    result = run(
+        orchestrator.run_turn(
+            text="내가 지금 타이레놀 먹어도 될까",
+            speaker_id=speaker_id,
+            include_judge=False,
+            include_delivery_llm=True,
+            run_identity_gate=True,
+        )
+    )
+
+    assert result.decision.mode == ReasoningMode.MEMORY_ONLY
+    assert result.decision.rationale == "medication_safety_fast_path"
+    assert result.filler_text == ""
+    answer = result.conversation.response_text
+    assert "타이레놀" in answer
+    assert "용량" in answer
+    assert "시간" in answer
+    assert "여러 알" not in answer
+    assert "저혈압" not in answer
+    assert "119" not in answer
+    assert len(answer) < 150
 
 
 def test_orchestrator_spoken_medication_registration_and_vague_followup(tmp_path):
@@ -2057,7 +2107,7 @@ def test_wake_word_only_is_suppressed_without_tts(tmp_path):
     assert result.execution_results.get("suppressed") is True
 
 
-def test_out_of_scope_stt_noise_is_suppressed_without_llm_search(tmp_path):
+def test_out_of_scope_stt_noise_is_answered_without_llm_search(tmp_path):
     memory = make_memory(tmp_path)
     run(
         memory.store.write_flash(
@@ -2077,15 +2127,17 @@ def test_out_of_scope_stt_noise_is_suppressed_without_llm_search(tmp_path):
     )
 
     assert result.decision.rationale in {
-        "out_of_scope_smalltalk_suppressed",
+        "assistant_general_smalltalk",
+        "smalltalk_detected",
+        "assistant_answered_former_suppressed_turn",
         "local_llm_route:noise_fragment",
         "local_llm_route:unknown",
         "local_llm_route:non_actionable_ack",
     }
-    assert result.conversation.response_type == "ignored"
-    assert result.conversation.response_text == ""
-    assert result.conversation.requires_tts is False
-    assert not any(event.action == "synthesize_core_message" for event in result.engine_trace)
+    assert result.conversation.response_type == "smalltalk"
+    assert result.conversation.response_text
+    assert result.conversation.requires_tts is True
+    assert any(event.action == "skip_llm_polish" for event in result.engine_trace)
 
 
 def test_orchestrator_identity_gate_blocks_before_reasoning(tmp_path):
