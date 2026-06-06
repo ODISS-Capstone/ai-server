@@ -20,7 +20,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from app.api import dur, health, query, upload
-from app.api.routes import agent_ws, feedback_api, memory_browser_api, ocr_api, stt_api
+from app.api.routes import (
+    agent_ws,
+    device_api,
+    feedback_api,
+    memory_browser_api,
+    ocr_api,
+    stt_api,
+)
 from app.core.config import settings
 from app.core.logging_config import configure_logging
 from app.database.md_store import md_store
@@ -102,6 +109,7 @@ app.include_router(query.router)
 app.include_router(agent_ws.router, tags=["websocket"])
 app.include_router(ocr_api.router)
 app.include_router(stt_api.router)
+app.include_router(device_api.router)
 app.include_router(memory_browser_api.router)
 app.include_router(feedback_api.router)
 

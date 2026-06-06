@@ -1,0 +1,18 @@
+{
+  "devices": [
+    {
+      "device_id": "android-r1",
+      "speaker_id": "speaker-r1",
+      "platform": "android",
+      "push_token": "push-token-r1",
+      "app_version": "1.0.0"
+    },
+    {
+      "device_id": "android-demo",
+      "speaker_id": "android_default",
+      "platform": "android",
+      "push_token": "tok-123",
+      "app_version": "0.1.0"
+    }
+  ]
+}
