@@ -116,6 +116,11 @@ app.include_router(feedback_api.router)
 web_dist = Path(settings.assistant_web_dist_path)
 if web_dist.exists() and web_dist.is_dir():
     app.mount("/app", StaticFiles(directory=str(web_dist), html=True), name="assistant-web")
+    web_assets = web_dist / "assets"
+    if web_assets.exists() and web_assets.is_dir():
+        # Backward-compatible fallback for older/cached web builds that referenced
+        # assets from the domain root instead of /app/assets.
+        app.mount("/assets", StaticFiles(directory=str(web_assets)), name="assistant-web-assets")
 else:
     logger.info("Assistant web dist not mounted; directory not found: %s", web_dist)
 

@@ -125,7 +125,10 @@ class Settings(BaseSettings):
 
     # Memory browser (read-only patient memory web UI)
     memory_browser_token: Optional[str] = None
-    memory_browser_cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
+    memory_browser_cors_origins: str = (
+        "http://localhost:5173,http://127.0.0.1:5173,"
+        "https://www.odiss.p-e.kr,http://www.odiss.p-e.kr"
+    )
 
     # Deployable assistant web app
     assistant_web_token: Optional[str] = None

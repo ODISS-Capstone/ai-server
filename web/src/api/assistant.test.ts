@@ -55,7 +55,7 @@ describe("assistant api client", () => {
     });
 
     const [path, init] = fetchMock.mock.calls[0];
-    expect(path).toBe("/api/feedback/turn");
+    expect(new URL(String(path), window.location.origin).pathname).toBe("/api/feedback/turn");
     expect(init.headers.Authorization).toBe("Bearer assistant-token");
     expect(JSON.parse(init.body).response_type).toBe("wake_word_ack");
   });
