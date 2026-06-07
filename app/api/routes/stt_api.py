@@ -16,10 +16,11 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
 from app.database.md_store import md_store
+from app.services.gemini_stt import GeminiSttError, transcribe_audio_with_gemini
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/stt", tags=["stt"])
@@ -36,6 +37,40 @@ class InstructionLogResponse(BaseModel):
     success: bool = True
     received_chars: int = 0
     stored_at: str = ""
+
+
+class SttTranscribeResponse(BaseModel):
+    success: bool = True
+    text: str = ""
+    provider: str = "gemini"
+
+
+@router.post("/transcribe", response_model=SttTranscribeResponse)
+async def transcribe_audio(
+    file: UploadFile = File(...),
+    speaker_id: Optional[str] = Form(None),
+    language: str = Form("ko-KR"),
+) -> SttTranscribeResponse:
+    """모바일 음성 파일을 Gemini API로 전사한다.
+
+    Gemini API 키는 서버 환경변수 ``GEMINI_API_KEY``에만 둔다.
+    """
+    audio = await file.read()
+    mime_type = file.content_type or "audio/mp4"
+    try:
+        text = await transcribe_audio_with_gemini(audio, mime_type=mime_type, language=language)
+    except GeminiSttError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    if text.strip():
+        await ingest_instruction_log(
+            InstructionLogInput(
+                text=text.strip(),
+                source="android_gemini_stt",
+                speaker_id=speaker_id,
+            )
+        )
+    return SttTranscribeResponse(success=True, text=text.strip())
 
 
 @router.post("/log", response_model=InstructionLogResponse)

@@ -1,2 +1,2 @@
 - [복약 관리 프로필](patient_profile.md) - android_default 사용자/복약 관리 대상자 기본 프로필
-- [최신 복약 및 DUR 요약](current_medication.md) - 최근 OCR 처방 약품: 타이레놀
+- [최신 복약 및 DUR 요약](current_medication.md) - 최근 OCR 처방 약품: zorigin'

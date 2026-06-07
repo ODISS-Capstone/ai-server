@@ -39,6 +39,17 @@ python -m uvicorn app.main:app --reload --host 0.0.0.0
 - 파이프라인: POST /query/pipeline (이미지 업로드 → OCR → DUR → DB/문서화)
 - 답변 생성: POST /query/ask (session_id, query_text 선택) → 내부 LLM → 검열 → 외부 LLM → 검증 → 사용자 친화 → MCP/기기 전송
 
+## 모바일 음성 인식(Gemini STT)
+
+Android 기본 STT 대신 모바일이 짧은 음성 파일을 `POST /api/stt/transcribe`로 업로드하고, 서버가 Gemini API로 전사합니다. API 키는 APK에 넣지 않고 서버 `.env`에만 둡니다.
+
+```bash
+GEMINI_API_KEY=...
+GEMINI_STT_MODEL=gemini-2.5-flash
+GEMINI_STT_FALLBACK_MODELS=gemini-2.5-flash-lite,gemini-1.5-flash
+GEMINI_STT_TIMEOUT_SECONDS=30
+```
+
 ## Qwen3-4B + Ollama (로컬 LLM)
 
 ai-server는 내부 LLM을 직접 추론하지 않고 OpenAI-compatible LLM 서버를 `INTERNAL_LLM_API_URL`로 호출한다. 기본 백엔드는 **Ollama** (`http://127.0.0.1:11434/v1/chat/completions`)이다.
