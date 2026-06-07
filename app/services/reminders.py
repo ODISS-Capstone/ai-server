@@ -23,6 +23,21 @@ DEFAULT_REMINDER_TIMES = {
 REMINDER_PENDING_TTL = timedelta(minutes=5)
 
 
+async def send_to_speaker_devices(
+    speaker_id: str,
+    text: str,
+    tts_requested: bool = True,
+    meta: Optional[dict[str, Any]] = None,
+) -> int:
+    """Best-effort device push hook used when no WebSocket is connected.
+
+    The local server does not own the actual device transport, so the default is
+    a no-op. Tests and deployment integrations can monkeypatch or replace this
+    function without changing ReminderService.
+    """
+    return 0
+
+
 @dataclass
 class ReminderSchedule:
     speaker_id: str
@@ -70,6 +85,7 @@ class OneShotReminder:
     display_name: str = ""
     medication_label: str = "식후 약"
     source_text: str = ""
+    idempotency_key: str = ""
     active: bool = True
 
     def to_dict(self) -> dict[str, Any]:
@@ -80,6 +96,7 @@ class OneShotReminder:
             "display_name": self.display_name,
             "medication_label": self.medication_label,
             "source_text": self.source_text,
+            "idempotency_key": self.idempotency_key,
             "active": self.active,
         }
 
@@ -252,6 +269,16 @@ class ReminderService:
         run_at = now + delay
         name = self._name(user_profile)
         medication_label = self._one_shot_label(text, prescription_log)
+        idempotency_key = self._one_shot_idempotency_key(
+            speaker_id,
+            run_at,
+            medication_label,
+        )
+        for reminder in self._one_shots.values():
+            if reminder.active and reminder.speaker_id == speaker_id and reminder.idempotency_key == idempotency_key:
+                if medication_label == "알림":
+                    return f"네, {self._display_duration(delay)} 뒤에 알림 드릴게요."
+                return f"네, {self._display_duration(delay)} 뒤에 {medication_label} 알려드릴게요."
         self._pending.pop(speaker_id, None)
         self._pending_started_at.pop(speaker_id, None)
         reminder_id = f"oneshot-{speaker_id}-{run_at.strftime('%Y%m%d%H%M%S')}-{len(self._one_shots) + 1}"
@@ -262,6 +289,7 @@ class ReminderService:
             display_name=name,
             medication_label=medication_label,
             source_text=text,
+            idempotency_key=idempotency_key,
         )
         self._one_shots[reminder_id] = reminder
         memory_engine = self._memory.get(speaker_id)
@@ -455,13 +483,25 @@ class ReminderService:
             "meal": meal,
             "medication_label": medication_label,
             "source_text": text,
+            "idempotency_key": self._taken_record_idempotency_key(
+                speaker_id,
+                now,
+                meal,
+                medication_label,
+                text,
+            ),
         }
-        existing = await memory_engine.store.read_user_file(speaker_id, "medication_taken.md")
-        await memory_engine.store.save_user_file(
-            speaker_id,
-            "medication_taken.md",
-            existing + "\n- " + json.dumps(record, ensure_ascii=False),
-        )
+        records = await self._load_taken_records(memory_engine, speaker_id)
+        if not any(existing.get("idempotency_key") == record["idempotency_key"] for existing in records):
+            records.append(record)
+            await self._save_taken_records(memory_engine, speaker_id, records)
+        else:
+            name = self._name(user_profile)
+            taken_phrase = self._format_taken_medication_phrase(meal, medication_label)
+            return (
+                f"알겠습니다. {name}이 오늘 {self._display_now(now)}에 "
+                f"{taken_phrase}을 복용한 것으로 기록해두겠습니다."
+            )
         await memory_engine.store.save(
             "medication_log",
             (
@@ -863,9 +903,6 @@ class ReminderService:
         schedule: ReminderSchedule,
         meal: str,
     ) -> Optional[dict[str, Any]]:
-        callback = self._callbacks.get(schedule.speaker_id)
-        if not callback:
-            return None
         recipient = schedule.display_name or "사용자님"
         text = (
             f"{recipient}, {self._display_time(schedule.times[meal])}가 되었습니다. "
@@ -883,15 +920,21 @@ class ReminderService:
             "meal": meal,
             "medication_label": schedule.medication_label,
         }
+        callback = self._callbacks.get(schedule.speaker_id)
+        if not callback:
+            sent_count = await send_to_speaker_devices(
+                schedule.speaker_id,
+                text,
+                tts_requested=True,
+                meta=payload,
+            )
+            return payload if sent_count else None
         result = callback(payload)
         if inspect.isawaitable(result):
             await result
         return payload
 
     async def _send_one_shot_reminder(self, reminder: OneShotReminder) -> Optional[dict[str, Any]]:
-        callback = self._callbacks.get(reminder.speaker_id)
-        if not callback:
-            return None
         recipient = reminder.display_name or "사용자님"
         if reminder.medication_label == "알림":
             text = f"{recipient}, 요청하신 알림 시간입니다."
@@ -911,6 +954,18 @@ class ReminderService:
             "meal": "식후",
             "medication_label": reminder.medication_label,
         }
+        callback = self._callbacks.get(reminder.speaker_id)
+        if not callback:
+            sent_count = await send_to_speaker_devices(
+                reminder.speaker_id,
+                text,
+                tts_requested=True,
+                meta=payload,
+            )
+            if sent_count:
+                self._recent_one_shot_dispatch_at[reminder.speaker_id] = self._now()
+                return payload
+            return None
         result = callback(payload)
         if inspect.isawaitable(result):
             await result
@@ -1013,6 +1068,26 @@ class ReminderService:
         return f"{hours}시간 {minutes}분" if minutes else f"{hours}시간"
 
     @staticmethod
+    def _one_shot_idempotency_key(speaker_id: str, run_at: datetime, medication_label: str) -> str:
+        label = re.sub(r"\s+", "", medication_label or "알림").lower()
+        return f"one-shot:{speaker_id}:{run_at.isoformat(timespec='seconds')}:{label}"
+
+    @staticmethod
+    def _taken_record_idempotency_key(
+        speaker_id: str,
+        taken_at: datetime,
+        meal: str,
+        medication_label: str,
+        source_text: str,
+    ) -> str:
+        label = re.sub(r"\s+", "", medication_label or "약").lower()
+        source = re.sub(r"[\s.?!,，。~]+", "", source_text or "").lower()
+        # Bucket to a minute so WebSocket retries or duplicate STT final events do
+        # not create duplicate medication-taken records.
+        bucket = taken_at.replace(second=0, microsecond=0).isoformat(timespec="minutes")
+        return f"taken:{speaker_id}:{bucket}:{meal or '식후'}:{label}:{source}"
+
+    @staticmethod
     def _display_now(now: datetime) -> str:
         meridiem = "오전" if now.hour < 12 else "오후"
         display_hour = now.hour if 1 <= now.hour <= 12 else now.hour - 12 if now.hour > 12 else 12
@@ -1059,6 +1134,7 @@ class ReminderService:
             display_name=str(payload.get("display_name") or ""),
             medication_label=str(payload.get("medication_label") or "알림"),
             source_text=str(payload.get("source_text") or ""),
+            idempotency_key=str(payload.get("idempotency_key") or ""),
             active=bool(payload.get("active", True)),
         )
 

@@ -1100,6 +1100,9 @@ function payloadSender(payload: WsPayload): AssistantMessage["sender"] {
 }
 
 function payloadRequestsCameraClose(payload: WsPayload, text: string): boolean {
+  if (payload.ui_action === "close_camera") {
+    return true;
+  }
   const responseType = String(payload.response_type || payload.type || "");
   if (responseType === "ocr_cancelled" || payload.fast_path === "assistant_camera_cancel") {
     return true;
@@ -1148,8 +1151,9 @@ function isPhotoIntent(text: string): boolean {
 
 function isCameraDismissIntent(text: string): boolean {
   const compact = text.replace(/\s+/g, "");
-  return /(카메라|사진|촬영|OCR|오씨알).*(꺼|끄|닫|치워|취소|그만|안해|안할|필요없|됐)/i.test(compact) ||
-    /(꺼|끄|닫|치워|취소|그만|안해|안할|필요없|됐).*(카메라|사진|촬영|OCR|오씨알)/i.test(compact) ||
+  return /(카메라|사진|촬영|OCR|오씨알).*(꺼|끄|닫|치워|취소|그만|안해|안할|안찍|찍지마|찍지말|필요없|됐)/i.test(compact) ||
+    /(꺼|끄|닫|치워|취소|그만|안해|안할|안찍|찍지마|찍지말|필요없|됐).*(카메라|사진|촬영|OCR|오씨알)/i.test(compact) ||
+    /사진안찍/i.test(compact) ||
     /^(취소|그만|됐어|아니야|아니|안해|필요없어|닫아|닫어|꺼|꺼줘|치워)$/.test(compact);
 }
 

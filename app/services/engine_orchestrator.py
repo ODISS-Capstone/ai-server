@@ -2293,14 +2293,14 @@ class EngineOrchestrator:
         )
         if other_med_signal and not multi_dose_signal:
             return (
-                f"{name}, 같이 드실 약 이름이 필요합니다. "
-                "확인 전에는 임의로 같이 드시지 말고 약사에게 먼저 확인해 주세요."
+                f"{name}, 같이 드실 약 이름을 먼저 알려주세요. "
+                "확인 전에는 임의로 같이 드시지 마세요."
             )
         if not multi_dose_signal:
             if acetaminophen_signal:
                 return (
                     f"{name}, 약봉투에 적힌 용량과 시간이 맞으면 타이레놀은 드셔도 됩니다. "
-                    "이미 드셨거나 감기약·진통제를 같이 드셨다면 먼저 약사에게 확인하세요."
+                    "이미 드셨거나 감기약을 같이 드셨다면 먼저 확인해 주세요."
                 )
             return (
                 f"{name}, 약봉투에 적힌 용량과 시간이 맞으면 드셔도 됩니다. "
@@ -2309,11 +2309,11 @@ class EngineOrchestrator:
         if acetaminophen_signal:
             return (
                 f"{name}, 타이레놀은 한 번에 많이 드시면 간 손상 위험이 있습니다. "
-                "약봉투의 1회 용량을 넘기지 말고, 이미 많이 드셨다면 약사나 119에 확인하세요."
+                "약봉투의 1회 용량을 넘기지 말고, 이미 많이 드셨다면 119나 약사에게 확인하세요."
             )
         return (
             f"{name}, {med_text}은 한 번에 더 드시면 위험할 수 있습니다. "
-            "정해진 1회 용량만 드시고, 이미 많이 드셨거나 이상 증상이 있으면 119에 연락하세요."
+            "정해진 1회 용량만 드시고, 이상 증상이 있으면 119에 연락하세요."
         )
 
     def _handle_stored_medication_guidance_turn(
@@ -2344,21 +2344,15 @@ class EngineOrchestrator:
                         "rationale": "named_medication_meal_guidance",
                         "response_text": (
                             f"{name}, 네. 지금은 {self._current_time_phrase()}이라 {meal_label} 후 {med_text} 안내로 기억해둘게요. "
-                            f"{meal_label}를 하고 오시면 저에게 '밥 먹었어'라고 말씀해 주세요. "
-                            f"그러면 {med_text}을 드시라고 안내드리겠습니다. "
-                            "드신 뒤에는 '먹었어'라고 알려주시면 복용 기록으로 남기겠습니다. "
-                            "복용량은 약봉투나 제품 포장에 적힌 대로만 드세요."
+                            f"{meal_label}를 하고 오시면 '밥 먹었어'라고 말씀해 주세요."
                         ),
                         "medications": meds,
                     }
                 return {
                     "rationale": "named_medication_meal_guidance",
                     "response_text": (
-                        f"{name}, 네. 지금 말씀하신 기준으로 {meal_label} 후 {med_text}을 드셔야 하는 것으로 기억해둘게요. "
-                        f"{meal_label}를 하고 오시면 저에게 '밥 먹었어'라고 말씀해 주세요. "
-                        f"그러면 {med_text} 복용을 안내드리겠습니다. "
-                        "드신 뒤에는 '먹었어'라고 말씀하시면 복용 기록으로 남기겠습니다. "
-                        "복용량은 약봉투나 제품 포장에 적힌 대로만 드세요."
+                        f"{name}, 네. {meal_label} 후 {med_text} 안내로 기억해둘게요. "
+                        f"{meal_label}를 하고 오시면 '밥 먹었어'라고 말씀해 주세요."
                     ),
                     "medications": meds,
                 }
@@ -2367,10 +2361,7 @@ class EngineOrchestrator:
                     "rationale": "stored_medication_meal_guidance",
                     "response_text": (
                         f"{name}, 네. 지금은 {self._current_time_phrase()}이라 {meal_label} 후 {med_text} 안내로 기억해둘게요. "
-                        f"{meal_label}를 하고 오시면 저에게 '밥 먹었어'라고 말씀해 주세요. "
-                        f"그러면 {med_text}을 드시라고 안내드리겠습니다. "
-                        "드신 뒤에는 '먹었어'라고 알려주시면 복용 기록으로 남기겠습니다. "
-                        "복용량은 약봉투나 처방전에 적힌 대로만 드세요."
+                        f"{meal_label}를 하고 오시면 '밥 먹었어'라고 말씀해 주세요."
                     ),
                     "medications": meds,
                 }
@@ -2380,7 +2371,6 @@ class EngineOrchestrator:
                     "rationale": "stored_medication_meal_guidance",
                     "response_text": (
                         f"{name}, 네. {meal_label}를 하셨군요. {meal_part} 복용약인 {med_text}을 드시면 됩니다. "
-                        "복용량은 약봉투나 처방전에 적힌 대로만 드세요. "
                         "드신 뒤에는 '먹었어'라고 말씀해 주세요."
                     ),
                     "medications": meds,
@@ -2389,9 +2379,8 @@ class EngineOrchestrator:
             return {
                 "rationale": "stored_medication_meal_guidance",
                 "response_text": (
-                    f"{name}, 현재 기록 기준으로 저장된 약은 {med_text}입니다. "
-                    f"밥을 드신 뒤, 약봉투나 처방전에 식후, 즉 {meal_part} 복용으로 적혀 있다면 정해진 양만 물과 함께 드세요. "
-                    "이미 드셨거나 헷갈리면 한 번 더 드시지 말고 약봉투나 약통을 먼저 확인해 주세요."
+                    f"{name}, 저장된 약은 {med_text}입니다. "
+                    f"{meal_part} 복용이 맞으면 드시고, 드신 뒤에는 '먹었어'라고 말씀해 주세요."
                 ),
                 "medications": meds,
             }
@@ -2399,8 +2388,7 @@ class EngineOrchestrator:
             "rationale": "stored_medication_vague_guidance",
             "response_text": (
                 f"{name}, 저장된 약은 {med_text}입니다. "
-                "드실 시간과 용량은 약봉투 기준으로 확인해 주세요. "
-                "헷갈리면 한 번 더 드시지 마세요."
+                "시간과 양은 약봉투 기준으로 확인하고, 헷갈리면 한 번 더 드시지 마세요."
             ),
             "medications": meds,
         }
@@ -2484,7 +2472,7 @@ class EngineOrchestrator:
                 suffix = (
                     " 그 외에 추가로 저장된 약은 없습니다. 새 약이 있으면 약 이름을 말씀해 주세요."
                     if ("그거말고" in compact or "다른" in compact) and len(meds) <= 1
-                    else " 정확한 복용 시간과 양은 약봉투나 처방전에 적힌 내용을 기준으로 확인해 주세요."
+                    else " 시간과 양은 약봉투 기준으로 확인해 주세요."
                 )
                 return {
                     "rationale": "stored_medication_list_recall",
@@ -2501,9 +2489,8 @@ class EngineOrchestrator:
                 return {
                     "rationale": "medication_intent_to_take",
                     "response_text": (
-                        f"네, {self._display_name(context.get('user_profile') or {})}. 현재 저장된 약은 {med_text}입니다. "
-                        "약봉투나 처방전에 적힌 복용 시간이 맞다면 정해진 양만 물과 함께 드세요. "
-                        "드신 뒤에는 '먹었어'라고 말씀하시면 복용 기록으로 남겨둘게요."
+                        f"네, {self._display_name(context.get('user_profile') or {})}. 저장된 약은 {med_text}입니다. "
+                        "시간이 맞으면 드시고, 드신 뒤에는 '먹었어'라고 말씀해 주세요."
                     ),
                     "action": "intent_to_take",
                 }
@@ -3013,8 +3000,7 @@ class EngineOrchestrator:
         med_text = self._friendly_medication_label(med_names)
         return (
             f"{self._display_name(context.get('user_profile') or {})}, {med_text}을 현재 복용 약 목록에 추가했습니다. "
-            "복용 시간과 한 번에 드실 양은 약봉투나 처방전 기준으로 확인해 주세요. "
-            "밥을 드신 뒤나 복용 시간이 헷갈릴 때 말씀하시면 이 기록을 기준으로 안내드릴게요."
+            "밥을 드신 뒤나 복용 시간이 헷갈릴 때 말씀해 주세요."
         )
 
     def _extract_spoken_medications_from_text(self, text: str) -> list[str]:

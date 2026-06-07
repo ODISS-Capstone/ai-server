@@ -1,5 +1,5 @@
-import { fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import App from "./App";
 
@@ -25,6 +25,10 @@ vi.mock("./api/memoryBrowser", () => ({
 }));
 
 describe("App", () => {
+  beforeEach(() => {
+    (window as any).__mockWebSockets = [];
+  });
+
   it("renders the assistant as the default screen", () => {
     render(<App />);
 
@@ -85,6 +89,36 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "카메라 닫기" }));
 
     expect(screen.queryByRole("heading", { name: "약봉투를 화면에 맞춰주세요" })).not.toBeInTheDocument();
+  });
+
+  it("closes the camera when the server sends the close-camera UI action", async () => {
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("button", { name: "직접 입력" }));
+    fireEvent.change(screen.getByLabelText("대화 입력"), {
+      target: { value: "약봉투 사진 찍을게" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "전송" }));
+    expect(await screen.findByRole("heading", { name: "약봉투를 화면에 맞춰주세요" })).toBeInTheDocument();
+
+    const sockets = (window as any).__mockWebSockets;
+    const socket = sockets[sockets.length - 1];
+    act(() => {
+      socket.onmessage?.({
+        data: JSON.stringify({
+          type: "response",
+          response_type: "assistant_control",
+          response_text: "네, 사진 확인을 중단할게요.",
+          fast_path: "assistant_camera_cancel",
+          ui_action: "close_camera",
+          requires_tts: true,
+        }),
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.queryByRole("heading", { name: "약봉투를 화면에 맞춰주세요" })).not.toBeInTheDocument();
+    });
   });
 
   it("keeps the memory browser behind admin mode", () => {

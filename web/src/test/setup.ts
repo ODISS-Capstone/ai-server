@@ -15,6 +15,7 @@ class MockWebSocket {
   send = vi.fn();
 
   constructor(public url: string) {
+    ((window as any).__mockWebSockets ||= []).push(this);
     setTimeout(() => {
       this.readyState = MockWebSocket.OPEN;
       this.onopen?.();
