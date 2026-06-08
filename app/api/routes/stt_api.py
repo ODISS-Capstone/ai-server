@@ -19,8 +19,10 @@ from typing import Optional
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
+from app.core.config import settings
 from app.database.md_store import md_store
 from app.services.gemini_stt import GeminiSttError, transcribe_audio_with_gemini
+from app.services.whisper_stt import WhisperSttError, transcribe_audio_with_whisper
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/stt", tags=["stt"])
@@ -51,26 +53,41 @@ async def transcribe_audio(
     speaker_id: Optional[str] = Form(None),
     language: str = Form("ko-KR"),
 ) -> SttTranscribeResponse:
-    """모바일 음성 파일을 Gemini API로 전사한다.
+    """모바일 음성 파일을 서버 STT provider로 전사한다.
 
-    Gemini API 키는 서버 환경변수 ``GEMINI_API_KEY``에만 둔다.
+    ``STT_PROVIDER=whisper``이면 로컬 faster-whisper 모델을 사용하고,
+    그 외에는 기존 Gemini STT를 사용한다.
     """
     audio = await file.read()
     mime_type = file.content_type or "audio/mp4"
+    provider = (settings.stt_provider or "gemini").strip().lower()
     try:
-        text = await transcribe_audio_with_gemini(audio, mime_type=mime_type, language=language)
+        if provider == "whisper":
+            text = await transcribe_audio_with_whisper(audio, language=language)
+        else:
+            provider = "gemini"
+            text = await transcribe_audio_with_gemini(audio, mime_type=mime_type, language=language)
     except GeminiSttError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except WhisperSttError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
+    logger.info(
+        "[STT] provider=%s speaker=%s chars=%d text=%r",
+        provider,
+        speaker_id or "",
+        len(text.strip()),
+        text.strip()[:200],
+    )
     if text.strip():
         await ingest_instruction_log(
             InstructionLogInput(
                 text=text.strip(),
-                source="android_gemini_stt",
+                source=f"android_{provider}_stt",
                 speaker_id=speaker_id,
             )
         )
-    return SttTranscribeResponse(success=True, text=text.strip())
+    return SttTranscribeResponse(success=True, text=text.strip(), provider=provider)
 
 
 @router.post("/log", response_model=InstructionLogResponse)

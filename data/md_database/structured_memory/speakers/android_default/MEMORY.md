@@ -1,2 +1,2 @@
+- [최신 복약 및 DUR 요약](current_medication.md) - 최근 OCR 처방 약품: 다나 소독용 에탄올, 원료약품 및 분량 , 에탄올, 기타 첨가물 : 정제수, 성상
 - [복약 관리 프로필](patient_profile.md) - android_default 사용자/복약 관리 대상자 기본 프로필
-- [최신 복약 및 DUR 요약](current_medication.md) - 최근 OCR 처방 약품: zorigin'

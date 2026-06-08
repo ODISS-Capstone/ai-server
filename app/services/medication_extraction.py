@@ -28,6 +28,14 @@ WAKE_WORDS: tuple[str, ...] = (
     "오지쓰",
     "우디스",
     "우디즈",
+    "우디",
+    "우디야",
+    "워디스",
+    "워디즈",
+    "워디",
+    "아디스",
+    "아디즈",
+    "아디",
     "오리스",
     "보리스",
     "보리쓰",
@@ -37,11 +45,16 @@ WAKE_WORDS: tuple[str, ...] = (
     "얘야",
     "어디스",
     "어딧스",
+    "어디쓰",
+    "어디즈",
 )
 
 WAKE_WORD_ONLY_ALIASES: tuple[str, ...] = (
     "야",
     "오디",
+    "우디",
+    "워디",
+    "아디",
     "여보세요",
     "들려",
     "잘들려",
@@ -49,13 +62,17 @@ WAKE_WORD_ONLY_ALIASES: tuple[str, ...] = (
     "듣고있니",
     "내말들려",
     "어디서",
+    "오디서",
+    "우디서",
+    "워디서",
 )
 
 _WAKE_WORD_FUZZY_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"[오어우]\s*디\s*[스즈쓰수]"),
+    re.compile(r"[오어우워아]\s*디\s*[스즈쓰수]?"),
     re.compile(r"오\s*딧\s*[스세]"),
     re.compile(r"오\s*티\s*[스즈쓰]"),
     re.compile(r"오\s*지\s*[스즈쓰]"),
+    re.compile(r"[오우워]\s*디\s*서"),
     re.compile(r"보\s*리\s*[스쓰]"),
     re.compile(r"보\s*디\s*[스즈]"),
 )

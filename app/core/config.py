@@ -140,9 +140,17 @@ class Settings(BaseSettings):
     clova_tts_client_id: Optional[str] = None
     clova_tts_client_secret: Optional[str] = None
     gemini_api_key: Optional[str] = None
+    stt_provider: str = "gemini"  # gemini | whisper
     gemini_stt_model: str = "gemini-2.5-flash"
     gemini_stt_fallback_models: str = "gemini-2.5-flash-lite,gemini-1.5-flash"
     gemini_stt_timeout_seconds: float = 30.0
+    whisper_model: str = "large-v3-turbo"
+    whisper_device: str = "auto"  # auto | cuda | cpu
+    whisper_compute_type: str = "auto"  # auto | float16 | int8_float16 | int8
+    whisper_cpu_threads: int = 4
+    gemini_ocr_model: str = "gemini-2.5-flash-lite"
+    gemini_ocr_fallback_models: str = "gemini-2.5-flash,gemini-1.5-flash"
+    gemini_ocr_timeout_seconds: float = 45.0
 
     # TurboQuant compressed KV cache — enabled by default on all Transformers
     # loads; see turboquant.runtime for details.

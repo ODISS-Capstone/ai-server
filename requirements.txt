@@ -9,3 +9,6 @@ websockets>=12.0
 # HTTP client
 httpx>=0.26.0
 pytest>=8.0.0
+
+# Local STT (Whisper Large-v3 via CTranslate2)
+faster-whisper>=1.1.0
