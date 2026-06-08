@@ -45,6 +45,8 @@ class SttTranscribeResponse(BaseModel):
     success: bool = True
     text: str = ""
     provider: str = "gemini"
+    model: str = ""
+    audio_bytes: int = 0
 
 
 @router.post("/transcribe", response_model=SttTranscribeResponse)
@@ -73,9 +75,11 @@ async def transcribe_audio(
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     logger.info(
-        "[STT] provider=%s speaker=%s chars=%d text=%r",
+        "[STT] provider=%s model=%s speaker=%s audio_bytes=%d chars=%d text=%r",
         provider,
+        settings.whisper_model if provider == "whisper" else settings.gemini_stt_model,
         speaker_id or "",
+        len(audio),
         len(text.strip()),
         text.strip()[:200],
     )
@@ -87,7 +91,13 @@ async def transcribe_audio(
                 speaker_id=speaker_id,
             )
         )
-    return SttTranscribeResponse(success=True, text=text.strip(), provider=provider)
+    return SttTranscribeResponse(
+        success=True,
+        text=text.strip(),
+        provider=provider,
+        model=settings.whisper_model if provider == "whisper" else settings.gemini_stt_model,
+        audio_bytes=len(audio),
+    )
 
 
 @router.post("/log", response_model=InstructionLogResponse)
