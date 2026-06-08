@@ -8,7 +8,7 @@ odiss/
 model/
 models/
 .model/
-
+.venv/
 # Runtime logs and validation reports
 logs/
 *.log
