@@ -371,14 +371,15 @@ def test_engine_orchestrator_skips_delivery_for_tool_safety_fast_path(monkeypatc
 
     class FakeJudge:
         async def review_final_answer(self, core_message, original_query, additional_context=None):
-            raise AssertionError("tool safety fast path should not call judge")
+            raise AssertionError("non-emergency DUR turn should not call judge")
 
-    async def fail_delivery(**kwargs):
-        raise AssertionError("tool safety fast path should not call delivery LLM")
+    async def recording_delivery(**kwargs):
+        calls.append("llm.call_local_delivery")
+        return "정리된 DUR 안내"
 
     monkeypatch.setattr(
         "app.services.engine_orchestrator.call_local_delivery_llm",
-        fail_delivery,
+        recording_delivery,
     )
 
     orchestrator = EngineOrchestrator(
@@ -389,11 +390,16 @@ def test_engine_orchestrator_skips_delivery_for_tool_safety_fast_path(monkeypatc
     )
     result = run(orchestrator.run_turn(text="can I take these together?", speaker_id="spk-1"))
 
-    assert result.delivery_message == result.reviewed_message == result.core_message
-    assert "llm.call_local_delivery" not in calls
-    assert any(
+    # DUR/약물 안전 턴은 이제 delivery LLM(Together)으로 자연어 가공한다.
+    assert "llm.call_local_delivery" in calls
+    assert result.delivery_message == "정리된 DUR 안내"
+    assert not any(
         event.stage == "DeliveryLLM"
         and event.status == "skipped"
         and event.metadata.get("delivery_skipped_reason") == "tool_safety_fast_path"
+        for event in result.engine_trace
+    )
+    assert any(
+        event.stage == "DeliveryLLM" and event.status != "skipped"
         for event in result.engine_trace
     )

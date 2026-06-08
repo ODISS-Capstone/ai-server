@@ -102,3 +102,8 @@ async def transcribe_audio_with_whisper(audio_bytes: bytes, language: str = "ko-
     finally:
         if temp_path is not None:
             temp_path.unlink(missing_ok=True)
+
+
+async def preload_whisper_model() -> None:
+    """Load the configured Whisper model during server startup."""
+    await asyncio.to_thread(_load_model)

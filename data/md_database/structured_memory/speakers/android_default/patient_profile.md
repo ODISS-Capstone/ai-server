@@ -10,4 +10,4 @@ type: user
 - ID: android_default
 - 연령: 72
 - 성별: 남성
-- 기저질환: 고혈압
+- 기저질환: 고혈압, 통풍

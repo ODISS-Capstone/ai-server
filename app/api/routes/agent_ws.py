@@ -13,6 +13,7 @@ import json
 import logging
 import asyncio
 import re
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from time import perf_counter
@@ -99,6 +100,8 @@ class AssistantDialogState:
     last_ocr_candidates: list[str] = field(default_factory=list)
     awaiting_confirmation: str = ""
     last_response_can_repeat: bool = False
+    # 최근 어시스턴트 TTS 텍스트(에코 차단용). (compact_text, monotonic_ts) 튜플.
+    recent_tts: deque = field(default_factory=lambda: deque(maxlen=12))
 
 
 @dataclass
@@ -261,38 +264,59 @@ class _WsTurnTrace:
         return round((perf_counter() - self._started_perf) * 1000)
 
     def mark(self, event: str, **data: Any) -> None:
-        if not self.enabled:
-            return
-        self.events.append(
-            {
-                "event": event,
-                "elapsed_ms": self.elapsed_ms(),
-                **data,
-            }
+        elapsed_ms = self.elapsed_ms()
+        preview = {
+            key: _preview_text(value) if isinstance(value, str) else value
+            for key, value in data.items()
+        }
+        logger.info(
+            "[WS][Trace] speaker=%s type=%s event=%s elapsed_ms=%s data=%s",
+            self.speaker_id or "-",
+            self.message_type or "-",
+            event,
+            elapsed_ms,
+            preview,
         )
+        if self.enabled:
+            self.events.append(
+                {
+                    "event": event,
+                    "elapsed_ms": elapsed_ms,
+                    **data,
+                }
+            )
 
     def record_outbound(self, payload: dict[str, Any]) -> None:
-        if not self.enabled:
-            return
-        self.outbound.append(
-            {
-                "elapsed_ms": self.elapsed_ms(),
-                "type": payload.get("type"),
-                "response_type": payload.get("response_type"),
-                "fast_path": payload.get("fast_path"),
-                "stage": payload.get("stage"),
-                "reason": payload.get("reason"),
-                "requires_tts": payload.get("requires_tts"),
-                "text": _preview_text(
-                    payload.get("response_text")
-                    or payload.get("text")
-                    or payload.get("message")
-                    or payload.get("reason")
-                    or ""
-                ),
-                "raw": payload,
-            }
+        elapsed_ms = self.elapsed_ms()
+        outbound = {
+            "elapsed_ms": elapsed_ms,
+            "type": payload.get("type"),
+            "response_type": payload.get("response_type"),
+            "fast_path": payload.get("fast_path"),
+            "stage": payload.get("stage"),
+            "reason": payload.get("reason"),
+            "requires_tts": payload.get("requires_tts"),
+            "text": _preview_text(
+                payload.get("response_text")
+                or payload.get("text")
+                or payload.get("message")
+                or payload.get("reason")
+                or ""
+            ),
+            "raw": payload,
+        }
+        logger.info(
+            "[WS][Send] speaker=%s elapsed_ms=%s type=%s response_type=%s reason=%s requires_tts=%s text=%r",
+            self.speaker_id or "-",
+            elapsed_ms,
+            outbound["type"],
+            outbound["response_type"],
+            outbound["reason"],
+            outbound["requires_tts"],
+            outbound["text"][:240],
         )
+        if self.enabled:
+            self.outbound.append(outbound)
 
     def final_route(self) -> str:
         for payload in reversed(self.outbound):
@@ -446,6 +470,31 @@ def _normalize_assistant_text(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip().lower())
 
 
+# 어시스턴트 TTS가 마이크로 되먹임될 수 있는 시간 창(초).
+ASSISTANT_ECHO_TTL_SEC = 30.0
+
+
+def _is_assistant_tts_echo(speaker_id: str | None, text: str) -> bool:
+    """들어온 STT 텍스트가 최근 어시스턴트 TTS의 되먹임(에코)인지 판정."""
+    incoming = _compact_text(text)
+    if not incoming or len(incoming) < 4:
+        return False
+    state = _speaker_state(speaker_id)
+    now = perf_counter()
+    for spoken, ts in list(state.recent_tts):
+        if now - ts > ASSISTANT_ECHO_TTL_SEC:
+            continue
+        if not spoken:
+            continue
+        # 정확 일치, 또는 한쪽이 다른 쪽을 충분히 포함(STT 절단/접두 차이 흡수).
+        if incoming == spoken:
+            return True
+        shorter, longer = (incoming, spoken) if len(incoming) <= len(spoken) else (spoken, incoming)
+        if len(shorter) >= 6 and shorter in longer:
+            return True
+    return False
+
+
 def _infer_active_flow_from_payload(payload: dict[str, Any]) -> str:
     if payload.get("active_flow"):
         return str(payload["active_flow"])
@@ -482,6 +531,11 @@ def _update_dialog_state_from_outbound(speaker_id: str | None, payload: dict[str
     response_text = str(payload.get("response_text") or payload.get("text") or payload.get("message") or "")
     payload_type = str(payload.get("type") or "")
     response_type = str(payload.get("response_type") or payload_type or "")
+    # 에코 차단: TTS로 재생되는 모든 출력(필러 포함)을 최근 발화 버퍼에 기록한다.
+    if payload.get("requires_tts", True) and response_text:
+        compact = _compact_text(response_text)
+        if compact:
+            state.recent_tts.append((compact, perf_counter()))
     if payload_type == "filler":
         return
     if response_text and payload_type != "filler":
@@ -529,7 +583,7 @@ async def websocket_chat(websocket: WebSocket):
         await websocket.close(code=1008)
         return
     await websocket.accept()
-    logger.info("WebSocket connected")
+    logger.info("[WS] connected path=/ws/chat")
     active_speakers: set[str] = set()
 
     try:
@@ -560,11 +614,22 @@ async def websocket_chat(websocket: WebSocket):
                 continue
 
             msg_type = message.get("type", "")
+            speaker_id = message.get("speaker_id")
+            text = str(message.get("text") or "").strip()
+            logger.info(
+                "[WS] recv type=%s speaker=%s chars=%d text=%r",
+                msg_type,
+                speaker_id,
+                len(text),
+                text[:160],
+            )
 
             if msg_type in {"stt_result", "identity_confirmed"}:
                 if msg_type == "identity_confirmed" and not message.get("text"):
                     message["text"] = "네, 본인 맞습니다."
                 await _handle_stt(websocket, message, active_speakers)
+            elif msg_type == "companion_prompt":
+                await _handle_companion_prompt(websocket, message)
             elif msg_type == "ocr_result":
                 await _handle_ocr(websocket, message)
             elif msg_type == "ping":
@@ -575,7 +640,7 @@ async def websocket_chat(websocket: WebSocket):
                 )
 
     except WebSocketDisconnect:
-        logger.info("WebSocket disconnected")
+        logger.info("[WS] disconnected")
     except Exception as e:
         logger.error("WebSocket error: %s", e)
         try:
@@ -613,10 +678,49 @@ async def _handle_stt(websocket: WebSocket, message: dict, active_speakers: set[
         await _persist_turn_diagnostic(trace)
 
 
+async def _handle_companion_prompt(websocket: WebSocket, message: dict) -> None:
+    """Handle internal assistant prompts without routing them as user STT."""
+    speaker_id = message.get("speaker_id")
+    prompt = str(message.get("text") or "").strip()
+    logger.info(
+        "[WS][Companion] recv speaker=%s chars=%d prompt=%r",
+        speaker_id,
+        len(prompt),
+        prompt[:160],
+    )
+    profile: dict[str, Any] = {}
+    if speaker_id:
+        try:
+            context = await memory_engine.load_context(speaker_id)
+            profile = context.get("user_profile") or {}
+        except Exception as exc:  # noqa: BLE001 - companion prompt must not break OCR flow
+            logger.debug("[WS][Companion] context_lookup_skipped speaker=%s error=%r", speaker_id, exc)
+    honorific = conversation_engine._honorific(profile)  # noqa: SLF001 - reuse existing profile wording.
+    text = (
+        f"{honorific}, 사진을 읽는 중입니다. 잠시 기다려 주세요. "
+        "최근 드신 약 중 불편했던 점은 없으셨나요?"
+    )
+    response = conversation_engine.build_response(
+        {
+            "text": text,
+            "type": "companion_prompt",
+            "requires_tts": True,
+        }
+    )
+    await websocket.send_json({"type": "response", **response})
+    logger.info(
+        "[WS][Companion] sent speaker=%s chars=%d text=%r",
+        speaker_id,
+        len(text),
+        text,
+    )
+
+
 async def _handle_stt_impl(websocket: WebSocket, message: dict, active_speakers: set[str]) -> None:
     """STT 결과를 받아 전체 파이프라인 실행."""
     text = message.get("text", "").strip()
     speaker_id = message.get("speaker_id")
+    turn_started_at = perf_counter()
     client_context = message.get("client_context")
     client_context_dict = client_context if isinstance(client_context, dict) else {}
     turn_router = AssistantTurnRouter(
@@ -634,6 +738,15 @@ async def _handle_stt_impl(websocket: WebSocket, message: dict, active_speakers:
         ),
         client_context=client_context_dict,
     )
+    logger.info(
+        "[WS][STT] start speaker=%s text=%r route=%s scope=%s fast_path=%s active_flow=%s",
+        speaker_id,
+        text[:160],
+        route_decision.route_label,
+        route_decision.engine_scope,
+        route_decision.fast_path,
+        turn_router.state.active_flow,
+    )
     _trace_mark(
         websocket,
         "short_utterance_route",
@@ -648,12 +761,30 @@ async def _handle_stt_impl(websocket: WebSocket, message: dict, active_speakers:
     )
 
     if not text:
+        logger.info("[WS][STT] empty_text speaker=%s", speaker_id)
         await websocket.send_json(
             {"type": "error", "message": "Empty text"}
         )
         return
 
+    if _is_assistant_tts_echo(speaker_id, text):
+        logger.info("[WS][STT] ignored_echo speaker=%s text=%r", speaker_id, text[:160])
+        await websocket.send_json(
+            {
+                "type": "ignored",
+                "reason": "assistant_tts_echo",
+                "requires_tts": False,
+            }
+        )
+        return
+
     if route_decision.engine_scope == "ignored":
+        logger.info(
+            "[WS][STT] ignored speaker=%s reason=%s text=%r",
+            speaker_id,
+            route_decision.route_label,
+            text[:160],
+        )
         await websocket.send_json(
             {
                 "type": "ignored",
@@ -681,6 +812,7 @@ async def _handle_stt_impl(websocket: WebSocket, message: dict, active_speakers:
         return
 
     if is_wake_word_only(text):
+        logger.info("[WS][STT] wake_fast_path speaker=%s text=%r", speaker_id, text[:160])
         await _handle_wake_word_fast_path(websocket, speaker_id, active_speakers)
         return
 
@@ -720,6 +852,25 @@ async def _handle_stt_impl(websocket: WebSocket, message: dict, active_speakers:
         await _handle_missed_one_shot_request(websocket, text, speaker_id)
         return
 
+    # 복약 알림 생성: classifier가 reminder_setup으로 보거나, 셋업 발화이거나,
+    # 이미 셋업 확인 대기 중(시간 답변)이면 리마인더 파이프라인으로 보낸다.
+    prescription_log_for_reminder = ""
+    if speaker_id:
+        try:
+            _ctx = await memory_engine.load_context(speaker_id)
+            prescription_log_for_reminder = str(_ctx.get("prescription_log") or "")
+        except Exception:  # noqa: BLE001 - reminder detection must stay responsive
+            prescription_log_for_reminder = ""
+    _has_pending_setup_fn = getattr(reminder_service, "has_pending_setup", None)
+    _reminder_has_pending = bool(_has_pending_setup_fn(speaker_id)) if callable(_has_pending_setup_fn) else False
+    if (
+        route_decision.fast_path == "reminder_setup"
+        or _reminder_has_pending
+        or ReminderService.is_setup_request(text, prescription_log=prescription_log_for_reminder)
+    ):
+        if await _handle_reminder_setup_request(websocket, text, speaker_id):
+            return
+
     pending_ocr_confirmation = _has_pending_ocr_confirmation(speaker_id)
     queued_ocr_reason = ""
     if not pending_ocr_confirmation:
@@ -728,12 +879,27 @@ async def _handle_stt_impl(websocket: WebSocket, message: dict, active_speakers:
         elif _is_direct_ocr_capture_request(text):
             queued_ocr_reason = "direct_ocr_capture_request"
         if queued_ocr_reason:
+            logger.info(
+                "[WS][OCR] direct_request_detected speaker=%s reason=%s text=%r",
+                speaker_id,
+                queued_ocr_reason,
+                text[:160],
+            )
             _queue_ocr_request(speaker_id, queued_ocr_reason)
+    else:
+        logger.info("[WS][OCR] pending_confirmation speaker=%s text=%r", speaker_id, text[:160])
 
     identity_gate = await evaluate_identity_gate(
         memory_engine=memory_engine,
         text=text,
         speaker_id=speaker_id,
+    )
+    logger.info(
+        "[WS][IdentityGate] speaker=%s allowed=%s response_type=%s reason=%s",
+        speaker_id,
+        identity_gate.allowed,
+        identity_gate.response_type,
+        identity_gate.reason,
     )
     if not identity_gate.allowed:
         if identity_gate.response_type == "ignored" and not identity_gate.response_text:
@@ -787,6 +953,7 @@ async def _handle_stt_impl(websocket: WebSocket, message: dict, active_speakers:
         return
 
     if queued_ocr_reason:
+        logger.info("[WS][OCR] send_queued_after_identity speaker=%s reason=%s", speaker_id, queued_ocr_reason)
         await _send_queued_ocr_request_if_ready(websocket, speaker_id)
         return
 
@@ -794,6 +961,7 @@ async def _handle_stt_impl(websocket: WebSocket, message: dict, active_speakers:
         return
 
     if await _send_queued_ocr_request_if_ready(websocket, speaker_id):
+        logger.info("[WS][OCR] sent_queued speaker=%s", speaker_id)
         return
 
     if await _handle_medication_safety_question_request(websocket, text, speaker_id, identity_gate):
@@ -941,7 +1109,17 @@ async def _handle_stt_impl(websocket: WebSocket, message: dict, active_speakers:
     # OCR 요청이 필요한 경우
     if turn.execution_results.get("task_results", {}).get("ocr_requested"):
         ocr_request = reasoning_engine.request_ocr()
-        await websocket.send_json({"type": "ocr_request", **ocr_request, "active_flow": "ocr_camera"})
+        logger.info(
+            "[WS][OCR] orchestrator_requested speaker=%s elapsed_ms=%.1f text=%r",
+            speaker_id,
+            (perf_counter() - turn_started_at) * 1000,
+            text[:160],
+        )
+        try:
+            await websocket.send_json({"type": "ocr_request", **ocr_request, "active_flow": "ocr_camera"})
+        except Exception as exc:  # noqa: BLE001 - WS 끊김 시 FCM 폴백
+            logger.warning("[WS][OCR] ws_send_failed speaker=%s error=%s — FCM 폴백 시도", speaker_id, exc)
+            await _push_ocr_request_via_fcm(speaker_id, ocr_request, "orchestrator_ocr_request")
         return
 
     synthesis = {
@@ -950,6 +1128,13 @@ async def _handle_stt_impl(websocket: WebSocket, message: dict, active_speakers:
         "requires_tts": turn.conversation.requires_tts,
     }
     response = conversation_engine.build_response(synthesis)
+    logger.info(
+        "[WS][STT] response speaker=%s response_type=%s elapsed_ms=%.1f chars=%d",
+        speaker_id,
+        synthesis["type"],
+        (perf_counter() - turn_started_at) * 1000,
+        len(synthesis["text"] or ""),
+    )
     await websocket.send_json({"type": "response", **response})
 
     # ME_Update: 결과 저장 및 Flash Memory 압축
@@ -1496,6 +1681,71 @@ async def _handle_relative_alarm_request(
         speaker_id=speaker_id,
     )
     await memory_engine.mark_identity_seen(speaker_id, verified=True)
+
+
+async def _handle_reminder_setup_request(
+    websocket: WebSocket,
+    text: str,
+    speaker_id: str | None,
+) -> bool:
+    """복약 알림 셋업/확인 흐름. 처리하면 True, 해당 없으면 False."""
+    if not speaker_id:
+        response = conversation_engine.build_response(
+            {
+                "text": "알림 설정에는 사용자 연결 정보가 필요합니다. 오디스를 다시 불러 주세요.",
+                "type": "reminder",
+                "requires_tts": True,
+            }
+        )
+        await websocket.send_json(
+            {"type": "response", **response, "fast_path": "reminder_setup"}
+        )
+        return True
+
+    # 응답 전 필러로 즉답성 유지(기존 리마인더 브랜치와 동일한 계약).
+    immediate_filler = _immediate_filler_for_text(text)
+    if immediate_filler:
+        await _send_runtime_filler(
+            websocket, immediate_filler, stage=_processing_stage_for_text(text)
+        )
+
+    context = await memory_engine.load_context(speaker_id)
+    reminder_text = await reminder_service.handle_user_text(
+        memory_engine=memory_engine,
+        speaker_id=speaker_id,
+        text=text,
+        user_profile=context.get("user_profile", {}),
+        prescription_log=context.get("prescription_log", ""),
+    )
+    if not reminder_text:
+        # 셋업으로 분류됐지만 리마인더 서비스가 처리하지 못하면 일반 파이프라인에 맡긴다.
+        return False
+
+    response = conversation_engine.build_response(
+        {
+            "text": reminder_text,
+            "type": "reminder",
+            "requires_tts": True,
+        }
+    )
+    await websocket.send_json(
+        {
+            "type": "response",
+            **response,
+            "fast_path": "reminder_setup",
+            "active_flow": "reminder",
+        }
+    )
+    await memory_engine.update_and_compress(
+        {
+            "query": text,
+            "answer": reminder_text,
+            "type": "reminder",
+        },
+        speaker_id=speaker_id,
+    )
+    await memory_engine.mark_identity_seen(speaker_id, verified=True)
+    return True
 
 
 async def _handle_missed_one_shot_request(
@@ -3104,22 +3354,68 @@ def _has_pending_ocr_confirmation(speaker_id: str | None) -> bool:
 def _queue_ocr_request(speaker_id: str | None, reason: str) -> None:
     key = _pending_ocr_key(speaker_id)
     _queued_ocr_request_by_speaker[key] = {"reason": reason, "created_at": datetime.now()}
+    logger.info("[WS][OCR] queued speaker=%s key=%s reason=%s", speaker_id, key, reason)
+
+
+async def _push_ocr_request_via_fcm(
+    speaker_id: str | None,
+    ocr_request: dict[str, Any],
+    reason: str,
+) -> int:
+    """활성 WS로 전달이 불가할 때 FCM 데이터 푸시로 촬영모드 실행을 폴백 전송."""
+    if not speaker_id:
+        return 0
+    try:
+        from app.services import device_api
+
+        message = str(ocr_request.get("message") or ocr_request.get("text") or "")
+        sent = await device_api.send_data_to_speaker_devices(
+            speaker_id,
+            {
+                "type": "ocr_request",
+                "action": "request_ocr",
+                "reason": reason,
+                "message": message,
+            },
+            notification_title="ODISS 촬영 요청",
+            notification_body=message or "약봉투 촬영을 진행해 주세요.",
+        )
+        logger.info("[WS][OCR] fcm_fallback speaker=%s reason=%s sent=%d", speaker_id, reason, sent)
+        return sent
+    except Exception as exc:  # noqa: BLE001 - 푸시 실패가 턴 처리를 막지 않도록
+        logger.warning("[WS][OCR] fcm_fallback_failed speaker=%s error=%s", speaker_id, exc)
+        return 0
 
 
 async def _send_queued_ocr_request_if_ready(websocket: WebSocket, speaker_id: str | None) -> bool:
     key = _pending_ocr_key(speaker_id)
     queued = _queued_ocr_request_by_speaker.pop(key, None)
     if not queued:
+        logger.info("[WS][OCR] no_queued_request speaker=%s key=%s", speaker_id, key)
         return False
     ocr_request = reasoning_engine.request_ocr()
-    await websocket.send_json(
-        {
-            "type": "ocr_request",
-            **ocr_request,
-            "reason": queued.get("reason") or "queued_ocr_request",
-            "active_flow": "ocr_camera",
-        }
+    reason = queued.get("reason") or "queued_ocr_request"
+    logger.info(
+        "[WS][OCR] sending_request speaker=%s key=%s reason=%s message=%r",
+        speaker_id,
+        key,
+        reason,
+        str(ocr_request.get("message") or ocr_request.get("text") or "")[:160],
     )
+    try:
+        await websocket.send_json(
+            {
+                "type": "ocr_request",
+                **ocr_request,
+                "reason": reason,
+                "active_flow": "ocr_camera",
+            }
+        )
+    except Exception as exc:  # noqa: BLE001 - WS 끊김 시 FCM 폴백
+        logger.warning("[WS][OCR] ws_send_failed speaker=%s error=%s — FCM 폴백 시도", speaker_id, exc)
+        await _push_ocr_request_via_fcm(speaker_id, ocr_request, reason)
+        return True
+    logger.info("[WS][OCR] sent_request speaker=%s key=%s", speaker_id, key)
     return True
 
 

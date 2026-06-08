@@ -301,6 +301,10 @@ class ReminderService:
             return f"네, {self._display_duration(delay)} 뒤에 알림 드릴게요."
         return f"네, {self._display_duration(delay)} 뒤에 {medication_label} 알려드릴게요."
 
+    def has_pending_setup(self, speaker_id: str | None) -> bool:
+        """진행 중인 복약 알림 셋업(시간 확인 대기)이 있는지 여부."""
+        return bool(speaker_id) and speaker_id in self._pending
+
     def start_setup(
         self,
         *,
@@ -603,6 +607,11 @@ class ReminderService:
                 "말해",
                 "깨워",
                 "챙겨",
+                "만들",
+                "만들어",
+                "등록",
+                "잡아",
+                "걸어",
             )
         )
         if medication_context and reminder_signal and setup_signal:
@@ -610,7 +619,10 @@ class ReminderService:
         return (
             "알림" in lowered
             and any(token in lowered for token in ("약", "복용", "식후", "밥"))
-            and any(token in lowered for token in ("추가", "설정", "해줘", "해 줘", "해야"))
+            and any(
+                token in lowered
+                for token in ("추가", "설정", "해줘", "해 줘", "해야", "만들", "만들어", "등록", "잡아", "걸어")
+            )
         )
 
     @staticmethod

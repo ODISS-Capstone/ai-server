@@ -34,6 +34,7 @@ from app.database.md_store import md_store
 from app.engines.memory import MemoryEngine
 from app.services import turboquant_runtime
 from app.services.llm import get_internal_llm_provider
+from app.services.whisper_stt import preload_whisper_model
 
 configure_logging()
 logger = logging.getLogger(__name__)
@@ -67,6 +68,18 @@ async def lifespan(app: FastAPI):
     logger.info("Flash Memory bootstrap 완료 (no active dialogue)")
 
     turboquant_runtime.install()
+
+    if (settings.stt_provider or "").strip().lower() == "whisper":
+        try:
+            await preload_whisper_model()
+            logger.info(
+                "[WhisperSTT] preload complete model=%s device=%s compute_type=%s",
+                settings.whisper_model,
+                settings.whisper_device,
+                settings.whisper_compute_type,
+            )
+        except Exception as exc:  # noqa: BLE001 - keep server bootable for diagnostics
+            logger.warning("[WhisperSTT] preload failed: %s", exc)
 
     logger.info("ODISS 서버엔진 준비 완료")
     yield

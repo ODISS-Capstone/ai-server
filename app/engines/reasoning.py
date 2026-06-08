@@ -566,12 +566,22 @@ class ReasoningEngine:
                 self.request_ocr()["message"]
             )
 
+        has_factual_result = False
+
         dur_data = task_results.get("dur", {})
         if dur_data:
+            seen_dur_summaries: set[str] = set()
             for drug_name, dur_result in dur_data.items():
                 dur_summary = self._summarize_dur(drug_name, dur_result)
-                if dur_summary:
-                    parts.append(dur_summary)
+                if not dur_summary:
+                    continue
+                # 약명 표기 변형(페브릭/패브릭 등)으로 거의 같은 줄이 중복 송출되는 것 방지.
+                dedup_key = re.sub(r"\s+", "", dur_summary)
+                if dedup_key in seen_dur_summaries:
+                    continue
+                seen_dur_summaries.add(dedup_key)
+                parts.append(dur_summary)
+                has_factual_result = True
 
         supp_data = task_results.get("supplements", {})
         if supp_data:
@@ -581,6 +591,7 @@ class ReasoningEngine:
                     parts.append(
                         f"{name}: {item.get('RAWMTR_NM', '성분 정보 없음')}"
                     )
+                    has_factual_result = True
                 else:
                     parts.append(
                         f"{name}: 제품마다 성분과 함량이 달라 제품명이나 성분표 확인이 필요합니다."
@@ -592,7 +603,12 @@ class ReasoningEngine:
             briefs = structured.get("briefs", []) if isinstance(structured, dict) else []
             for brief in briefs[:2]:
                 parts.append(brief)
-            if not briefs and not self._is_profile_identity_recall(query, {"name": "_"}):
+            # 실제 결과(DUR/영양제)가 있으면 내부 상태문을 사용자 발화에 섞지 않는다.
+            if (
+                not briefs
+                and not has_factual_result
+                and not self._is_profile_identity_recall(query, {"name": "_"})
+            ):
                 parts.append("이전 기록에서 바로 답할 핵심 내용을 찾지 못했습니다.")
 
         if not parts:
@@ -666,8 +682,9 @@ class ReasoningEngine:
     def _summarize_dur(
         self, drug_name: str, dur_result: dict
     ) -> str:
-        """DUR 결과를 요약 문자열로 변환."""
+        """DUR 결과를 요약 문자열로 변환(노트 기준 중복 제거)."""
         summaries: list[str] = []
+        seen_notes: set[str] = set()
 
         for check_type, result in dur_result.items():
             if not isinstance(result, dict):
@@ -692,11 +709,17 @@ class ReasoningEngine:
                         or item.get("NOTE")
                         or ""
                     )
-                    if note:
-                        summaries.append(f"{name} ({endpoint_desc}): {note[:100]}")
+                    if not note:
+                        continue
+                    # 같은 주의 내용은 한 번만(엔드포인트가 달라도 동일 노트면 중복).
+                    note_key = re.sub(r"\s+", "", note[:100])
+                    if note_key in seen_notes:
+                        continue
+                    seen_notes.add(note_key)
+                    summaries.append(f"{name} ({endpoint_desc}): {note[:100]}")
 
         if summaries:
-            return f"{drug_name} 안전 확인 결과: " + "; ".join(summaries)
+            return f"{drug_name} 안전 확인 결과: " + "; ".join(summaries[:4])
         return ""
 
     @staticmethod

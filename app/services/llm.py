@@ -66,6 +66,17 @@ def get_conversation_llm_backend() -> str:
     return backend
 
 
+def _internal_helper_llm_available() -> bool:
+    """로컬 보조 LLM(라우팅/후속 회복)이 실제로 호출 가능한지 추정.
+
+    대화 백엔드가 원격 Together로 완전히 전환된 배포에서는 로컬 Ollama/vLLM이
+    떠 있지 않으므로, 매 턴 죽은 엔드포인트를 호출하지 않도록 비활성으로 본다.
+    """
+    if get_conversation_llm_backend() == "together":
+        return False
+    return bool(settings.internal_llm_api_url)
+
+
 def get_conversation_llm_config() -> dict[str, Any]:
     """Expose the effective conversation LLM switch configuration."""
     backend = get_conversation_llm_backend()
@@ -309,6 +320,8 @@ async def recover_medical_followup_with_llm(
     key = api_key if api_key is not None else settings.internal_llm_api_key
     if not url:
         return {"is_medical_followup": False, "response": "", "source": "local_llm_not_configured"}
+    if not _internal_helper_llm_available():
+        return {"is_medical_followup": False, "response": "", "source": "internal_llm_unavailable"}
 
     messages = [
         {
@@ -370,6 +383,10 @@ async def classify_reasoning_route_with_llm(
     key = api_key if api_key is not None else settings.internal_llm_api_key
     if not url:
         return {"source": "local_llm_not_configured", "usable": False}
+    if not _internal_helper_llm_available():
+        # 대화 백엔드가 원격(Together)으로 전환된 배포에서는 로컬 라우팅 LLM이 떠 있지 않다.
+        # 죽은 Ollama를 매 턴 호출해 80ms 낭비/경고를 내지 않고 결정적 라우팅으로 조용히 폴백한다.
+        return {"source": "internal_llm_unavailable", "usable": False}
 
     messages = [
         {

@@ -1,2 +1,3 @@
-- [최신 복약 및 DUR 요약](current_medication.md) - 최근 OCR 처방 약품: 다나 소독용 에탄올, 원료약품 및 분량 , 에탄올, 기타 첨가물 : 정제수, 성상
 - [복약 관리 프로필](patient_profile.md) - android_default 사용자/복약 관리 대상자 기본 프로필
+- [복약 이벤트 기록](medication_events.md) - 최근 복약 이벤트: 패브릭정
+- [최신 복약 및 DUR 요약](current_medication.md) - 최근 OCR 처방 약품: 페브릭정, 설정, 패브릭정

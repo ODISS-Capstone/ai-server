@@ -115,6 +115,13 @@ class Settings(BaseSettings):
     # OCR
     ocr_api_timeout_seconds: float = 8.0
 
+    # FCM (Firebase Cloud Messaging) — 앱 종료 상태에서도 촬영모드/알림 푸시
+    fcm_enabled: bool = False
+    # 서비스 계정 JSON 경로(미설정 시 GOOGLE_APPLICATION_CREDENTIALS 환경변수 사용)
+    fcm_credentials_path: Optional[str] = None
+    fcm_project_id: Optional[str] = None
+    fcm_timeout_seconds: float = 8.0
+
     # MCP
     mcp_server_url: Optional[str] = None
     mcp_transport: str = "stdio"

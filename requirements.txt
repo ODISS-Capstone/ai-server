@@ -12,3 +12,6 @@ pytest>=8.0.0
 
 # Local STT (Whisper Large-v3 via CTranslate2)
 faster-whisper>=1.1.0
+
+# Push notifications (FCM) — 앱 종료 상태 촬영모드/알림 전송 (선택적)
+firebase-admin>=6.5.0

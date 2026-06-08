@@ -88,6 +88,15 @@ class EngineOrchestrator:
             status: str = "observed",
             **metadata: Any,
         ) -> None:
+            logger.info(
+                "[EngineTrace] speaker_id=%s stage=%s component=%s action=%s status=%s meta=%s",
+                speaker_id or "-",
+                stage,
+                component,
+                action,
+                status,
+                metadata,
+            )
             engine_trace.append(
                 EngineTraceEvent(
                     stage=stage,
@@ -107,6 +116,16 @@ class EngineOrchestrator:
             status: str = "observed",
             **metadata: Any,
         ) -> None:
+            logger.info(
+                "[MemoryTrace] speaker_id=%s operation=%s file=%s category=%s path=%s status=%s meta=%s",
+                speaker_id or "-",
+                operation,
+                logical_file,
+                category,
+                path,
+                status,
+                metadata,
+            )
             memory_trace.append(
                 MemoryTraceEvent(
                     operation=operation,
@@ -1843,33 +1862,23 @@ class EngineOrchestrator:
         if rationale in route_fast_labels:
             return "reasoning_route_fast_path"
 
+        # 약물 정보(DUR/제품정보/심평원) 턴은 delivery LLM(Together)으로 자연어 가공한다.
+        # OCR 촬영 요청만 결정적 문구를 유지하기 위해 스킵.
         tool_fast_tasks = {
-            "dur_check",
-            "dur_product_info",
-            "hira_lookup",
             "request_ocr",
         }
         if task_types & tool_fast_tasks:
             return "tool_safety_fast_path"
 
+        # 진짜 응급/위해 신호가 있을 때만 결정적 문구 유지. 일반 복약/DUR 안내는 polish 허용.
         haystack = f"{text}\n{core_message}".lower()
-        safety_terms = (
+        urgent_terms = (
             "119",
             "응급",
-            "타이레놀",
-            "아세트아미노펜",
             "간 손상",
-            "중복",
             "과량",
-            "임의로",
-            "의사",
-            "약사",
-            "복용 기록",
-            "약봉투",
-            "처방전",
-            "dur",
         )
-        if intent in {"medication_query", "drug_identification"} and any(term in haystack for term in safety_terms):
+        if intent in {"medication_query", "drug_identification"} and any(term in haystack for term in urgent_terms):
             return "medication_safety_fast_path"
 
         return ""
