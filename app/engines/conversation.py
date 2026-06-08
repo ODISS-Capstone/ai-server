@@ -116,8 +116,8 @@ SMALLTALK_PATTERNS = {
         "그건 아직 잘 도와드리기 어렵습니다. 대신 약, 알림, 컨디션 확인은 바로 도와드릴게요.",
     ],
     "unclear": [
-        "네, 듣고 있어요. 원하시는 걸 한 번만 더 짧게 말씀해 주세요.",
-        "제가 놓쳤을 수 있어요. 다시 한 번 말씀해 주세요.",
+        "약 확인, 알림, 약봉투 사진 확인 중 하나를 말씀해 주세요.",
+        "복약이나 컨디션 확인이 필요하시면 그대로 말씀해 주세요.",
     ],
 }
 
@@ -160,8 +160,12 @@ SUGGESTION_KEYWORDS = [
 CAPABILITY_KEYWORDS = [
     "뭐 할 수 있어",
     "뭘 할 수 있어",
+    "뭐 도와줄 수 있어",
+    "무엇을 도와줄 수 있어",
     "뭐해줄 수",
     "뭐 해줄 수",
+    "뭐 해줘",
+    "뭐해줘",
     "뭐 도와줄",
     "뭘 도와줄",
     "무엇을 도와",
@@ -241,7 +245,7 @@ FAST_SMALLTALK_RESPONSES = {
     "assistant_companion": "제가 곁에서 듣고 있을게요. 약이나 컨디션이 걱정되면 바로 말씀해 주세요.",
     "repeat_request": "제가 방금 한 말을 다시 짧게 말씀드릴게요.",
     "unsupported_but_answered": "그 기능은 아직 어렵지만, 복약이나 컨디션은 바로 도와드릴게요.",
-    "unclear": "네, 듣고 있어요. 한 번만 더 짧게 말씀해 주세요.",
+    "unclear": "약 확인, 알림, 약봉투 사진 확인 중 하나를 말씀해 주세요.",
 }
 
 
@@ -444,7 +448,7 @@ class ConversationEngine:
     ) -> dict:
         """최종 응답을 합성. 팩트 데이터가 없으면 스몰토크로 처리."""
         if input_data.get("is_smalltalk") and not fact_data:
-            response_text = self.generate_smalltalk(input_data) or "네, 듣고 있어요."
+            response_text = self.generate_smalltalk(input_data) or "필요한 걸 말씀해 주세요."
             return {
                 "text": response_text,
                 "type": "smalltalk",
@@ -464,7 +468,7 @@ class ConversationEngine:
             }
 
         return {
-            "text": "네, 말씀해 주세요. 듣고 있어요.",
+            "text": "네, 필요한 걸 말씀해 주세요.",
             "type": "fallback",
             "requires_tts": True,
         }
@@ -537,7 +541,7 @@ class ConversationEngine:
             if contract.decision.mode == ReasoningMode.MEMORY_ONLY:
                 fallback = (
                     "사용자님, 제가 바로 확인할 내용이 부족합니다. "
-                    "약 이름이나 원하시는 일을 한 번만 더 짧게 말씀해 주세요."
+                    "약 확인, 알림, 약봉투 사진 확인 중 하나를 말씀해 주세요."
                 )
             return ConversationComposeResponse(
                 response_text=self.apply_tone(
@@ -623,10 +627,10 @@ class ConversationEngine:
             return "greeting"
         if any(kw in text_lower for kw in REPEAT_REQUEST_KEYWORDS):
             return "repeat_request"
-        if any(kw in text_lower for kw in SUGGESTION_KEYWORDS):
-            return "assistant_suggestion"
         if any(kw in text_lower for kw in CAPABILITY_KEYWORDS):
             return "assistant_capability"
+        if any(kw in text_lower for kw in SUGGESTION_KEYWORDS):
+            return "assistant_suggestion"
         if any(kw in text_lower for kw in COMPANION_KEYWORDS):
             return "assistant_companion"
         if any(kw in text_lower for kw in PRESENCE_KEYWORDS):
@@ -803,7 +807,7 @@ class ConversationEngine:
     def _ensure_user_prefix(self, text: str, user_profile: Optional[dict] = None) -> str:
         text = (text or "").strip()
         if not text:
-            return f"{self._honorific(user_profile)}, 듣고 있어요."
+            return f"{self._honorific(user_profile)}, 필요한 걸 말씀해 주세요."
         honorific = self._honorific(user_profile)
         text = self._replace_generic_honorific(text, honorific)
         if text.startswith(("어르신", "사용자님", "네,", honorific)):

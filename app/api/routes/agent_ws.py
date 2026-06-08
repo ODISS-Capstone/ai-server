@@ -21,6 +21,7 @@ from typing import Any
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from app.api.routes.assistant_auth import websocket_assistant_token_allowed
+from app.core.config import settings as app_settings
 from app.database.md_store import md_store
 from app.engines.conversation import ConversationEngine
 from app.engines.memory import MemoryEngine
@@ -29,6 +30,7 @@ from app.engines.llm_judge import LLMJudgeEngine
 from app.services.engine_orchestrator import EngineOrchestrator
 from app.services.identity_guard import evaluate_identity_gate
 from app.services.llm import extract_ocr_medication_candidates_with_llm, refine_ocr_medication_candidates_with_context
+from app.services.assistant_intent_classifier import AssistantIntentClassifier, AssistantRouteDecision
 from app.services.medication_extraction import (
     extract_medication_suffix_tokens,
     is_ocr_capture_request_text,
@@ -53,11 +55,35 @@ engine_orchestrator = EngineOrchestrator(
     llm_judge=llm_judge,
 )
 reminder_service = ReminderService()
+assistant_intent_classifier = AssistantIntentClassifier()
 _pending_ocr_by_speaker: dict[str, dict[str, Any]] = {}
 _queued_ocr_request_by_speaker: dict[str, dict[str, Any]] = {}
 _bootstrapped_speakers: set[str] = set()
 _wake_profile_cache_by_speaker: dict[str, dict[str, Any]] = {}
 _identity_pending_action_cache_by_speaker: dict[str, str] = {}
+
+
+class _AgentWebSocketSettings:
+    """Backward-compatible auth settings surface for older tests/tools."""
+
+    def __init__(self) -> None:
+        self.websocket_auth_token = str(app_settings.assistant_web_token or "")
+
+
+settings = _AgentWebSocketSettings()
+
+
+def _is_websocket_authorized(websocket: WebSocket) -> bool:
+    """Compatibility wrapper for the old WebSocket token contract."""
+    expected = str(getattr(settings, "websocket_auth_token", "") or "").strip()
+    if not expected:
+        return True
+    query_token = str(getattr(websocket, "query_params", {}).get("token") or "").strip()
+    if query_token == expected:
+        return True
+    headers = getattr(websocket, "headers", {}) or {}
+    authorization = str(headers.get("authorization") or headers.get("Authorization") or "")
+    return authorization.strip() == f"Bearer {expected}"
 
 
 @dataclass
@@ -73,6 +99,102 @@ class AssistantDialogState:
     last_ocr_candidates: list[str] = field(default_factory=list)
     awaiting_confirmation: str = ""
     last_response_can_repeat: bool = False
+
+
+@dataclass
+class AssistantTurnRouter:
+    """State-aware lightweight router for short assistant-control utterances."""
+
+    text: str
+    speaker_id: str | None = None
+    client_context: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def normalized(self) -> str:
+        return _normalize_assistant_text(self.text)
+
+    @property
+    def compact(self) -> str:
+        return _compact_text(self.text)
+
+    @property
+    def state(self) -> AssistantDialogState:
+        return _speaker_state(self.speaker_id)
+
+    def control_kind(self) -> str:
+        return _assistant_control_kind(self.text)
+
+    def camera_surface_active(self) -> bool:
+        context_camera_mode = str(self.client_context.get("camera_mode") or "")
+        return (
+            self.state.active_flow in {"ocr", "ocr_camera"}
+            or bool(self.client_context.get("ocr_busy"))
+            or bool(self.client_context.get("has_ocr_preview"))
+            or context_camera_mode not in {"", "idle"}
+        )
+
+    def pending_ocr_confirmation(self) -> bool:
+        return self.state.active_flow == "ocr_confirm" or _has_pending_ocr_confirmation(self.speaker_id)
+
+    def should_cancel_camera(self) -> bool:
+        kind = self.control_kind()
+        if kind == "camera_cancel":
+            return True
+        if self.pending_ocr_confirmation():
+            return False
+        if not self.camera_surface_active():
+            return False
+        return kind in {"negative", "stop"} or _is_camera_dismiss_text(self.text)
+
+    def short_utterance_route(self) -> str:
+        """Return the state-based route expected for short elderly-style utterances."""
+        if not self.compact:
+            return "empty"
+        if is_wake_word_only(self.text):
+            return "wake_word"
+        kind = self.control_kind()
+        flow = self.state.active_flow
+        if self.should_cancel_camera():
+            return "camera_cancel"
+        if self.pending_ocr_confirmation():
+            if _is_ocr_save_rejection(self.text):
+                return "ocr_save_reject"
+            if _is_ocr_save_confirmation(self.text):
+                return "ocr_save_confirm"
+            return "ocr_confirmation_followup"
+        if flow == "identity" and kind in {"affirmative", "negative"}:
+            return "identity_followup"
+        if flow in {"medication_guidance", "medication_workflow"}:
+            if ReminderService.is_taken_time_correction(self.text):
+                return "medication_time_correction"
+            if ReminderService.is_taken_recall(self.text) or _is_contextual_medication_taken_recall_text(self.text):
+                return "medication_taken_recall"
+            if ReminderService.is_taken_confirmation(self.text) or _is_contextual_medication_taken_confirmation_text(self.text):
+                return "medication_taken_record"
+            if _has_stored_medication_guidance_signal(self.text) or _is_stored_medication_guidance_request(
+                self.text,
+                self.state.last_medication_candidates,
+            ):
+                return "medication_guidance"
+        if flow == "reminder":
+            if ReminderService.is_relative_alarm_request(self.text):
+                return "relative_alarm"
+            if ReminderService.is_missed_one_shot_check(self.text):
+                return "missed_reminder_check"
+            if kind in {"negative", "stop"}:
+                return "reminder_control"
+        if kind == "repeat":
+            return "assistant_repeat"
+        if kind == "stop":
+            return "assistant_stop"
+        if kind in {"affirmative", "negative"} and flow in {"assistant_social", "none"} and self.state.last_assistant_text:
+            return "assistant_acknowledgement"
+        if _is_incomplete_or_noise_utterance(self.text):
+            return "ignored_noise"
+        assistant_type = conversation_engine.assistant_response_type(self.text)
+        if assistant_type and assistant_type != "unclear":
+            return assistant_type
+        return "unclear"
 
 
 _dialog_state_by_speaker: dict[str, AssistantDialogState] = {}
@@ -329,16 +451,27 @@ def _infer_active_flow_from_payload(payload: dict[str, Any]) -> str:
         return str(payload["active_flow"])
     fast_path = str(payload.get("fast_path") or "")
     response_type = str(payload.get("response_type") or payload.get("type") or "")
+    if fast_path == "assistant_camera_cancel" or response_type == "ocr_cancelled":
+        return "none"
     if fast_path in {"relative_alarm", "missed_one_shot_check"} or response_type == "reminder":
         if "taken" in fast_path or "record" in fast_path:
             return "medication_record"
         return "reminder"
+    if response_type in {"ocr_processed", "ocr_refined_confirmation", "ocr_confirmation_required"}:
+        if payload.get("pending_confirmation") is True or "confirmation" in response_type:
+            return "ocr_confirm"
     if "ocr" in fast_path or response_type == "ocr_request":
-        return "ocr"
+        return "ocr_camera"
     if "identity" in response_type or "profile" in response_type:
         return "identity"
     if response_type in {"smalltalk", "wake_word_ack"}:
         return "assistant_social"
+    if fast_path in {
+        "stored_medication_guidance",
+        "named_meal_medication_guidance",
+        "medication_intent_to_take",
+    }:
+        return "medication_guidance"
     if response_type in {"medical_response", "medication_query"}:
         return "medication_workflow"
     return "none"
@@ -359,7 +492,7 @@ def _update_dialog_state_from_outbound(speaker_id: str | None, payload: dict[str
     meds = payload.get("medications")
     if isinstance(meds, list):
         state.last_medication_candidates = [str(item) for item in meds if str(item).strip()]
-        if state.active_flow == "medication_workflow" and state.last_medication_candidates:
+        if state.active_flow in {"medication_workflow", "medication_guidance"} and state.last_medication_candidates:
             state.last_guided_medication = state.last_medication_candidates[0]
     if payload.get("reminder_kind") or payload.get("delay_seconds") or payload.get("run_at"):
         state.last_reminder = {
@@ -367,6 +500,12 @@ def _update_dialog_state_from_outbound(speaker_id: str | None, payload: dict[str
             "delay_seconds": payload.get("delay_seconds"),
             "run_at": payload.get("run_at"),
         }
+    if response_type == "ocr_request" or state.active_flow == "ocr_camera":
+        state.awaiting_confirmation = ""
+    if state.active_flow == "ocr_confirm":
+        state.awaiting_confirmation = "ocr_save"
+    if state.active_flow == "none" or response_type in {"ocr_cancelled", "ocr_saved"}:
+        state.awaiting_confirmation = ""
     ocr_candidates = payload.get("ocr_candidates")
     if isinstance(ocr_candidates, list):
         state.last_ocr_candidates = [str(item) for item in ocr_candidates if str(item).strip()]
@@ -478,6 +617,35 @@ async def _handle_stt_impl(websocket: WebSocket, message: dict, active_speakers:
     """STT 결과를 받아 전체 파이프라인 실행."""
     text = message.get("text", "").strip()
     speaker_id = message.get("speaker_id")
+    client_context = message.get("client_context")
+    client_context_dict = client_context if isinstance(client_context, dict) else {}
+    turn_router = AssistantTurnRouter(
+        text=text,
+        speaker_id=speaker_id,
+        client_context=client_context_dict,
+    )
+    route_decision = assistant_intent_classifier.classify(
+        text,
+        active_flow=turn_router.state.active_flow,
+        active_session=_is_active_assistant_session(
+            speaker_id=speaker_id,
+            active_speakers=active_speakers,
+            client_context=client_context_dict,
+        ),
+        client_context=client_context_dict,
+    )
+    _trace_mark(
+        websocket,
+        "short_utterance_route",
+        route=turn_router.short_utterance_route(),
+        route_label=route_decision.route_label,
+        engine_scope=route_decision.engine_scope,
+        risk_level=route_decision.risk_level,
+        fast_path=route_decision.fast_path,
+        ui_action=route_decision.ui_action,
+        db_write_expected=route_decision.db_write_expected,
+        active_flow=turn_router.state.active_flow,
+    )
 
     if not text:
         await websocket.send_json(
@@ -485,7 +653,24 @@ async def _handle_stt_impl(websocket: WebSocket, message: dict, active_speakers:
         )
         return
 
-    if _is_incomplete_or_noise_utterance(text):
+    if route_decision.engine_scope == "ignored":
+        await websocket.send_json(
+            {
+                "type": "ignored",
+                "reason": route_decision.route_label,
+                "requires_tts": False,
+                "route_label": route_decision.route_label,
+                "engine_scope": route_decision.engine_scope,
+                "risk_level": route_decision.risk_level,
+            }
+        )
+        return
+
+    if route_decision.engine_scope == "safety" and _should_intercept_global_safety_route(route_decision):
+        await _handle_global_safety_precheck_route(websocket, text, speaker_id, route_decision)
+        return
+
+    if _is_incomplete_or_noise_utterance(text) and turn_router.short_utterance_route() == "ignored_noise":
         await websocket.send_json(
             {
                 "type": "ignored",
@@ -499,8 +684,8 @@ async def _handle_stt_impl(websocket: WebSocket, message: dict, active_speakers:
         await _handle_wake_word_fast_path(websocket, speaker_id, active_speakers)
         return
 
-    if await _should_handle_assistant_control_fast_path(text, speaker_id):
-        await _handle_assistant_control_fast_path(websocket, text, speaker_id, active_speakers)
+    if await _should_handle_assistant_control_fast_path(text, speaker_id, turn_router):
+        await _handle_assistant_control_fast_path(websocket, text, speaker_id, active_speakers, turn_router)
         return
 
     if _should_handle_profile_memory_ack_fast_path(text):
@@ -638,11 +823,11 @@ async def _handle_stt_impl(websocket: WebSocket, message: dict, active_speakers:
         await _handle_medication_taken_time_correction_request(websocket, text, speaker_id, identity_gate)
         return
 
-    if ReminderService.is_taken_recall(text):
+    if ReminderService.is_taken_recall(text) or _is_contextual_medication_taken_recall_text(text):
         await _handle_medication_taken_recall_request(websocket, text, speaker_id, identity_gate)
         return
 
-    if ReminderService.is_taken_confirmation(text):
+    if ReminderService.is_taken_confirmation(text) or _is_contextual_medication_taken_confirmation_text(text):
         await _handle_medication_taken_confirmation_request(websocket, text, speaker_id, identity_gate)
         return
 
@@ -756,7 +941,7 @@ async def _handle_stt_impl(websocket: WebSocket, message: dict, active_speakers:
     # OCR 요청이 필요한 경우
     if turn.execution_results.get("task_results", {}).get("ocr_requested"):
         ocr_request = reasoning_engine.request_ocr()
-        await websocket.send_json({"type": "ocr_request", **ocr_request})
+        await websocket.send_json({"type": "ocr_request", **ocr_request, "active_flow": "ocr_camera"})
         return
 
     synthesis = {
@@ -825,6 +1010,87 @@ def _identity_response_text_for_assistant_request(text: str, identity_gate) -> s
     return response_text
 
 
+def _is_active_assistant_session(
+    *,
+    speaker_id: str | None,
+    active_speakers: set[str],
+    client_context: dict[str, Any],
+) -> bool:
+    state = _speaker_state(speaker_id)
+    if state.active_flow not in {"", "none", "assistant_social"}:
+        return True
+    if speaker_id and speaker_id in active_speakers:
+        return True
+    if client_context.get("active_session") is False or client_context.get("voice_armed") is False:
+        return False
+    if not client_context:
+        return True
+    camera_mode = str(client_context.get("camera_mode") or "")
+    return bool(
+        client_context.get("active_session")
+        or client_context.get("voice_armed")
+        or client_context.get("listening")
+        or client_context.get("ocr_busy")
+        or client_context.get("has_ocr_preview")
+        or camera_mode not in {"", "idle"}
+    )
+
+
+def _should_intercept_global_safety_route(route_decision: AssistantRouteDecision) -> bool:
+    """Only bypass the legacy fast paths when waiting would be unsafe.
+
+    Medication-safety questions without an active flow can use the existing
+    context-aware fast path or the reasoning engine. During OCR/identity/reminder
+    confirmation, however, safety must preempt the pending workflow so no DB write
+    happens accidentally.
+    """
+    if route_decision.route_label in {"emergency", "third_party_medication"}:
+        return True
+    return bool(route_decision.paused_flow)
+
+
+async def _handle_global_safety_precheck_route(
+    websocket: WebSocket,
+    text: str,
+    speaker_id: str | None,
+    route_decision: AssistantRouteDecision,
+) -> None:
+    """Send deterministic safety output before any stateful workflow writes."""
+    state = _speaker_state(speaker_id)
+    if route_decision.paused_flow:
+        state.awaiting_confirmation = f"paused:{route_decision.paused_flow}"
+    state.active_flow = route_decision.active_flow or "emergency"
+    response_text = route_decision.response_text.strip()
+    if not response_text:
+        safety = classify_patient_safety_situation(text)
+        response_text = (
+            safety.response_text
+            if safety
+            else "지금은 더 드시지 마세요. 약봉투를 확인하고, 심한 증상이 있으면 119에 연락하세요."
+        )
+    response = conversation_engine.build_response(
+        {
+            "text": response_text,
+            "type": "medical_response",
+            "requires_tts": True,
+        }
+    )
+    await websocket.send_json(
+        {
+            "type": "response",
+            **response,
+            "fast_path": route_decision.fast_path or "global_safety_precheck",
+            "route_label": route_decision.route_label,
+            "engine_scope": route_decision.engine_scope,
+            "risk_level": route_decision.risk_level,
+            "active_flow": state.active_flow,
+            "paused_flow": route_decision.paused_flow,
+            "route_reason": route_decision.route_reason,
+            "db_write_expected": False,
+        }
+    )
+
+
 def _assistant_control_kind(text: str) -> str:
     lowered = (text or "").strip().lower()
     compact = re.sub(r"[\s.?!,，。~]+", "", lowered)
@@ -833,26 +1099,64 @@ def _assistant_control_kind(text: str) -> str:
     if any(token in lowered for token in ("다시 말", "한번 더", "한 번 더", "못 들", "못들", "방금 뭐", "다시 알려")):
         return "repeat"
     if any(token in lowered for token in ("카메라", "사진", "촬영", "ocr", "오씨알")) and any(
-        token in lowered for token in ("꺼", "끄", "닫", "치워", "취소", "그만", "안 해", "안해", "필요 없", "필요없")
+        token in lowered for token in (
+            "꺼",
+            "끄",
+            "닫",
+            "치워",
+            "취소",
+            "그만",
+            "안 해",
+            "안해",
+            "안 찍",
+            "안찍",
+            "찍지 마",
+            "찍지말",
+            "필요 없",
+            "필요없",
+        )
     ):
         return "camera_cancel"
     if compact in {"그만", "됐어", "됐습니다", "잠깐만", "잠깐", "기다려", "멈춰"}:
         return "stop"
-    if compact in {"아니", "아냐", "아니요", "아니야"}:
+    if compact in {"아니", "아냐", "아니요", "아니야"} or compact.startswith(("아니", "아냐")):
         return "negative"
     if compact in {"네", "예", "응", "어", "그래", "맞아"}:
+        return "affirmative"
+    if compact in {"어맞아", "응맞아", "그래맞아", "네맞아", "예맞아", "맞아요", "맞습니다"}:
+        return "affirmative"
+    if compact.endswith("맞아") and len(compact) <= 6:
         return "affirmative"
     return ""
 
 
-async def _should_handle_assistant_control_fast_path(text: str, speaker_id: str | None) -> bool:
-    kind = _assistant_control_kind(text)
+def _is_camera_dismiss_text(text: str) -> bool:
+    compact = _compact_text(text)
+    if not compact:
+        return False
+    return (
+        any(token in compact for token in ("사진안찍", "안찍", "찍지마", "찍지말", "카메라꺼", "카메라닫", "촬영취소"))
+        or compact in {"아니", "아니야", "아냐", "됐어", "그만", "취소", "필요없어", "안해"}
+    )
+
+
+async def _should_handle_assistant_control_fast_path(
+    text: str,
+    speaker_id: str | None,
+    router: AssistantTurnRouter | None = None,
+) -> bool:
+    router = router or AssistantTurnRouter(text=text, speaker_id=speaker_id)
+    kind = router.control_kind()
+    if router.should_cancel_camera():
+        return True
     if not kind:
         return False
     if kind in {"negative", "affirmative"} and await _has_pending_identity_action_fast(speaker_id):
         return False
+    if kind in {"negative", "affirmative"} and router.pending_ocr_confirmation():
+        return False
     if kind in {"negative", "affirmative"}:
-        state = _speaker_state(speaker_id)
+        state = router.state
         return state.active_flow in {"assistant_social", "none"} and bool(state.last_assistant_text)
     return True
 
@@ -862,6 +1166,7 @@ async def _handle_assistant_control_fast_path(
     text: str,
     speaker_id: str | None,
     active_speakers: set[str],
+    router: AssistantTurnRouter | None = None,
 ) -> None:
     started = perf_counter()
     if speaker_id:
@@ -872,8 +1177,10 @@ async def _handle_assistant_control_fast_path(
         active_speakers.add(speaker_id)
 
     profile = await _load_wake_profile_fast(speaker_id)
-    state = _speaker_state(speaker_id)
-    kind = _assistant_control_kind(text)
+    router = router or AssistantTurnRouter(text=text, speaker_id=speaker_id)
+    state = router.state
+    kind = "camera_cancel" if router.should_cancel_camera() else router.control_kind()
+    extra_payload: dict[str, Any] = {}
     if kind == "repeat" and state.last_assistant_text:
         response_text = state.last_assistant_text
         response_type = state.last_response_type or "assistant_control"
@@ -881,9 +1188,10 @@ async def _handle_assistant_control_fast_path(
     elif kind == "camera_cancel":
         state.active_flow = "none"
         state.awaiting_confirmation = ""
-        response_text = "사진 확인을 중단할게요. 필요하시면 다시 말씀해 주세요."
+        response_text = "네, 사진 확인을 중단할게요."
         response_type = "assistant_control"
         fast_path = "assistant_camera_cancel"
+        extra_payload["ui_action"] = "close_camera"
     elif kind == "stop":
         state.active_flow = "none"
         state.awaiting_confirmation = ""
@@ -914,9 +1222,10 @@ async def _handle_assistant_control_fast_path(
             "type": "response",
             **response,
             "fast_path": fast_path,
-            "active_flow": "assistant_control" if kind in {"repeat", "stop"} else "assistant_social",
+            "active_flow": "none" if kind == "camera_cancel" else "assistant_control" if kind in {"repeat", "stop"} else "assistant_social",
             "route_reason": kind,
             "server_elapsed_ms": round((perf_counter() - started) * 1000, 1),
+            **extra_payload,
         }
     )
 
@@ -1323,8 +1632,7 @@ async def _handle_spoken_medication_registration_request(
     med_text = _friendly_medication_label(merged)
     response_text = (
         f"{name}, {med_text}을 현재 복용 약 목록에 추가했습니다. "
-        "복용 시간과 한 번에 드실 양은 약봉투나 처방전 기준으로 확인해 주세요. "
-        "밥을 드신 뒤나 복용 시간이 헷갈릴 때 말씀하시면 이 기록을 기준으로 안내드릴게요."
+        "밥을 드신 뒤나 복용 시간이 헷갈릴 때 말씀해 주세요."
     )
     response = conversation_engine.build_response(
         {
@@ -1782,14 +2090,14 @@ def _build_medication_safety_question_text(
     )
     if other_med_signal and not multi_dose_signal:
         return (
-            f"{name}, 같이 드실 약 이름이 필요합니다. "
-            "확인 전에는 임의로 같이 드시지 말고 약사에게 먼저 확인해 주세요."
+            f"{name}, 같이 드실 약 이름을 먼저 알려주세요. "
+            "확인 전에는 임의로 같이 드시지 마세요."
         )
     if not multi_dose_signal:
         if acetaminophen_signal:
             return (
                 f"{name}, 약봉투에 적힌 용량과 시간이 맞으면 타이레놀은 드셔도 됩니다. "
-                "이미 드셨거나 감기약·진통제를 같이 드셨다면 먼저 약사에게 확인하세요."
+                "이미 드셨거나 감기약을 같이 드셨다면 먼저 확인해 주세요."
             )
         return (
             f"{name}, 약봉투에 적힌 용량과 시간이 맞으면 드셔도 됩니다. "
@@ -1798,11 +2106,11 @@ def _build_medication_safety_question_text(
     if acetaminophen_signal:
         return (
             f"{name}, 타이레놀은 한 번에 많이 드시면 간 손상 위험이 있습니다. "
-            "약봉투의 1회 용량을 넘기지 말고, 이미 많이 드셨다면 약사나 119에 확인하세요."
+            "약봉투의 1회 용량을 넘기지 말고, 이미 많이 드셨다면 119나 약사에게 확인하세요."
         )
     return (
         f"{name}, {med_text}은 한 번에 더 드시면 위험할 수 있습니다. "
-        "정해진 1회 용량만 드시고, 이미 많이 드셨거나 이상 증상이 있으면 119에 연락하세요."
+        "정해진 1회 용량만 드시고, 이상 증상이 있으면 119에 연락하세요."
     )
 
 
@@ -1877,8 +2185,8 @@ def _build_current_medication_list_text(
             "그 외에 추가로 저장된 약은 없습니다. 새 약이 있으면 약 이름을 말씀해 주세요."
         )
     return (
-        f"{name}, 현재 저장된 약은 {med_text}입니다. "
-        "복용 시간과 한 번에 드실 양은 약봉투나 처방전 기준으로 확인해 주세요."
+        f"{name}, 저장된 약은 {med_text}입니다. "
+        "시간과 양은 약봉투 기준으로 확인하고, 헷갈리면 한 번 더 드시지 마세요."
     )
 
 
@@ -1898,9 +2206,51 @@ def _build_medication_intent_to_take_text(
     name = _display_name_from_context(context)
     med_text = _friendly_medication_label(meds)
     return (
-        f"네, {name}. 현재 저장된 약은 {med_text}입니다. "
-        "약봉투나 처방전에 적힌 복용 시간이 맞다면 정해진 양만 물과 함께 드세요. "
-        "드신 뒤에는 '먹었어'라고 말씀하시면 복용 기록으로 남겨둘게요."
+        f"네, {name}. 저장된 약은 {med_text}입니다. "
+        "시간이 맞으면 드시고, 드신 뒤에는 '먹었어'라고 말씀해 주세요."
+    )
+
+
+def _is_contextual_medication_taken_confirmation_text(text: str) -> bool:
+    compact = re.sub(r"[\s.?!,，。~]+", "", (text or "").strip().lower())
+    if not compact:
+        return False
+    if any(token in compact for token in ("먹어도", "되나", "돼?", "괜찮", "위험", "부작용", "헷갈", "기억", "못먹", "깜빡")):
+        return False
+    if any(token in compact for token in ("밥먹었", "아침먹었", "점심먹었", "저녁먹었", "식사했", "식사끝")):
+        return "약" in compact or "복용" in compact
+    return any(
+        token in compact
+        for token in (
+            "먹었어",
+            "먹었어요",
+            "먹었습니다",
+            "먹음",
+            "다먹었",
+            "약먹었",
+            "방금먹었",
+            "지금먹었",
+            "복용했",
+            "복용완료",
+        )
+    )
+
+
+def _is_contextual_medication_taken_recall_text(text: str) -> bool:
+    compact = re.sub(r"[\s.?!,，。~]+", "", (text or "").strip().lower())
+    if not compact:
+        return False
+    return any(
+        token in compact
+        for token in (
+            "먹은기록",
+            "복용기록",
+            "기록있",
+            "먹었다고했",
+            "먹었다했",
+            "먹었나",
+            "먹었지",
+        )
     )
 
 
@@ -1920,45 +2270,33 @@ def _build_stored_medication_guidance_text(
         if _is_meal_based_notification_guidance_request(text):
             return (
                 f"{name}, 네. 지금은 {_current_time_phrase()}이라 {meal_label} 후 {med_text} 안내로 기억해둘게요. "
-                f"{meal_label}를 하고 오시면 저에게 '밥 먹었어'라고 말씀해 주세요. "
-                f"그러면 {med_text}을 드시라고 안내드리겠습니다. "
-                "드신 뒤에는 '먹었어'라고 알려주시면 복용 기록으로 남기겠습니다. "
-                "복용량은 약봉투나 제품 포장에 적힌 대로만 드세요."
+                f"{meal_label}를 하고 오시면 '밥 먹었어'라고 말씀해 주세요."
             )
         return (
-            f"{name}, 네. 지금 말씀하신 기준으로 {meal_label} 후 {med_text}을 드셔야 하는 것으로 기억해둘게요. "
-            f"{meal_label}를 하고 오시면 저에게 '밥 먹었어'라고 말씀해 주세요. "
-            f"그러면 {med_text} 복용을 안내드리겠습니다. "
-            "드신 뒤에는 '먹었어'라고 말씀하시면 복용 기록으로 남기겠습니다. "
-            "복용량은 약봉투나 제품 포장에 적힌 대로만 드세요."
+            f"{name}, 네. {meal_label} 후 {med_text} 안내로 기억해둘게요. "
+            f"{meal_label}를 하고 오시면 '밥 먹었어'라고 말씀해 주세요."
         )
     if _is_meal_guidance_signal(text):
         meal_label = f"{meal} 식사" if meal else "식사"
         if _is_meal_based_notification_guidance_request(text):
             return (
                 f"{name}, 네. 지금은 {_current_time_phrase()}이라 {meal_label} 후 {med_text} 안내로 기억해둘게요. "
-                f"{meal_label}를 하고 오시면 저에게 '밥 먹었어'라고 말씀해 주세요. "
-                f"그러면 {med_text}을 드시라고 안내드리겠습니다. "
-                "드신 뒤에는 '먹었어'라고 알려주시면 복용 기록으로 남기겠습니다. "
-                "복용량은 약봉투나 처방전에 적힌 대로만 드세요."
+                f"{meal_label}를 하고 오시면 '밥 먹었어'라고 말씀해 주세요."
             )
         if _is_after_meal_completion_signal(text):
             meal_part = f"{meal} 식후" if meal else "식후"
             return (
                 f"{name}, 네. {meal_label}를 하셨군요. {meal_part} 복용약인 {med_text}을 드시면 됩니다. "
-                "복용량은 약봉투나 처방전에 적힌 대로만 드세요. "
                 "드신 뒤에는 '먹었어'라고 말씀해 주세요."
             )
         meal_part = f"{meal_label} 후"
         return (
-            f"{name}, 현재 기록 기준으로 저장된 약은 {med_text}입니다. "
-            f"밥을 드신 뒤, 약봉투나 처방전에 식후, 즉 {meal_part} 복용으로 적혀 있다면 정해진 양만 물과 함께 드세요. "
-            "이미 드셨거나 헷갈리면 한 번 더 드시지 말고 약봉투나 약통을 먼저 확인해 주세요."
+            f"{name}, 저장된 약은 {med_text}입니다. "
+            f"{meal_part} 복용이 맞으면 드시고, 드신 뒤에는 '먹었어'라고 말씀해 주세요."
         )
     return (
         f"{name}, 저장된 약은 {med_text}입니다. "
-        "드실 시간과 용량은 약봉투 기준으로 확인해 주세요. "
-        "헷갈리면 한 번 더 드시지 마세요."
+        "시간과 양은 약봉투 기준으로 확인하고, 헷갈리면 한 번 더 드시지 마세요."
     )
 
 
@@ -2464,6 +2802,7 @@ async def _handle_ocr_impl(websocket: WebSocket, message: dict) -> None:
                     **recapture_request,
                     "reason": "uncertain_ocr_result",
                     "requires_tts": False,
+                    "active_flow": "ocr_camera",
                 }
             )
             return
@@ -2487,6 +2826,7 @@ async def _handle_ocr_impl(websocket: WebSocket, message: dict) -> None:
                     "message": summary + " 이 정보를 복약 정보로 저장할까요?",
                     "medication_count": len(medications),
                     "pending_confirmation": True,
+                    "active_flow": "ocr_confirm",
                 }
             )
         else:
@@ -2509,6 +2849,7 @@ async def _handle_ocr_impl(websocket: WebSocket, message: dict) -> None:
                     **recapture_request,
                     "reason": "empty_ocr_medications",
                     "requires_tts": False,
+                    "active_flow": "ocr_camera",
                 }
             )
     finally:
@@ -2546,7 +2887,14 @@ async def _handle_pending_ocr_confirmation(
         response = conversation_engine.build_response(
             {"text": response_text, "type": "ocr_cancelled", "requires_tts": True}
         )
-        await websocket.send_json({"type": "response", **response})
+        await websocket.send_json(
+            {
+                "type": "response",
+                **response,
+                "ui_action": "close_camera",
+                "active_flow": "none",
+            }
+        )
         if recapture:
             ocr_request = reasoning_engine.request_ocr()
             await websocket.send_json(
@@ -2555,6 +2903,7 @@ async def _handle_pending_ocr_confirmation(
                     **ocr_request,
                     "reason": "user_requested_recapture",
                     "requires_tts": False,
+                    "active_flow": "ocr_camera",
                 }
             )
         return True
@@ -2623,7 +2972,7 @@ async def _handle_pending_ocr_confirmation(
     response = conversation_engine.build_response(
         {"text": response_text, "type": "ocr_saved", "requires_tts": True}
     )
-    await websocket.send_json({"type": "response", **response})
+    await websocket.send_json({"type": "response", **response, "active_flow": "none", "ui_action": "close_camera"})
     await memory_engine.update_and_compress(
         {
             "query": text,
@@ -2768,6 +3117,7 @@ async def _send_queued_ocr_request_if_ready(websocket: WebSocket, speaker_id: st
             "type": "ocr_request",
             **ocr_request,
             "reason": queued.get("reason") or "queued_ocr_request",
+            "active_flow": "ocr_camera",
         }
     )
     return True
@@ -2809,6 +3159,10 @@ def _is_ocr_save_rejection(text: str) -> bool:
             "다시",
             "재촬영",
             "삭제",
+            "안 찍",
+            "안찍",
+            "찍지 마",
+            "찍지마",
         )
     )
 

@@ -1241,7 +1241,8 @@ def test_meal_medication_guidance_uses_deterministic_fast_path_without_ocr(tmp_p
     assert after_meal.decision.rationale == "stored_medication_meal_guidance"
     assert prep.decision.tasks == []
     assert after_meal.decision.tasks == []
-    assert "밥을 드신 뒤" in prep.conversation.response_text
+    assert "저장된 약은 혈압약" in prep.conversation.response_text
+    assert "먹었어" in prep.conversation.response_text
     assert "혈압약" in after_meal.conversation.response_text
     assert not prep.execution_results.get("task_results", {}).get("ocr_requested")
     assert not after_meal.execution_results.get("task_results", {}).get("ocr_requested")
@@ -1293,7 +1294,8 @@ def test_after_meal_question_with_wake_word_uses_stored_medication_first(tmp_pat
     assert result.decision.tasks == []
     assert "김영수님" in answer
     assert "혈압약" in answer
-    assert "현재 기록" in answer
+    assert "저장된 약은" in answer
+    assert "먹었어" in answer
     assert "어르신" not in answer
     assert "사용자님" not in answer
     assert "구체적인 정보" not in answer

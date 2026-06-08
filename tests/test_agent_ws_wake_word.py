@@ -96,6 +96,176 @@ def make_real_memory(tmp_path) -> MemoryEngine:
     return memory
 
 
+STATE_SHORT_UTTERANCE_CASES: list[dict] = []
+
+
+def _add_short_utterance_cases(
+    *,
+    flow: str,
+    expected: str,
+    utterances: list[str],
+    client_context: dict | None = None,
+    last_assistant_text: str = "제가 방금 안내드렸습니다.",
+) -> None:
+    for text in utterances:
+        STATE_SHORT_UTTERANCE_CASES.append(
+            {
+                "id": f"{flow}:{expected}:{text}",
+                "flow": flow,
+                "text": text,
+                "expected": expected,
+                "client_context": client_context or {},
+                "last_assistant_text": last_assistant_text,
+            }
+        )
+
+
+_add_short_utterance_cases(
+    flow="none",
+    expected="wake_word",
+    utterances=["오디스", "오디세", "오티스", "오티즈", "오지스", "보리스", "보디스", "오 디 스", "야", "들려?"],
+)
+_add_short_utterance_cases(
+    flow="assistant_social",
+    expected="assistant_acknowledgement",
+    utterances=["응", "어", "그래", "맞아", "어 맞아", "응 맞아", "네", "예", "아니", "아냐", "아니야", "아니요"],
+)
+_add_short_utterance_cases(
+    flow="assistant_social",
+    expected="assistant_repeat",
+    utterances=["다시 말해줘", "한 번 더 말해줘", "못 들었어", "방금 뭐라고", "다시 알려줘"],
+)
+_add_short_utterance_cases(
+    flow="assistant_social",
+    expected="assistant_stop",
+    utterances=["그만", "됐어", "잠깐만", "기다려", "멈춰"],
+)
+_add_short_utterance_cases(
+    flow="ocr_camera",
+    expected="camera_cancel",
+    utterances=[
+        "사진 안 찍는다고",
+        "아니야 사진 안 찍어",
+        "안 찍는다고",
+        "안 찍어",
+        "찍지 마",
+        "찍지 말라고",
+        "카메라 꺼",
+        "카메라 꺼줘",
+        "카메라 닫아",
+        "사진 취소",
+        "촬영 취소",
+        "사진 필요 없어",
+        "사진 그만",
+        "됐어",
+        "아니",
+        "아니야",
+        "그만",
+        "필요없어",
+    ],
+    client_context={"camera_mode": "ready"},
+)
+_add_short_utterance_cases(
+    flow="none",
+    expected="camera_cancel",
+    utterances=["사진 안 찍는다고", "카메라 꺼줘", "사진 취소", "촬영 그만", "약봉투 사진 안 찍어"],
+)
+_add_short_utterance_cases(
+    flow="ocr_confirm",
+    expected="ocr_save_confirm",
+    utterances=["네", "응", "예", "그래", "좋아", "맞아", "확인", "저장해", "네 저장해", "그대로 저장"],
+)
+_add_short_utterance_cases(
+    flow="ocr_confirm",
+    expected="ocr_save_reject",
+    utterances=["아니", "아냐", "싫어", "취소", "저장하지 마", "저장 안 해", "하지 마", "틀렸어", "다시 찍어", "재촬영", "삭제해", "다시"],
+)
+_add_short_utterance_cases(
+    flow="ocr_confirm",
+    expected="ocr_confirmation_followup",
+    utterances=["감기 때문에 받은 약이야", "두통 때문에 먹는 약", "통증약이야", "처방받은 거야", "증상은 기침이야"],
+)
+_add_short_utterance_cases(
+    flow="identity",
+    expected="identity_followup",
+    utterances=["응", "어", "네", "예", "맞아", "어 맞아", "맞습니다", "아니", "아니야", "아냐"],
+)
+_add_short_utterance_cases(
+    flow="medication_guidance",
+    expected="medication_taken_record",
+    utterances=["먹었어", "어 먹었어", "약 먹었어", "방금 먹었어", "지금 먹었어", "복용했어", "먹었습니다", "다 먹었어", "먹음", "먹었어요"],
+)
+_add_short_utterance_cases(
+    flow="medication_guidance",
+    expected="medication_taken_recall",
+    utterances=["언제 먹었지", "몇 시에 먹었지", "아까 언제 먹었어", "내가 약 먹었나", "먹은 기록 있어", "먹었다고 했지", "몇시에 먹었다고"],
+)
+_add_short_utterance_cases(
+    flow="medication_guidance",
+    expected="medication_guidance",
+    utterances=["오늘 그거 먹어야 돼", "그거 먹어야 하나", "밥 먹었어", "저녁 먹었어", "식사 끝났어", "식후 약 뭐야"],
+)
+_add_short_utterance_cases(
+    flow="reminder",
+    expected="reminder_control",
+    utterances=["아니", "아니야", "됐어", "그만", "잠깐만", "멈춰"],
+)
+_add_short_utterance_cases(
+    flow="reminder",
+    expected="missed_reminder_check",
+    utterances=["왜 안 울려", "알람 안 왔어", "알림 안 왔어", "시간 지났어", "30초 지났음"],
+)
+_add_short_utterance_cases(
+    flow="none",
+    expected="assistant_suggestion",
+    utterances=["뭐 하지", "뭐 하면 좋을까", "나 뭐 해야 돼", "도와줘", "뭘 하면 돼"],
+)
+_add_short_utterance_cases(
+    flow="none",
+    expected="assistant_capability",
+    utterances=["너 뭐 할 수 있어", "뭐 도와줄 수 있어", "무엇을 도와줄 수 있어", "너는 뭐 해줘"],
+)
+_add_short_utterance_cases(
+    flow="none",
+    expected="presence",
+    utterances=["어딨어", "어디 있어", "거기 있어"],
+)
+_add_short_utterance_cases(
+    flow="none",
+    expected="thanks",
+    utterances=["고마워", "감사해", "땡큐"],
+)
+_add_short_utterance_cases(
+    flow="none",
+    expected="assistant_companion",
+    utterances=["심심해", "말동무 해줘", "이야기하자"],
+)
+
+
+assert len(STATE_SHORT_UTTERANCE_CASES) >= 100
+
+
+@pytest.mark.parametrize(
+    "case",
+    STATE_SHORT_UTTERANCE_CASES,
+    ids=[case["id"] for case in STATE_SHORT_UTTERANCE_CASES],
+)
+def test_assistant_turn_router_state_short_utterance_table(case: dict) -> None:
+    speaker_id = "short-utterance-table"
+    state = agent_ws._speaker_state(speaker_id)
+    state.active_flow = case["flow"]
+    state.last_assistant_text = case["last_assistant_text"]
+    state.last_response_type = "smalltalk"
+
+    router = agent_ws.AssistantTurnRouter(
+        text=case["text"],
+        speaker_id=speaker_id,
+        client_context=case["client_context"],
+    )
+
+    assert router.short_utterance_route() == case["expected"]
+
+
 def test_registered_wake_word_uses_profile_and_skips_orchestrator(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_memory = FakeMemoryEngine()
     websocket = FakeWebSocket()
@@ -234,7 +404,10 @@ def test_agent_ws_assistant_suggestion_uses_fast_path_without_identity_or_orches
     assert websocket.sent[-1]["fast_path"] == "smalltalk"
     assert websocket.sent[-1]["active_flow"] == "assistant_social"
     assert websocket.sent[-1]["route_reason"] == "assistant_suggestion"
-    assert "드실 약 확인" in websocket.sent[-1]["response_text"]
+    assert (
+        "드실 약 확인" in websocket.sent[-1]["response_text"]
+        or "식후 약 확인" in websocket.sent[-1]["response_text"]
+    )
     assert "복약 알림" in websocket.sent[-1]["response_text"]
     assert "약봉투 사진" in websocket.sent[-1]["response_text"]
 
@@ -351,6 +524,198 @@ def test_agent_ws_repeat_control_repeats_last_response(monkeypatch: pytest.Monke
     assert websocket.sent[-1]["type"] == "response"
     assert websocket.sent[-1]["fast_path"] == "assistant_repeat"
     assert websocket.sent[-1]["response_text"] == "김영수님, 오늘 아침 식후 약은 혈압약입니다."
+
+
+def test_agent_ws_colloquial_affirmative_ack_does_not_fallback_to_unclear(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_memory = FakeMemoryEngine()
+    websocket = FakeWebSocket()
+    state = agent_ws._speaker_state("speaker-ack")
+    state.active_flow = "assistant_social"
+    state.last_assistant_text = "제가 도와드릴 수 있는 건 세 가지예요."
+    state.last_response_type = "smalltalk"
+
+    async def fail_if_identity_gate_called(**kwargs):
+        raise AssertionError("colloquial acknowledgement should not call the identity gate")
+
+    async def fail_if_orchestrator_called(**kwargs):
+        raise AssertionError("colloquial acknowledgement should not call the orchestrator")
+
+    monkeypatch.setattr(agent_ws, "memory_engine", fake_memory)
+    monkeypatch.setattr(agent_ws, "reminder_service", FakeReminderService())
+    monkeypatch.setattr(agent_ws, "evaluate_identity_gate", fail_if_identity_gate_called)
+    monkeypatch.setattr(agent_ws.engine_orchestrator, "run_turn", fail_if_orchestrator_called)
+
+    run(
+        agent_ws._handle_stt(
+            websocket,
+            {
+                "type": "stt_result",
+                "speaker_id": "speaker-ack",
+                "text": "어 맞아",
+            },
+            set(),
+        )
+    )
+
+    assert not any(payload.get("type") == "filler" for payload in websocket.sent)
+    assert websocket.sent[-1]["type"] == "response"
+    assert websocket.sent[-1]["fast_path"] == "assistant_acknowledgement"
+    assert websocket.sent[-1]["route_reason"] == "affirmative"
+    assert "짧게" not in websocket.sent[-1]["response_text"]
+    assert "다시" not in websocket.sent[-1]["response_text"]
+
+
+def test_agent_ws_camera_cancel_understands_photo_negative(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_memory = FakeMemoryEngine()
+    websocket = FakeWebSocket()
+    state = agent_ws._speaker_state("speaker-camera")
+    state.active_flow = "ocr"
+    state.last_assistant_text = "약봉투를 화면에 맞춰주세요."
+    state.last_response_type = "ocr_request"
+
+    async def fail_if_identity_gate_called(**kwargs):
+        raise AssertionError("camera cancel should not call the identity gate")
+
+    async def fail_if_orchestrator_called(**kwargs):
+        raise AssertionError("camera cancel should not call the orchestrator")
+
+    monkeypatch.setattr(agent_ws, "memory_engine", fake_memory)
+    monkeypatch.setattr(agent_ws, "reminder_service", FakeReminderService())
+    monkeypatch.setattr(agent_ws, "evaluate_identity_gate", fail_if_identity_gate_called)
+    monkeypatch.setattr(agent_ws.engine_orchestrator, "run_turn", fail_if_orchestrator_called)
+
+    run(
+        agent_ws._handle_stt(
+            websocket,
+            {
+                "type": "stt_result",
+                "speaker_id": "speaker-camera",
+                "text": "사진 안 찍는다고",
+            },
+            set(),
+        )
+    )
+
+    assert not any(payload.get("type") == "filler" for payload in websocket.sent)
+    assert websocket.sent[-1]["type"] == "response"
+    assert websocket.sent[-1]["fast_path"] == "assistant_camera_cancel"
+    assert websocket.sent[-1]["route_reason"] == "camera_cancel"
+    assert websocket.sent[-1]["ui_action"] == "close_camera"
+    assert websocket.sent[-1]["active_flow"] == "none"
+    assert websocket.sent[-1]["response_text"] == "네, 사진 확인을 중단할게요."
+
+
+def test_agent_ws_camera_cancel_uses_client_camera_state_without_server_flow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_memory = FakeMemoryEngine()
+    websocket = FakeWebSocket()
+
+    async def fail_if_identity_gate_called(**kwargs):
+        raise AssertionError("camera cancel should not call the identity gate")
+
+    async def fail_if_orchestrator_called(**kwargs):
+        raise AssertionError("camera cancel should not call the orchestrator")
+
+    monkeypatch.setattr(agent_ws, "memory_engine", fake_memory)
+    monkeypatch.setattr(agent_ws, "reminder_service", FakeReminderService())
+    monkeypatch.setattr(agent_ws, "evaluate_identity_gate", fail_if_identity_gate_called)
+    monkeypatch.setattr(agent_ws.engine_orchestrator, "run_turn", fail_if_orchestrator_called)
+
+    run(
+        agent_ws._handle_stt(
+            websocket,
+            {
+                "type": "stt_result",
+                "speaker_id": "speaker-camera-client",
+                "text": "아니야 사진 안 찍는다고",
+                "client_context": {"camera_mode": "ready"},
+            },
+            set(),
+        )
+    )
+
+    assert not any(payload.get("type") == "filler" for payload in websocket.sent)
+    assert websocket.sent[-1]["fast_path"] == "assistant_camera_cancel"
+    assert websocket.sent[-1]["ui_action"] == "close_camera"
+
+
+def test_agent_ws_camera_cancel_handles_omitted_photo_word_when_camera_is_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_memory = FakeMemoryEngine()
+    websocket = FakeWebSocket()
+
+    async def fail_if_identity_gate_called(**kwargs):
+        raise AssertionError("camera cancel should not call the identity gate")
+
+    async def fail_if_orchestrator_called(**kwargs):
+        raise AssertionError("camera cancel should not call the orchestrator")
+
+    monkeypatch.setattr(agent_ws, "memory_engine", fake_memory)
+    monkeypatch.setattr(agent_ws, "reminder_service", FakeReminderService())
+    monkeypatch.setattr(agent_ws, "evaluate_identity_gate", fail_if_identity_gate_called)
+    monkeypatch.setattr(agent_ws.engine_orchestrator, "run_turn", fail_if_orchestrator_called)
+
+    run(
+        agent_ws._handle_stt(
+            websocket,
+            {
+                "type": "stt_result",
+                "speaker_id": "speaker-camera-omitted",
+                "text": "안 찍는다고",
+                "client_context": {"camera_mode": "ready"},
+            },
+            set(),
+        )
+    )
+
+    assert websocket.sent[-1]["fast_path"] == "assistant_camera_cancel"
+    assert websocket.sent[-1]["ui_action"] == "close_camera"
+
+
+def test_agent_ws_medication_guidance_followup_records_short_taken_confirmation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_memory = FakeMemoryEngine()
+    websocket = FakeWebSocket()
+    state = agent_ws._speaker_state("speaker-guided-med")
+    state.active_flow = "medication_guidance"
+    state.last_guided_medication = "혈압약"
+    state.last_medication_candidates = ["혈압약"]
+    state.last_assistant_text = "김영수님, 저장된 약은 혈압약입니다."
+
+    async def fake_identity_gate(**kwargs):
+        return IdentityGateResult(
+            allowed=True,
+            reason="identity_verified",
+            metadata={"profile": {"name": "김영수", "age": "72", "gender": "남성"}},
+        )
+
+    async def fail_if_orchestrator_called(**kwargs):
+        raise AssertionError("guided medication taken confirmation should not call the orchestrator")
+
+    monkeypatch.setattr(agent_ws, "memory_engine", fake_memory)
+    monkeypatch.setattr(agent_ws, "reminder_service", FakeReminderService())
+    monkeypatch.setattr(agent_ws, "evaluate_identity_gate", fake_identity_gate)
+    monkeypatch.setattr(agent_ws.engine_orchestrator, "run_turn", fail_if_orchestrator_called)
+
+    run(
+        agent_ws._handle_stt(
+            websocket,
+            {
+                "type": "stt_result",
+                "speaker_id": "speaker-guided-med",
+                "text": "어 먹었어",
+            },
+            set(),
+        )
+    )
+
+    assert not any(payload.get("type") == "filler" for payload in websocket.sent)
+    assert websocket.sent[-1]["type"] == "response"
+    assert websocket.sent[-1]["fast_path"] == "medication_taken_record"
+    assert "기록" in websocket.sent[-1]["response_text"]
 
 
 @pytest.mark.parametrize(
@@ -597,30 +962,12 @@ def test_symptom_utterance_does_not_use_smalltalk_fast_path(
 ) -> None:
     fake_memory = FakeMemoryEngine()
     websocket = FakeWebSocket()
-    calls: list[str] = []
 
     async def fake_identity_gate(**kwargs):
-        calls.append("identity_gate")
-        return IdentityGateResult(
-            allowed=True,
-            reason="identity_verified",
-            metadata={"profile": {"name": "김영수", "age": "72", "gender": "남성"}},
-        )
+        raise AssertionError("emergency precheck should not wait for identity gate")
 
     async def fake_run_turn(**kwargs):
-        calls.append("orchestrator")
-        return SimpleNamespace(
-            filler_text="",
-            conversation=SimpleNamespace(
-                requires_tts=True,
-                response_text="김영수님, 가슴이 답답하면 즉시 119나 응급실에 연락하세요.",
-                response_type="medical_response",
-            ),
-            execution_results={"task_results": {}},
-            decision=SimpleNamespace(rationale="emergency_policy_first", intent="emergency"),
-            core_message="",
-            judge_review={},
-        )
+        raise AssertionError("emergency precheck should not wait for orchestrator")
 
     monkeypatch.setattr(agent_ws, "memory_engine", fake_memory)
     monkeypatch.setattr(agent_ws, "reminder_service", FakeReminderService())
@@ -639,8 +986,10 @@ def test_symptom_utterance_does_not_use_smalltalk_fast_path(
         )
     )
 
-    assert calls == ["identity_gate", "orchestrator"]
     assert websocket.sent[-1]["response_type"] == "medical_response"
+    assert websocket.sent[-1]["route_label"] == "emergency"
+    assert websocket.sent[-1]["engine_scope"] == "safety"
+    assert websocket.sent[-1]["fast_path"] == "global_safety_precheck"
     assert websocket.sent[-1].get("fast_path") != "smalltalk"
     assert "119" in websocket.sent[-1]["response_text"]
 
