@@ -11,10 +11,21 @@ import {
   createTurnId,
 } from "../state/assistantSession";
 import type { AssistantMessage, TurnTiming } from "../state/assistantSession";
+import { detectBrowserCapabilities, speechRecognitionConstructor } from "./browserCapabilities";
+import { appendClientEvent, createClientEvent } from "./clientEvents";
+import type { ClientEvent, ClientEventType } from "./clientEvents";
+import { compactLiveText, liveCaptionClass, normalizeLiveText } from "./liveText";
 
 type ConnectionStatus = "connecting" | "connected" | "closed" | "error";
 type CameraMode = "idle" | "opening" | "ready" | "captured" | "error";
 type AssistantMode = "idle" | "listening" | "thinking" | "camera_ready" | "ocr_processing" | "speaking" | "error";
+type PublicNoticeKind = "connection" | "error" | "permission";
+
+interface PublicNotice {
+  kind: PublicNoticeKind;
+  text: string;
+  action?: "manual" | "reconnect";
+}
 
 interface AssistantAppProps {
   token: string;
@@ -59,6 +70,8 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
   const [cameraMessage, setCameraMessage] = useState("약봉투나 처방전을 보여주시면 제가 읽고 대화로 이어갈게요.");
   const [ocrPreview, setOcrPreview] = useState("");
   const [ocrBusy, setOcrBusy] = useState(false);
+  const [publicNotice, setPublicNotice] = useState<PublicNotice | null>(null);
+  const [clientEvents, setClientEvents] = useState<ClientEvent[]>([]);
   const [speakerId, setSpeakerId] = useState(
     () => localStorage.getItem(SPEAKER_STORAGE_KEY) || createSpeakerId(),
   );
@@ -80,6 +93,8 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
   const activeSpeechTextRef = useRef("");
   const lastInterruptRef = useRef<{ at: number; text: string } | null>(null);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const reconnectNoticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const recoverableSttErrorCountRef = useRef(0);
   const turnTimingRef = useRef<Partial<TurnTiming> & { userText?: string }>({});
   const turnTimingsRef = useRef<Map<string, Partial<TurnTiming> & { userText?: string }>>(new Map());
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -88,12 +103,8 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
   const streamRef = useRef<MediaStream | null>(null);
   const ocrRunRef = useRef(0);
 
-  const speechSupported = useMemo(() => {
-    if (typeof window === "undefined") {
-      return false;
-    }
-    return Boolean((window as any).SpeechRecognition || (window as any).webkitSpeechRecognition);
-  }, []);
+  const browserCapabilities = useMemo(() => detectBrowserCapabilities(), []);
+  const speechSupported = browserCapabilities.speechRecognition;
 
   useEffect(() => {
     localStorage.setItem(SPEAKER_STORAGE_KEY, speakerId);
@@ -134,6 +145,10 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
         clearTimeout(reconnectTimerRef.current);
         reconnectTimerRef.current = null;
       }
+      if (reconnectNoticeTimerRef.current) {
+        clearTimeout(reconnectNoticeTimerRef.current);
+        reconnectNoticeTimerRef.current = null;
+      }
       const socket = wsRef.current;
       if (socket) {
         socket.onclose = null;
@@ -146,6 +161,41 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
     // Reconnect only when the credential or speaker changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [token, speakerId]);
+
+  function logClientEvent(type: ClientEventType, detail?: Record<string, unknown>) {
+    setClientEvents((events) => appendClientEvent(events, createClientEvent(type, detail)));
+  }
+
+  function clearReconnectNoticeTimer() {
+    if (reconnectNoticeTimerRef.current) {
+      clearTimeout(reconnectNoticeTimerRef.current);
+      reconnectNoticeTimerRef.current = null;
+    }
+  }
+
+  function showPublicNotice(notice: PublicNotice) {
+    setPublicNotice(notice);
+  }
+
+  function clearPublicNotice(kind?: PublicNoticeKind) {
+    setPublicNotice((current) => {
+      if (!current || (kind && current.kind !== kind)) {
+        return current;
+      }
+      return null;
+    });
+  }
+
+  function forceReconnect() {
+    clearReconnectNoticeTimer();
+    const existing = wsRef.current;
+    wsRef.current = null;
+    if (existing) {
+      existing.onclose = null;
+      existing.close();
+    }
+    connectWebSocket();
+  }
 
   function connectWebSocket(): WebSocket | null {
     if (typeof WebSocket === "undefined") {
@@ -161,17 +211,31 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
     }
 
     setStatus("connecting");
+    logClientEvent("ws_connecting", { url: websocketUrl(token) });
     const socket = new WebSocket(websocketUrl(token));
     wsRef.current = socket;
 
     socket.onopen = () => {
+      clearReconnectNoticeTimer();
       setStatus("connected");
+      clearPublicNotice("connection");
+      logClientEvent("ws_open");
       socket.send(JSON.stringify({ type: "ping" }));
     };
     socket.onmessage = (event) => handleSocketMessage(event.data);
-    socket.onerror = () => setStatus("error");
+    socket.onerror = () => {
+      setStatus("error");
+      showPublicNotice({ kind: "connection", text: "연결을 다시 확인하고 있어요.", action: "reconnect" });
+      logClientEvent("ws_error");
+    };
     socket.onclose = () => {
       setStatus("closed");
+      logClientEvent("ws_close");
+      clearReconnectNoticeTimer();
+      reconnectNoticeTimerRef.current = setTimeout(() => {
+        showPublicNotice({ kind: "connection", text: "연결 다시 시도 중이에요.", action: "reconnect" });
+        logClientEvent("ws_reconnect_visible");
+      }, 3000);
       if (!reconnectTimerRef.current) {
         reconnectTimerRef.current = setTimeout(() => {
           reconnectTimerRef.current = null;
@@ -330,9 +394,12 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
   function startAssistant() {
     if (!speechSupported) {
       setManualOpen(true);
+      showPublicNotice({ kind: "permission", text: "음성 입력이 어려워 직접 입력을 열었어요.", action: "manual" });
+      logClientEvent("stt_error", { error: "unsupported" });
       appendSystemMessage("이 브라우저는 음성 인식을 지원하지 않습니다. 아래에 말씀을 적어 주세요.", "warning");
       return;
     }
+    clearPublicNotice("permission");
     setVoiceArmed(true);
     voiceArmedRef.current = true;
     void startVoiceMeter();
@@ -397,6 +464,9 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
       tick();
     } catch {
       setVoiceLevel(0);
+      setManualOpen(true);
+      showPublicNotice({ kind: "permission", text: "마이크 권한을 확인해 주세요.", action: "manual" });
+      logClientEvent("stt_error", { error: "microphone_permission" });
     }
   }
 
@@ -416,7 +486,7 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
   }
 
   function startListening() {
-    const Recognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    const Recognition = speechRecognitionConstructor();
     if (!Recognition) {
       appendSystemMessage("이 브라우저는 음성 인식을 지원하지 않습니다. 텍스트로 입력해 주세요.", "warning");
       return;
@@ -433,15 +503,28 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
     recognition.maxAlternatives = 1;
     turnTimingRef.current = { sttStart: performance.now() };
 
-    recognition.onstart = () => setListening(true);
+    recognition.onstart = () => {
+      setListening(true);
+      logClientEvent("stt_start");
+    };
     recognition.onerror = (event: { error?: string }) => {
       setListening(false);
       recognitionRef.current = null;
       const recoverable = ["no-speech", "aborted", "network"].includes(String(event.error || ""));
+      logClientEvent("stt_error", { error: event.error || "unknown", recoverable });
       if (!recoverable) {
+        recoverableSttErrorCountRef.current = 0;
         voiceArmedRef.current = false;
         setVoiceArmed(false);
+        setManualOpen(true);
+        showPublicNotice({ kind: "permission", text: "마이크 권한을 확인해 주세요.", action: "manual" });
         appendSystemMessage(`음성 인식 오류: ${event.error || "unknown"}`, "warning");
+        return;
+      }
+      recoverableSttErrorCountRef.current += 1;
+      if (recoverableSttErrorCountRef.current >= 3) {
+        setManualOpen(true);
+        showPublicNotice({ kind: "permission", text: "말이 잘 들리지 않아 직접 입력을 열었어요.", action: "manual" });
       }
     };
     recognition.onend = () => {
@@ -466,7 +549,10 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
       const heardText = (finalTranscript || interimTranscript).trim();
       setInterimText(interimTranscript.trim());
       if (heardText) {
+        recoverableSttErrorCountRef.current = 0;
+        clearPublicNotice("permission");
         pulseFromTranscript();
+        logClientEvent("stt_result", { final: Boolean(finalTranscript.trim()), preview: heardText.slice(0, 80) });
       }
       if (
         speakingRef.current &&
@@ -502,6 +588,7 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
 
   function speak(text: string, turnId?: string) {
     if (!ttsEnabled || typeof window === "undefined" || !("speechSynthesis" in window)) {
+      showPublicNotice({ kind: "permission", text: "음성 재생이 꺼져 있어요.", action: "manual" });
       return;
     }
     const timing = turnId ? turnTimingsRef.current.get(turnId) : undefined;
@@ -512,6 +599,7 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
     utterance.onstart = () => {
       speakingRef.current = true;
       setSpeaking(true);
+      logClientEvent("tts_start", { preview: text.slice(0, 80), turn_id: turnId });
       const now = performance.now();
       turnTimingRef.current.ttsStart = now;
       if (timing) {
@@ -526,6 +614,7 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
       speakingRef.current = false;
       activeSpeechTextRef.current = "";
       setSpeaking(false);
+      logClientEvent("tts_end", { turn_id: turnId });
       const now = performance.now();
       turnTimingRef.current.ttsEnd = now;
       if (timing) {
@@ -540,6 +629,7 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
       speakingRef.current = false;
       activeSpeechTextRef.current = "";
       setSpeaking(false);
+      logClientEvent("tts_end", { error: true, turn_id: turnId });
       if (voiceArmedRef.current && !manualStopRef.current) {
         setTimeout(() => startListening(), 250);
       }
@@ -551,17 +641,32 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
     if ("speechSynthesis" in window) {
       window.speechSynthesis.cancel();
     }
+    logClientEvent("tts_stop");
     speakingRef.current = false;
     activeSpeechTextRef.current = "";
     setSpeaking(false);
   }
 
+  function repeatLastReply() {
+    if (!liveReplyText) {
+      return;
+    }
+    if (!ttsEnabled || typeof window === "undefined" || !("speechSynthesis" in window)) {
+      showPublicNotice({ kind: "permission", text: "음성 재생을 사용할 수 없어요.", action: "manual" });
+      return;
+    }
+    speak(liveReplyText, latestReplyMessage?.turnId);
+  }
+
   async function activateCamera(message = "사진 확인을 준비했습니다.") {
     setCameraMessage(message);
     setCameraMode("opening");
+    logClientEvent("camera_open");
     if (!navigator.mediaDevices?.getUserMedia) {
       setCameraMode("error");
-      setCameraMessage("이 브라우저에서는 실시간 카메라를 열 수 없습니다. 사진 업로드를 사용해 주세요.");
+      setCameraMessage("카메라를 열 수 없어요. 사진 선택을 사용해 주세요.");
+      showPublicNotice({ kind: "permission", text: "카메라를 열 수 없어요.", action: "manual" });
+      logClientEvent("camera_error", { error: "unsupported" });
       return;
     }
     try {
@@ -577,9 +682,13 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
       }
       setCameraMode("ready");
       setCameraMessage("카메라가 준비됐습니다. 약 이름이 크게 보이게 맞춘 뒤 촬영해 주세요.");
+      clearPublicNotice("permission");
+      logClientEvent("camera_ready");
     } catch {
       setCameraMode("error");
-      setCameraMessage("카메라 권한을 받지 못했습니다. 파일 업로드로도 OCR 확인이 가능합니다.");
+      setCameraMessage("카메라 권한이 필요해요. 사진 선택도 가능합니다.");
+      showPublicNotice({ kind: "permission", text: "카메라 권한을 확인해 주세요.", action: "manual" });
+      logClientEvent("camera_error", { error: "permission" });
     }
   }
 
@@ -598,12 +707,17 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
     setCameraMode("idle");
     updatePreview(null);
     setCameraMessage("약봉투나 처방전을 보여주시면 제가 읽고 대화로 이어갈게요.");
+    clearPublicNotice("permission");
+    logClientEvent("camera_close", { message });
     if (message) {
       appendSystemMessage(message);
     }
   }
 
   async function captureAndAnalyze() {
+    if (ocrBusy) {
+      return;
+    }
     const video = videoRef.current;
     const canvas = canvasRef.current;
     if (!video || !canvas || video.videoWidth === 0) {
@@ -626,6 +740,10 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
   }
 
   function handleOcrFileChange(event: ChangeEvent<HTMLInputElement>) {
+    if (ocrBusy) {
+      event.target.value = "";
+      return;
+    }
     const file = event.target.files?.[0] || null;
     updatePreview(file);
     if (file) {
@@ -646,6 +764,7 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
     const runId = ocrRunRef.current + 1;
     ocrRunRef.current = runId;
     setOcrBusy(true);
+    logClientEvent("ocr_start", { file_type: file.type, file_size: file.size });
     appendSystemMessage("사진을 읽고 있습니다. 글자가 잘 보이는지 확인한 뒤 대화로 이어갈게요.");
     try {
       const result = await uploadOcrImage(file, token);
@@ -657,6 +776,7 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
           ? `OCR에서 약 ${result.medications.length}개를 찾았습니다. 저장 여부를 대화로 확인할게요.`
           : "약 이름이 선명하지 않습니다. 필요하면 다시 촬영을 안내할게요.",
       );
+      logClientEvent("ocr_success", { medication_count: result.medications.length });
       const turnId = createTurnId();
       const timing = {
         wsSend: performance.now(),
@@ -684,7 +804,11 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
       if (ocrRunRef.current !== runId) {
         return;
       }
-      appendSystemMessage(error instanceof Error ? error.message : "OCR 업로드에 실패했습니다.", "warning");
+      const message = error instanceof Error ? error.message : "OCR upload failed";
+      setCameraMessage("사진을 다시 찍거나 선택해 주세요.");
+      showPublicNotice({ kind: "error", text: "사진 확인에 실패했어요.", action: "manual" });
+      logClientEvent("ocr_error", { error: message });
+      appendSystemMessage("사진을 다시 찍거나 선택해 주세요.", "warning");
     } finally {
       if (ocrRunRef.current === runId) {
         setOcrBusy(false);
@@ -722,8 +846,8 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
         status,
         websocket_ready_state: wsRef.current?.readyState ?? null,
         speech_supported: speechSupported,
-        speech_synthesis_supported: typeof window !== "undefined" && "speechSynthesis" in window,
-        media_devices_supported: Boolean(navigator.mediaDevices?.getUserMedia),
+        speech_synthesis_supported: browserCapabilities.speechSynthesis,
+        media_devices_supported: browserCapabilities.mediaDevices,
         tts_enabled: ttsEnabled,
         filler_tts_enabled: fillerTtsEnabled,
         voice_armed: voiceArmed,
@@ -740,6 +864,7 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
         language: navigator.language,
         pending_turn_count: turnTimingsRef.current.size,
       },
+      client_events: clientEvents,
       messages: [...messages].reverse().map((message) => ({
         id: message.id,
         turn_id: message.turnId,
@@ -767,8 +892,12 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
   const liveReplyText = latestReplyMessage?.text || "";
   const liveReplySender: AssistantMessage["sender"] = latestReplyMessage?.sender || "odiss";
   const hasLiveDialog = Boolean(liveUserText || liveReplyText);
-  const liveUserSize = captionSizeClass(liveUserText);
-  const liveReplySize = captionSizeClass(liveReplyText);
+  const liveUserDisplay = compactLiveText(liveUserText, "user");
+  const liveReplyDisplay = compactLiveText(liveReplyText, "reply");
+  const liveUserCompacted = Boolean(liveUserText && liveUserDisplay !== normalizeLiveText(liveUserText));
+  const liveReplyCompacted = Boolean(liveReplyText && liveReplyDisplay !== normalizeLiveText(liveReplyText));
+  const liveUserSize = liveCaptionClass(liveUserDisplay);
+  const liveReplySize = liveCaptionClass(liveReplyDisplay);
   const mode = currentAssistantMode({
     cameraMode,
     latestMessage,
@@ -798,6 +927,16 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
   const primaryButtonStyle = {
     "--voice-level": Math.max(voiceLevel, voiceDetected ? 0.36 : 0).toFixed(2),
   } as CSSProperties;
+
+  function handlePublicNoticeAction() {
+    if (publicNotice?.action === "reconnect") {
+      forceReconnect();
+      return;
+    }
+    if (publicNotice?.action === "manual") {
+      setManualOpen(true);
+    }
+  }
 
   function handlePrimaryAction() {
     if (ocrBusy || cameraMode === "opening") {
@@ -833,6 +972,17 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
         </div>
       ) : null}
 
+      {!adminMode && publicNotice ? (
+        <div className={`public-status-pill ${publicNotice.kind}`} role="status" aria-live="polite">
+          <span>{publicNotice.text}</span>
+          {publicNotice.action ? (
+            <button type="button" onClick={handlePublicNoticeAction}>
+              {publicNotice.action === "reconnect" ? "다시 연결" : "직접 입력"}
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+
       <main className={`assistant-center ${showCamera ? "camera-layout" : "voice-layout"}`} aria-label="ODISS 음성 비서">
         {showVisibleCopy ? (
           <div className="assistant-copy">
@@ -862,8 +1012,13 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
 
         {!adminMode && liveUserText ? (
           <section className="live-dialog above-mic" aria-label="내 말" aria-live="polite">
-            <article className={`live-card user ${liveUserSize}`}>
-              <p>{liveUserText}</p>
+            <article
+              className={`live-card user ${liveUserSize} ${liveUserCompacted ? "is-compact" : ""}`}
+              aria-label={`사용자: ${liveUserText}`}
+              title={liveUserText}
+            >
+              <span className="live-card-label">사용자</span>
+              <p>{liveUserDisplay}</p>
             </article>
           </section>
         ) : null}
@@ -891,8 +1046,13 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
 
         {!adminMode && liveReplyText ? (
           <section className="live-dialog below-mic" aria-label="오디스 답변" aria-live="polite">
-            <article className={`live-card ${liveReplySender} ${liveReplySize}`}>
-              <p>{liveReplyText}</p>
+            <article
+              className={`live-card ${liveReplySender} ${liveReplySize} ${liveReplyCompacted ? "is-compact" : ""}`}
+              aria-label={`ODISS 답변: ${liveReplyText}`}
+              title={liveReplyText}
+            >
+              <span className="live-card-label">ODISS</span>
+              <p>{liveReplyDisplay}</p>
             </article>
           </section>
         ) : null}
@@ -944,6 +1104,17 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
           >
             <span className="keyboard-icon-shape" aria-hidden="true" />
           </button>
+          {liveReplyText ? (
+            <button
+              type="button"
+              className="icon-utility-button repeat-voice"
+              onClick={repeatLastReply}
+              aria-label="다시 듣기"
+              title="다시 듣기"
+            >
+              <span className="repeat-icon-shape" aria-hidden="true" />
+            </button>
+          ) : null}
           {speaking ? (
             <button type="button" className="icon-utility-button stop-voice" onClick={stopTts} aria-label="음성 중지" title="음성 중지">
               <span className="stop-icon-shape" aria-hidden="true" />
@@ -1009,6 +1180,17 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
               <dt>token</dt>
               <dd>{token ? "configured" : "empty/local"}</dd>
             </dl>
+            <details className="client-events-panel">
+              <summary>클라이언트 이벤트 {clientEvents.length}</summary>
+              <ol>
+                {clientEvents.slice(-8).reverse().map((event) => (
+                  <li key={event.id}>
+                    <strong>{event.type}</strong>
+                    <span>{formatTime(event.at)}</span>
+                  </li>
+                ))}
+              </ol>
+            </details>
           </section>
 
           <section className="panel timeline-panel">
@@ -1076,14 +1258,6 @@ function MessageItem({
 
 function payloadText(payload: WsPayload): string {
   return String(payload.response_text || payload.text || payload.message || payload.reason || "");
-}
-
-function captionSizeClass(text: string): string {
-  const length = Array.from(text.trim()).length;
-  if (length <= 14) return "caption-short";
-  if (length <= 34) return "caption-medium";
-  if (length <= 78) return "caption-long";
-  return "caption-xlong";
 }
 
 function payloadSender(payload: WsPayload): AssistantMessage["sender"] {
