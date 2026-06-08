@@ -14,6 +14,7 @@ import logging
 import asyncio
 import re
 from collections import deque
+from uuid import uuid4
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from time import perf_counter
@@ -30,6 +31,7 @@ from app.engines.reasoning import ReasoningEngine
 from app.engines.llm_judge import LLMJudgeEngine
 from app.services.engine_orchestrator import EngineOrchestrator
 from app.services.identity_guard import evaluate_identity_gate
+from app.services.identity_registry import touch_identity
 from app.services.llm import extract_ocr_medication_candidates_with_llm, refine_ocr_medication_candidates_with_context
 from app.services.assistant_intent_classifier import AssistantIntentClassifier, AssistantRouteDecision
 from app.services.medication_extraction import (
@@ -203,6 +205,42 @@ class AssistantTurnRouter:
 _dialog_state_by_speaker: dict[str, AssistantDialogState] = {}
 OCR_PENDING_TTL = timedelta(minutes=5)
 ANONYMOUS_OCR_KEY = "__anonymous__"
+# 영구 키 의무화: speaker_id가 없을 때 연결마다 발급하는 키 접두사.
+AUTO_IDENTITY_PREFIX = "auto-"
+_IDENTITY_BEARING_MESSAGE_TYPES = {
+    "stt_result",
+    "identity_confirmed",
+    "ocr_result",
+    "companion_prompt",
+}
+
+
+def _client_ip_from_ws(websocket: WebSocket) -> str:
+    """WebSocket 클라이언트 IP 추정(프록시 뒤에서는 XFF 1차값)."""
+    try:
+        xff = str(websocket.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+        if xff:
+            return xff
+        client = getattr(websocket, "client", None)
+        return client.host if client else ""
+    except Exception:  # noqa: BLE001 - IP는 보조 메타라 실패해도 흐름 유지
+        return ""
+
+
+def _infer_platform(speaker_id: str | None, client_context: Any = None) -> str:
+    """speaker_id 접두사/클라이언트 컨텍스트로 플랫폼 추론."""
+    sid = str(speaker_id or "")
+    if sid.startswith("web-") or sid.startswith("web_"):
+        return "web"
+    if sid.startswith("android-") or sid.startswith("android_"):
+        return "android"
+    if isinstance(client_context, dict):
+        platform = str(client_context.get("platform") or "").strip().lower()
+        if platform in {"android", "web", "ios"}:
+            return platform
+    if sid.startswith(AUTO_IDENTITY_PREFIX):
+        return "unknown"
+    return "unknown"
 WEBSOCKET_IDLE_TIMEOUT_SEC = 65.0
 WAKE_PROFILE_LOOKUP_TIMEOUT_SEC = 0.15
 IDENTITY_PENDING_ACTIONS = {
@@ -583,8 +621,12 @@ async def websocket_chat(websocket: WebSocket):
         await websocket.close(code=1008)
         return
     await websocket.accept()
-    logger.info("[WS] connected path=/ws/chat")
+    client_ip = _client_ip_from_ws(websocket)
+    logger.info("[WS] connected path=/ws/chat ip=%s", client_ip or "-")
     active_speakers: set[str] = set()
+    # 영구 키 의무화(소프트 보장): 키 누락 시 연결 단위로 발급해 동일 연결 내내 사용.
+    connection_identity: str | None = None
+    touched_identities: set[str] = set()
 
     try:
         await memory_engine.initialize()
@@ -615,6 +657,41 @@ async def websocket_chat(websocket: WebSocket):
 
             msg_type = message.get("type", "")
             speaker_id = message.get("speaker_id")
+
+            # 영구 키 의무화: 식별이 필요한 메시지인데 키가 없으면 연결 키를 발급/주입한다.
+            if msg_type in _IDENTITY_BEARING_MESSAGE_TYPES:
+                resolved_id = str(message.get("speaker_id") or "").strip()
+                auto_issued = False
+                if not resolved_id and app_settings.identity_auto_issue:
+                    if connection_identity is None:
+                        connection_identity = f"{AUTO_IDENTITY_PREFIX}{uuid4().hex[:8]}"
+                        logger.info(
+                            "[WS][Identity] auto_issued speaker_id=%s ip=%s",
+                            connection_identity,
+                            client_ip or "-",
+                        )
+                    resolved_id = connection_identity
+                    auto_issued = True
+                if resolved_id:
+                    message["speaker_id"] = resolved_id
+                    speaker_id = resolved_id
+                    if resolved_id not in touched_identities:
+                        touched_identities.add(resolved_id)
+                        try:
+                            _, is_new = touch_identity(
+                                resolved_id,
+                                platform=_infer_platform(resolved_id, message.get("client_context")),
+                                ip=client_ip,
+                                source="auto_issued" if auto_issued else "ws",
+                            )
+                            logger.info(
+                                "[WS][Identity] touch speaker_id=%s is_new=%s",
+                                resolved_id,
+                                is_new,
+                            )
+                        except Exception as exc:  # noqa: BLE001 - 레지스트리 실패가 대화를 막지 않도록
+                            logger.warning("[WS][Identity] touch_failed speaker_id=%s error=%s", resolved_id, exc)
+
             text = str(message.get("text") or "").strip()
             logger.info(
                 "[WS] recv type=%s speaker=%s chars=%d text=%r",

@@ -1,0 +1,28 @@
+{
+  "identities": [
+    {
+      "speaker_id": "speaker-r1",
+      "platform": "android",
+      "first_seen": "2026-06-08T23:29:27",
+      "last_seen": "2026-06-08T23:29:41",
+      "first_ip": "testclient",
+      "last_ip": "testclient",
+      "app_version": "1.0.0",
+      "display_name": "",
+      "seen_count": 2,
+      "source": "device_register"
+    },
+    {
+      "speaker_id": "speaker-contract-ws",
+      "platform": "unknown",
+      "first_seen": "2026-06-08T23:29:38",
+      "last_seen": "2026-06-08T23:29:38",
+      "first_ip": "testclient",
+      "last_ip": "testclient",
+      "app_version": "",
+      "display_name": "",
+      "seen_count": 10,
+      "source": "ws"
+    }
+  ]
+}

@@ -24,6 +24,7 @@ from app.api.routes import (
     agent_ws,
     device_api,
     feedback_api,
+    identity_api,
     memory_browser_api,
     ocr_api,
     stt_api,
@@ -123,6 +124,7 @@ app.include_router(agent_ws.router, tags=["websocket"])
 app.include_router(ocr_api.router)
 app.include_router(stt_api.router)
 app.include_router(device_api.router)
+app.include_router(identity_api.router)
 app.include_router(memory_browser_api.router)
 app.include_router(feedback_api.router)
 

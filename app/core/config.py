@@ -130,6 +130,11 @@ class Settings(BaseSettings):
     storage_path: str = "./data/storage"
     nfs_mount_path: Optional[str] = None
 
+    # Identity registry (파일 기반 사용자 식별 리스트)
+    identity_registry_path: str = "./data/storage/identity_registry.json"
+    # 영구 키 의무화(소프트 보장): speaker_id 누락 시 연결 단위로 고유 키 자동 발급
+    identity_auto_issue: bool = True
+
     # Memory browser (read-only patient memory web UI)
     memory_browser_token: Optional[str] = None
     memory_browser_cors_origins: str = (
