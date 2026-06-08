@@ -16,6 +16,9 @@ class MockWebSocket {
 
   constructor(public url: string) {
     ((window as any).__mockWebSockets ||= []).push(this);
+    if ((window as any).__mockWebSocketDisableAutoOpen) {
+      return;
+    }
     setTimeout(() => {
       this.readyState = MockWebSocket.OPEN;
       this.onopen?.();
