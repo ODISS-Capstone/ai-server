@@ -124,13 +124,13 @@ describe("Assistant public live text", () => {
     expect(window.speechSynthesis.cancel).toHaveBeenCalledTimes(1);
   });
 
-  it("opens manual input with a short notice when browser STT is unsupported", async () => {
+  it("opens manual input with a short notice when server STT recording is unsupported", async () => {
     render(<App />);
     await latestSocket();
 
     fireEvent.click(screen.getByRole("button", { name: "직접 입력하기" }));
 
-    expect(screen.getByText("음성 입력이 어려워 직접 입력을 열었어요.")).toBeInTheDocument();
+    expect(screen.getByText("마이크 녹음을 사용할 수 없어 직접 입력을 열었어요.")).toBeInTheDocument();
     expect(screen.getByRole("textbox", { name: "대화 입력" })).toBeInTheDocument();
   });
 
@@ -151,7 +151,7 @@ describe("Assistant public live text", () => {
       vi.advanceTimersByTime(3000);
     });
 
-    expect(screen.getByText("연결 다시 시도 중이에요.")).toBeInTheDocument();
+    expect(screen.getByText("서버 WebSocket 연결을 다시 시도 중이에요.")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "다시 연결" })).toBeInTheDocument();
   });
 

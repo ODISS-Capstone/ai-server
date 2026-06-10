@@ -14,6 +14,7 @@ import logging
 import asyncio
 import re
 from collections import deque
+from difflib import SequenceMatcher
 from uuid import uuid4
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -510,17 +511,34 @@ def _normalize_assistant_text(text: str) -> str:
 
 # 어시스턴트 TTS가 마이크로 되먹임될 수 있는 시간 창(초).
 ASSISTANT_ECHO_TTL_SEC = 30.0
+# TTS 직후(재생+녹음+STT 왕복) 창. 이 안에 들어온 유사 텍스트는 에코일 확률이 높아
+# 더 느슨한 기준으로 잡는다.
+ASSISTANT_ECHO_RECENT_SEC = 12.0
+
+
+def _common_prefix_len(a: str, b: str) -> int:
+    limit = min(len(a), len(b))
+    for i in range(limit):
+        if a[i] != b[i]:
+            return i
+    return limit
 
 
 def _is_assistant_tts_echo(speaker_id: str | None, text: str) -> bool:
-    """들어온 STT 텍스트가 최근 어시스턴트 TTS의 되먹임(에코)인지 판정."""
+    """들어온 STT 텍스트가 최근 어시스턴트 TTS의 되먹임(에코)인지 판정.
+
+    STT가 에코를 받아 적으면서 글자가 변형되거나 끝이 다르게 잘릴 수 있으므로
+    ('확인하고 있어요'→'확인해 주시기 바랍니다') 정확 일치/포함뿐 아니라
+    유사도·공통 접두 기반 퍼지 매칭도 수행한다.
+    """
     incoming = _compact_text(text)
     if not incoming or len(incoming) < 4:
         return False
     state = _speaker_state(speaker_id)
     now = perf_counter()
     for spoken, ts in list(state.recent_tts):
-        if now - ts > ASSISTANT_ECHO_TTL_SEC:
+        age = now - ts
+        if age > ASSISTANT_ECHO_TTL_SEC:
             continue
         if not spoken:
             continue
@@ -530,6 +548,19 @@ def _is_assistant_tts_echo(speaker_id: str | None, text: str) -> bool:
         shorter, longer = (incoming, spoken) if len(incoming) <= len(spoken) else (spoken, incoming)
         if len(shorter) >= 6 and shorter in longer:
             return True
+        # 퍼지 매칭: STT가 한두 글자를 바꿔 적은 에코를 흡수한다.
+        if len(shorter) >= 8 and len(shorter) / len(longer) >= 0.6:
+            ratio = SequenceMatcher(None, incoming, spoken).ratio()
+            if ratio >= 0.82:
+                return True
+            # TTS 직후 창에서는 STT가 끝부분을 크게 바꿔 적어도 에코로 간주한다.
+            if age <= ASSISTANT_ECHO_RECENT_SEC and ratio >= 0.55:
+                return True
+        # 직후 창의 공통 접두 매칭: 필러 앞부분을 그대로 받아 적은 에코를 잡는다.
+        if age <= ASSISTANT_ECHO_RECENT_SEC:
+            prefix = _common_prefix_len(incoming, spoken)
+            if prefix >= 8 and prefix >= 0.6 * len(shorter):
+                return True
     return False
 
 
@@ -575,6 +606,10 @@ def _update_dialog_state_from_outbound(speaker_id: str | None, payload: dict[str
         if compact:
             state.recent_tts.append((compact, perf_counter()))
     if payload_type == "filler":
+        return
+    if payload_type in {"ignored", "error"}:
+        # 에코/노이즈 무시 응답이 진행 중인 플로우(reminder 등)와 확인 대기 상태를
+        # "none"으로 덮어쓰면 사용자의 진짜 확답이 길을 잃는다. 상태를 건드리지 않는다.
         return
     if response_text and payload_type != "filler":
         state.last_assistant_text = response_text
@@ -1079,9 +1114,10 @@ async def _handle_stt_impl(websocket: WebSocket, message: dict, active_speakers:
     immediate_filler = _immediate_filler_for_text(text)
     progress_task: asyncio.Task | None = None
     if immediate_filler:
-        await _send_runtime_filler(websocket, immediate_filler, stage=_processing_stage_for_text(text))
+        # 지연 전송: 응답이 INITIAL_FILLER_DELAY_SEC 안에 완성되면 필러를 말하지 않는다.
+        # (필러 TTS의 마이크 되먹임이 자기 응답 루프의 주요 원인)
         progress_task = asyncio.create_task(
-            _send_progress_fillers(websocket, text, initial_sent=True)
+            _send_initial_and_progress_fillers(websocket, text, immediate_filler)
         )
     try:
         context = await memory_engine.load_context(speaker_id)
@@ -1119,13 +1155,15 @@ async def _handle_stt_impl(websocket: WebSocket, message: dict, active_speakers:
 
         preview_input = conversation_engine.receive_input(text, speaker_id)
         pre_filler = "" if immediate_filler else conversation_engine.generate_filler(preview_input)
-        if pre_filler:
-            await _send_runtime_filler(websocket, pre_filler, stage=_processing_stage_for_text(text))
-
         if progress_task is None:
-            progress_task = asyncio.create_task(
-                _send_progress_fillers(websocket, text, initial_sent=bool(pre_filler))
-            )
+            if pre_filler:
+                progress_task = asyncio.create_task(
+                    _send_initial_and_progress_fillers(websocket, text, pre_filler)
+                )
+            else:
+                progress_task = asyncio.create_task(
+                    _send_progress_fillers(websocket, text, initial_sent=False)
+                )
         turn = await engine_orchestrator.run_turn(
             text=text,
             speaker_id=speaker_id,
@@ -1156,8 +1194,8 @@ async def _handle_stt_impl(websocket: WebSocket, message: dict, active_speakers:
     finally:
         await _cancel_progress_task(progress_task)
 
-    if turn.filler_text and not immediate_filler and not pre_filler:
-        await _send_runtime_filler(websocket, turn.filler_text, stage=_processing_stage_for_text(text))
+    # 주의: 턴 완료 후의 후행 필러는 보내지 않는다. 최종 응답이 바로 이어지므로
+    # "혼자 여러 번 말하는" 소음만 추가될 뿐이다.
 
     if not turn.conversation.requires_tts and not turn.conversation.response_text:
         fallback_text = conversation_engine.build_assistant_response(
@@ -1779,21 +1817,32 @@ async def _handle_reminder_setup_request(
         )
         return True
 
-    # 응답 전 필러로 즉답성 유지(기존 리마인더 브랜치와 동일한 계약).
+    # 응답 전 필러는 지연 전송: 빠르게 끝나는 턴(대부분)은 필러 없이 본 응답만 나간다.
     immediate_filler = _immediate_filler_for_text(text)
+    filler_task: asyncio.Task | None = None
     if immediate_filler:
-        await _send_runtime_filler(
-            websocket, immediate_filler, stage=_processing_stage_for_text(text)
+        filler_task = asyncio.create_task(
+            _send_runtime_filler(
+                websocket,
+                immediate_filler,
+                stage=_processing_stage_for_text(text),
+                delay=INITIAL_FILLER_DELAY_SEC,
+            )
         )
 
-    context = await memory_engine.load_context(speaker_id)
-    reminder_text = await reminder_service.handle_user_text(
-        memory_engine=memory_engine,
-        speaker_id=speaker_id,
-        text=text,
-        user_profile=context.get("user_profile", {}),
-        prescription_log=context.get("prescription_log", ""),
-    )
+    try:
+        context = await memory_engine.load_context(speaker_id)
+        reminder_text = await reminder_service.handle_user_text(
+            memory_engine=memory_engine,
+            speaker_id=speaker_id,
+            text=text,
+            user_profile=context.get("user_profile", {}),
+            prescription_log=context.get("prescription_log", ""),
+        )
+    finally:
+        # 처리 결과와 무관하게 지연 필러는 취소한다. 일반 파이프라인으로 넘어가면
+        # 그쪽에서 자체 필러를 관리하므로 여기 것이 살아 있으면 중복 발화가 된다.
+        await _cancel_progress_task(filler_task)
     if not reminder_text:
         # 셋업으로 분류됐지만 리마인더 서비스가 처리하지 못하면 일반 파이프라인에 맡긴다.
         return False
@@ -2850,7 +2899,24 @@ async def _refresh_wake_word_state_background(speaker_id: str) -> None:
         logger.warning("[WakeWord] background_refresh_failed speaker=%s error=%r", speaker_id, exc)
 
 
-async def _send_runtime_filler(websocket: WebSocket, text: str, *, stage: str) -> None:
+# 빠른 턴(이 시간 안에 응답 완성)은 필러를 아예 말하지 않는다.
+# 필러 TTS가 마이크로 되먹임돼 자기 응답 루프를 만드는 주요 원인이기 때문.
+INITIAL_FILLER_DELAY_SEC = 1.2
+
+
+async def _send_runtime_filler(
+    websocket: WebSocket,
+    text: str,
+    *,
+    stage: str,
+    delay: float = 0.0,
+) -> None:
+    if delay > 0:
+        await asyncio.sleep(delay)
+    trace = getattr(websocket, "_trace", None)
+    if trace is not None and any(payload.get("type") == "filler" for payload in trace.outbound):
+        # 한 턴에 필러는 한 번만 보낸다. 중복 필러는 '혼자 여러 번 말하는' 증상의 원인.
+        return
     await websocket.send_json(
         {
             "type": "filler",
@@ -2928,6 +2994,24 @@ def _processing_stage_for_text(text: str) -> str:
     return "general"
 
 
+async def _send_initial_and_progress_fillers(
+    websocket: WebSocket,
+    text: str,
+    filler_text: str,
+) -> None:
+    """지연 후 초기 필러를 보내고, 작업이 더 길어지면 진행 필러를 이어 보낸다.
+
+    INITIAL_FILLER_DELAY_SEC 안에 턴이 완료되면 호출측에서 task를 취소하므로
+    빠른 턴에서는 어떤 필러도 발화되지 않는다.
+    """
+    try:
+        await asyncio.sleep(INITIAL_FILLER_DELAY_SEC)
+        await _send_runtime_filler(websocket, filler_text, stage=_processing_stage_for_text(text))
+        await _send_progress_fillers(websocket, text, initial_sent=True)
+    except WebSocketDisconnect:
+        raise
+
+
 async def _send_progress_fillers(
     websocket: WebSocket,
     text: str,
@@ -2946,7 +3030,7 @@ async def _send_progress_fillers(
         fillers = MEDICATION_PROGRESS_FILLERS
     else:
         fillers = GENERAL_PROGRESS_FILLERS
-    delay = 6.0 if initial_sent else 0.6
+    delay = 6.0 if initial_sent else INITIAL_FILLER_DELAY_SEC
     try:
         await asyncio.sleep(delay)
         await _send_runtime_filler(websocket, fillers[0], stage=stage)

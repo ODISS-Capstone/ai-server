@@ -31,11 +31,19 @@ async def send_to_speaker_devices(
 ) -> int:
     """Best-effort device push hook used when no WebSocket is connected.
 
-    The local server does not own the actual device transport, so the default is
-    a no-op. Tests and deployment integrations can monkeypatch or replace this
-    function without changing ReminderService.
+    기본 구현은 device_api의 FCM push로 위임한다(자격증명/등록 단말이 없으면 0건).
+    테스트는 이 함수를 monkeypatch하여 전송을 검증한다.
     """
-    return 0
+    try:
+        from app.services import device_api
+    except Exception:  # noqa: BLE001 - push fallback must never break scheduling
+        return 0
+    return await device_api.send_to_speaker_devices(
+        speaker_id,
+        text,
+        tts_requested=tts_requested,
+        meta=meta,
+    )
 
 
 @dataclass
@@ -1189,9 +1197,28 @@ class ReminderService:
         name = str((user_profile or {}).get("name") or "").strip()
         return f"{name}님" if name else "사용자님"
 
+    # 짧은 한두 마디 확답. 한 글자짜리('해', '어' 등)는 포함 검사가 위험하므로
+    # 정규화 후 정확 일치로만 인정한다.
+    _SHORT_AFFIRMATIVES = {
+        "네", "넹", "넵", "예", "응", "어", "엉", "그래", "그래요", "그러자", "그럼", "그럼요",
+        "해", "해줘", "해주세요", "해요", "하자", "할게", "할래", "해라", "그렇게해", "그렇게해줘",
+        "그렇게하자", "좋아", "좋아요", "좋지", "좋습니다", "괜찮아", "괜찮아요", "괜찮습니다",
+        "맞아", "맞아요", "맞습니다", "오케이", "오키", "ok", "okay", "콜", "당연하지", "당연하죠",
+        "부탁해", "부탁해요", "부탁드려요", "진행해", "진행해줘", "설정해", "설정해줘",
+        "등록해", "등록해줘",
+    }
+
     @staticmethod
     def _is_affirmative(text: str) -> bool:
-        return any(token in text.strip().lower() for token in ("네", "예", "응", "그래", "괜찮", "좋아", "맞아"))
+        lowered = text.strip().lower()
+        normalized = ReminderService._normalize_short_reply(lowered)
+        if normalized in ReminderService._SHORT_AFFIRMATIVES:
+            return True
+        # 문장 속 확답: 거절/질문은 호출부에서 먼저 거르므로 긍정 신호 포함이면 확답으로 본다.
+        return any(
+            token in lowered
+            for token in ("네", "예", "응", "그래", "괜찮", "좋아", "맞아", "해줘", "해 줘", "부탁", "진행해", "그렇게 해")
+        )
 
     @staticmethod
     def _is_wait_ack(text: str) -> bool:
@@ -1212,7 +1239,14 @@ class ReminderService:
     @staticmethod
     def _is_rejection(text: str) -> bool:
         lowered = text.strip().lower()
-        return any(token in lowered for token in ("아니", "아냐", "취소", "하지 마", "하지마", "싫", "필요 없어", "안 해"))
+        normalized = ReminderService._normalize_short_reply(lowered)
+        # '됐어'는 '잘됐어'처럼 긍정 문장에도 들어가므로 단독 발화일 때만 거절로 본다.
+        if normalized in {"됐어", "됐어요", "됐습니다", "아니요", "아뇨", "노", "no", "관둬", "그만", "안할래", "안할게"}:
+            return True
+        return any(
+            token in lowered
+            for token in ("아니", "아냐", "취소", "하지 마", "하지마", "싫", "필요 없어", "필요없어", "안 해", "안 할", "그만둬")
+        )
 
     @staticmethod
     def _is_bare_taken_confirmation(text: str) -> bool:

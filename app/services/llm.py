@@ -381,11 +381,16 @@ async def classify_reasoning_route_with_llm(
     """Use the local LLM as the primary intent/router classifier."""
     url = api_url or settings.internal_llm_api_url
     key = api_key if api_key is not None else settings.internal_llm_api_key
-    if not url:
+    # 대화 백엔드가 원격(Together)이면 추론(라우팅) 엔진도 Together Qwen3.5-9B로 돌린다.
+    # 죽은 로컬 Ollama를 매 턴 호출하지 않으면서도 LLM 라우팅 품질은 유지한다.
+    use_remote_backend = (
+        not _internal_helper_llm_available()
+        and get_conversation_llm_backend() == "together"
+        and bool(settings.together_api_key)
+    )
+    if not url and not use_remote_backend:
         return {"source": "local_llm_not_configured", "usable": False}
-    if not _internal_helper_llm_available():
-        # 대화 백엔드가 원격(Together)으로 전환된 배포에서는 로컬 라우팅 LLM이 떠 있지 않다.
-        # 죽은 Ollama를 매 턴 호출해 80ms 낭비/경고를 내지 않고 결정적 라우팅으로 조용히 폴백한다.
+    if not _internal_helper_llm_available() and not use_remote_backend:
         return {"source": "internal_llm_unavailable", "usable": False}
 
     messages = [
@@ -435,7 +440,7 @@ async def classify_reasoning_route_with_llm(
     ]
     try:
         answer = await _post_chat_once(
-            url,
+            url or settings.together_base_url,
             key,
             messages,
             model=model or settings.internal_llm_model,
@@ -443,13 +448,14 @@ async def classify_reasoning_route_with_llm(
             temperature=settings.internal_llm_route_temperature,
             timeout_seconds=settings.local_delivery_llm_timeout_seconds,
             chat_template_kwargs={"enable_thinking": False},
+            use_conversation_backend=use_remote_backend,
         )
     except Exception as exc:  # noqa: BLE001 - routing must fall back to deterministic code
         logger.warning("[RouteLLM] failed fallback=true error=%s", exc)
         return {"source": "local_llm_error", "usable": False, "raw": repr(exc)}
 
     parsed = _parse_route_classifier_answer(answer)
-    parsed["source"] = "local_llm"
+    parsed["source"] = "together_llm" if use_remote_backend else "local_llm"
     parsed["raw"] = answer[:400]
     return parsed
 
@@ -471,6 +477,12 @@ async def judge_identity_conflict(
         return {
             "conflict": False,
             "source": "local_llm_not_configured",
+            "raw": "",
+        }
+    if not _internal_helper_llm_available():
+        return {
+            "conflict": False,
+            "source": "internal_llm_unavailable",
             "raw": "",
         }
 
@@ -525,6 +537,8 @@ async def judge_pending_identity_reply_with_llm(
     key = api_key if api_key is not None else settings.internal_llm_api_key
     if not url:
         return {"decision": "unclear", "profile": extracted_profile or {}, "source": "local_llm_not_configured"}
+    if not _internal_helper_llm_available():
+        return {"decision": "unclear", "profile": extracted_profile or {}, "source": "internal_llm_unavailable"}
 
     messages = [
         {
@@ -584,6 +598,12 @@ async def extract_identity_profile_with_llm(
         return {
             "profile": fallback,
             "source": "heuristic_no_internal_llm",
+            "raw": "",
+        }
+    if not _internal_helper_llm_available():
+        return {
+            "profile": fallback,
+            "source": "heuristic_internal_llm_unavailable",
             "raw": "",
         }
 
@@ -840,6 +860,12 @@ async def judge_prior_conversation_turn(
         return {
             **fallback,
             "source": "heuristic_no_internal_llm",
+            "raw": "",
+        }
+    if not _internal_helper_llm_available():
+        return {
+            **fallback,
+            "source": "heuristic_internal_llm_unavailable",
             "raw": "",
         }
 
@@ -1301,13 +1327,14 @@ def _heuristic_identity_extract(text: str) -> dict[str, Any]:
     if not text:
         return profile
 
+    # '살|세' 뒤에 한글이 이어지면("말씀해주세요"의 '세') 나이 표현이 아니므로 경계를 강제한다.
     name_patterns = [
         r"(?:제\s*이름은|이름은)\s*([가-힣]{2,5}?)(?:이고|고|입니다|이에요|예요|,|\s|$)",
         r"(?:저는|나는|난)\s*([가-힣]{2,5}?)(?:이고|고|입니다|이에요|예요|,|\s|$)",
         r"^\s*([가-힣]{2,5})\s*(?:남자|남성|여자|여성)",
-        r"^\s*([가-힣]{2,5})\s*,?\s*(?:\d{1,3}|[가-힣]{2,8})\s*(?:살|세)",
-        r"(?:^|\s)([가-힣]{2,5})\s*,?\s*(?:\d{1,3}|[가-힣]{2,8})\s*(?:살|세)\s*(?:남자|남성|여자|여성)?",
-        r"(?:^|\s)([가-힣]{2,5})\s*(?:남자|남성|여자|여성)\s*,?\s*\d{1,3}\s*(?:살|세)?",
+        r"^\s*([가-힣]{2,5})\s*,?\s*(?:\d{1,3}|[가-힣]{2,8})\s*(?:살|세)(?![가-힣])",
+        r"(?:^|\s)([가-힣]{2,5})\s*,?\s*(?:\d{1,3}|[가-힣]{2,8})\s*(?:살|세)(?![가-힣])\s*(?:남자|남성|여자|여성)?",
+        r"(?:^|\s)([가-힣]{2,5})\s*(?:남자|남성|여자|여성)\s*,?\s*\d{1,3}\s*(?:살|세)?(?![가-힣])",
         (
             r"(?:대상자|아버지|어머니|엄마|아빠|남편|아내|배우자)"
             r"(?:\s*이름은|\s*성함은|\s*는|\s*가|\s*께서는)?\s*"
@@ -1323,11 +1350,11 @@ def _heuristic_identity_extract(text: str) -> dict[str, Any]:
             continue
         profile["name"] = candidate
         break
-    age_match = re.search(r"(\d{1,3})\s*(?:살|세)", text)
+    age_match = re.search(r"(\d{1,3})\s*(?:살|세)(?![가-힣])", text)
     if age_match:
         profile["age"] = age_match.group(1)
     else:
-        korean_age_match = re.search(r"([가-힣]{2,8})\s*(?:살|세)", text)
+        korean_age_match = re.search(r"([가-힣]{2,8})\s*(?:살|세)(?![가-힣])", text)
         if korean_age_match:
             age = _parse_korean_age(korean_age_match.group(1))
             if age:
@@ -1398,6 +1425,15 @@ def _parse_korean_age(text: str) -> int:
 
 def _looks_like_non_name_identity_candidate(value: str) -> bool:
     return value in {
+        # 안내문/지시문에서 흔히 등장하는 기능어 — 이름이 될 수 없다.
+        "말씀",
+        "이름",
+        "나이",
+        "성별",
+        "본인",
+        "환자",
+        "사용자",
+        "성함",
         "고혈압",
         "당뇨",
         "천식",

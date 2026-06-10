@@ -1,5 +1,6 @@
 export interface BrowserCapabilities {
   mediaDevices: boolean;
+  mediaRecorder: boolean;
   speechRecognition: boolean;
   speechSynthesis: boolean;
 }
@@ -10,6 +11,7 @@ export function detectBrowserCapabilities(
 ): BrowserCapabilities {
   return {
     mediaDevices: Boolean(nav?.mediaDevices?.getUserMedia),
+    mediaRecorder: Boolean(win && "MediaRecorder" in win && nav?.mediaDevices?.getUserMedia),
     speechRecognition: Boolean(speechRecognitionConstructor(win)),
     speechSynthesis: Boolean(win && "speechSynthesis" in win),
   };

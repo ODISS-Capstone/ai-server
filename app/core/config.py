@@ -154,15 +154,21 @@ class Settings(BaseSettings):
     gemini_api_key: Optional[str] = None
     stt_provider: str = "gemini"  # gemini | whisper
     gemini_stt_model: str = "gemini-2.5-flash"
-    gemini_stt_fallback_models: str = "gemini-2.5-flash-lite,gemini-1.5-flash"
+    gemini_stt_fallback_models: str = "gemini-2.5-flash-lite,gemini-2.0-flash"
     gemini_stt_timeout_seconds: float = 30.0
     whisper_model: str = "large-v3-turbo"
     whisper_device: str = "auto"  # auto | cuda | cpu
     whisper_compute_type: str = "auto"  # auto | float16 | int8_float16 | int8
     whisper_cpu_threads: int = 4
+    # gemini-1.5-flash는 retire되어 404를 반환하므로 폴백에서 제외한다.
     gemini_ocr_model: str = "gemini-2.5-flash-lite"
-    gemini_ocr_fallback_models: str = "gemini-2.5-flash,gemini-1.5-flash"
+    gemini_ocr_fallback_models: str = "gemini-2.5-flash,gemini-2.0-flash"
     gemini_ocr_timeout_seconds: float = 45.0
+    # Gemini OCR 전면 실패(429 크레딧 소진 등) 시 Together 비전 모델 폴백.
+    # 계정에서 serverless로 호출 가능한 VLM이어야 한다(Qwen3-VL 계열은 dedicated endpoint 필요).
+    together_vision_model: str = "moonshotai/Kimi-K2.6"
+    together_vision_fallback_models: str = ""
+    together_vision_timeout_seconds: float = 45.0
 
     # TurboQuant compressed KV cache — enabled by default on all Transformers
     # loads; see turboquant.runtime for details.

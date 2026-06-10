@@ -1007,14 +1007,16 @@ def test_reminder_setup_sends_filler_before_reminder_response(monkeypatch: pytes
 
     class SlowReminderService(FakeReminderService):
         async def handle_user_text(self, **kwargs):
+            # 지연 필러 계약: 처리 시간이 INITIAL_FILLER_DELAY_SEC을 넘기면 필러가 발화된다.
+            await asyncio.sleep(0.05)
             assert websocket.sent
             assert websocket.sent[0]["type"] == "filler"
-            await asyncio.sleep(0)
             return "네, 김영수님. 현재 저장된 복약 정보 기준으로 식후 복용 알림을 설정할 수 있습니다."
 
     monkeypatch.setattr(agent_ws, "memory_engine", fake_memory)
     monkeypatch.setattr(agent_ws, "reminder_service", SlowReminderService())
     monkeypatch.setattr(agent_ws, "evaluate_identity_gate", fake_identity_gate)
+    monkeypatch.setattr(agent_ws, "INITIAL_FILLER_DELAY_SEC", 0.01)
 
     run(
         agent_ws._handle_stt(
@@ -2356,6 +2358,8 @@ def test_medication_reasoning_sends_filler_before_orchestrator(monkeypatch: pyte
         )
 
     async def fake_run_turn(**kwargs):
+        # 지연 필러 계약: 오케스트레이터가 INITIAL_FILLER_DELAY_SEC보다 오래 걸리면 필러가 발화된다.
+        await asyncio.sleep(0.05)
         assert websocket.sent
         assert websocket.sent[0]["type"] == "filler"
         return SimpleNamespace(
@@ -2375,6 +2379,7 @@ def test_medication_reasoning_sends_filler_before_orchestrator(monkeypatch: pyte
     monkeypatch.setattr(agent_ws, "reminder_service", FakeReminderService())
     monkeypatch.setattr(agent_ws, "evaluate_identity_gate", fake_identity_gate)
     monkeypatch.setattr(agent_ws.engine_orchestrator, "run_turn", fake_run_turn)
+    monkeypatch.setattr(agent_ws, "INITIAL_FILLER_DELAY_SEC", 0.01)
 
     run(
         agent_ws._handle_stt(

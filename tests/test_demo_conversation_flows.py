@@ -2139,7 +2139,9 @@ def test_out_of_scope_stt_noise_is_answered_without_llm_search(tmp_path):
     assert result.conversation.response_type == "smalltalk"
     assert result.conversation.response_text
     assert result.conversation.requires_tts is True
-    assert any(event.action == "skip_llm_polish" for event in result.engine_trace)
+    # 일반 대화(unclear smalltalk)는 delivery LLM 자연 응답을 허용하지만,
+    # 비활성/실패 시에도 외부 LLM 검색 없이 결정적 응답으로 마무리되어야 한다.
+    assert not any(event.action == "call_local_delivery_llm" for event in result.engine_trace)
 
 
 def test_orchestrator_identity_gate_blocks_before_reasoning(tmp_path):

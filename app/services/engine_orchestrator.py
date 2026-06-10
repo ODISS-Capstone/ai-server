@@ -1194,6 +1194,23 @@ class EngineOrchestrator:
                 len(delivery_message or ""),
             )
 
+        if (
+            str(getattr(decision, "intent", "") or "").lower() == "smalltalk"
+            and not skip_llm_polish
+            and (delivery_message or "").strip() == (reviewed_message or "").strip()
+        ):
+            # 일반 대화 turn에서 delivery LLM이 실패/비활성이면 내부 지시문이
+            # 그대로 발화되지 않도록 정형 스몰토크 응답으로 폴백한다.
+            delivery_message = self.conversation.build_assistant_response(
+                query_text,
+                context.get("user_profile"),
+                context=context,
+            )
+            logger.info(
+                "[DeliveryLLM] smalltalk_polish_unavailable fallback=deterministic chars=%d",
+                len(delivery_message or ""),
+            )
+
         stage_started = perf_counter()
         conversation = self.conversation.compose_from_contract(
             ConversationComposeRequest(
@@ -1631,6 +1648,15 @@ class EngineOrchestrator:
             return f"{name}님이십니다. 현재 저장된 정보는 {detail_text}입니다."
 
         if decision.intent == "smalltalk":
+            smalltalk_type = self.conversation.assistant_response_type(text)
+            if smalltalk_type == "unclear":
+                # 정형 패턴에 안 잡히는 일반 대화: 메뉴 안내문을 반복하지 않고
+                # delivery LLM이 자연스러운 대화 응답을 생성하도록 지시문을 전달한다.
+                return (
+                    f"사용자가 복약과 무관한 일반 대화를 건넴: \"{text}\". "
+                    "기능 메뉴(약 확인/알림/약봉투 사진)를 안내하지 말고, "
+                    "사용자의 말을 받아 1~2문장으로 자연스럽게 대화를 이어갈 것."
+                )
             return self.conversation.build_assistant_response(text, profile, context=context)
 
         profile_update = (
@@ -1818,6 +1844,10 @@ class EngineOrchestrator:
         if mode == ReasoningMode.ASK_USER_CLARIFY:
             return "clarify_fast_path"
         if intent == "smalltalk" or rationale == "smalltalk_detected":
+            # 인사/감사 등 정형 스몰토크만 결정적 응답으로 스킵한다.
+            # 분류되지 않는 일반 대화(unclear)는 conversation LLM으로 자연 응답을 만든다.
+            if ConversationEngine().assistant_response_type(text) == "unclear":
+                return ""
             return "smalltalk_fast_path"
         if is_profile_recall_query(text):
             return "profile_recall_fast_path"

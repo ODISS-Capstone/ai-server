@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import type { CSSProperties, ChangeEvent, FormEvent } from "react";
 
-import { uploadOcrImage, websocketUrl } from "../api/assistant";
+import { transcribeAudio, uploadOcrImage, websocketUrl } from "../api/assistant";
 import {
   assistantMessagesReducer,
   computeLatency,
@@ -52,6 +52,14 @@ interface WsPayload {
 
 const SPEAKER_STORAGE_KEY = "odiss.assistant.speaker_id";
 const SESSION_STORAGE_KEY = "odiss.assistant.session_id";
+const OCR_AUTO_CAPTURE_DELAY_MS = 5500;
+const VIDEO_ELEMENT_TIMEOUT_MS = 1200;
+const VIDEO_READY_TIMEOUT_MS = 2500;
+const SERVER_STT_MAX_RECORDING_MS = 20000;
+const SERVER_STT_NO_SPEECH_TIMEOUT_MS = 1800;
+const SERVER_STT_SILENCE_AFTER_SPEECH_MS = 900;
+const SERVER_STT_MIN_RECORDING_MS = 500;
+const SERVER_STT_VOICE_THRESHOLD = 0.045;
 
 export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
   const [messages, dispatch] = useReducer(assistantMessagesReducer, []);
@@ -102,9 +110,17 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const ocrRunRef = useRef(0);
+  const autoCaptureTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const cameraModeRef = useRef<CameraMode>("idle");
+  const ocrBusyRef = useRef(false);
+  const serverSttRecorderRef = useRef<MediaRecorder | null>(null);
+  const serverSttStopRef = useRef<(() => void) | null>(null);
+  const serverSttRunRef = useRef(0);
 
   const browserCapabilities = useMemo(() => detectBrowserCapabilities(), []);
+  const serverSttSupported = browserCapabilities.mediaRecorder;
   const speechSupported = browserCapabilities.speechRecognition;
+  const voiceInputSupported = serverSttSupported;
 
   useEffect(() => {
     localStorage.setItem(SPEAKER_STORAGE_KEY, speakerId);
@@ -119,20 +135,29 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
   }, [voiceArmed]);
 
   useEffect(() => {
-    if (voiceArmed && speechSupported) {
+    cameraModeRef.current = cameraMode;
+  }, [cameraMode]);
+
+  useEffect(() => {
+    ocrBusyRef.current = ocrBusy;
+  }, [ocrBusy]);
+
+  useEffect(() => {
+    if (voiceArmed && voiceInputSupported) {
       void startVoiceMeter();
     } else {
       stopVoiceMeter();
     }
     // The meter follows the user-controlled armed state only.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [speechSupported, voiceArmed]);
+  }, [voiceInputSupported, voiceArmed]);
 
   useEffect(() => {
     return () => {
       if (sttPulseTimerRef.current) {
         clearTimeout(sttPulseTimerRef.current);
       }
+      clearAutoCaptureTimer();
       stopVoiceMeter();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -210,9 +235,10 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
       return existing;
     }
 
+    const url = websocketUrl(token);
     setStatus("connecting");
-    logClientEvent("ws_connecting", { url: websocketUrl(token) });
-    const socket = new WebSocket(websocketUrl(token));
+    logClientEvent("ws_connecting", { url });
+    const socket = new WebSocket(url);
     wsRef.current = socket;
 
     socket.onopen = () => {
@@ -225,16 +251,22 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
     socket.onmessage = (event) => handleSocketMessage(event.data);
     socket.onerror = () => {
       setStatus("error");
-      showPublicNotice({ kind: "connection", text: "연결을 다시 확인하고 있어요.", action: "reconnect" });
-      logClientEvent("ws_error");
+      showPublicNotice({ kind: "connection", text: "WebSocket 연결을 확인하고 있어요.", action: "reconnect" });
+      logClientEvent("ws_error", { url });
     };
-    socket.onclose = () => {
+    socket.onclose = (event) => {
+      const closeCode = event?.code ?? 0;
+      const closeReason = event?.reason ?? "";
       setStatus("closed");
-      logClientEvent("ws_close");
+      logClientEvent("ws_close", { code: closeCode, reason: closeReason, url });
       clearReconnectNoticeTimer();
+      if (closeCode === 1008) {
+        showPublicNotice({ kind: "connection", text: "접속 토큰이 맞지 않아 서버 연결이 닫혔어요.", action: "reconnect" });
+        return;
+      }
       reconnectNoticeTimerRef.current = setTimeout(() => {
-        showPublicNotice({ kind: "connection", text: "연결 다시 시도 중이에요.", action: "reconnect" });
-        logClientEvent("ws_reconnect_visible");
+        showPublicNotice({ kind: "connection", text: "서버 WebSocket 연결을 다시 시도 중이에요.", action: "reconnect" });
+        logClientEvent("ws_reconnect_visible", { code: closeCode, url });
       }, 3000);
       if (!reconnectTimerRef.current) {
         reconnectTimerRef.current = setTimeout(() => {
@@ -273,11 +305,11 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
       return;
     }
 
+    const text = payloadText(payload);
     if (payload.type === "ocr_request" || payload.needs_recapture) {
-      void activateCamera("서버가 사진 확인을 요청했습니다. 약봉투나 처방전을 화면에 맞춰주세요.");
+      void handleOcrCaptureRequest(payload, text);
     }
 
-    const text = payloadText(payload);
     if (payloadRequestsCameraClose(payload, text)) {
       closeCameraSession();
     }
@@ -392,11 +424,18 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
   }
 
   function startAssistant() {
-    if (!speechSupported) {
+    if (!voiceInputSupported) {
       setManualOpen(true);
-      showPublicNotice({ kind: "permission", text: "음성 입력이 어려워 직접 입력을 열었어요.", action: "manual" });
-      logClientEvent("stt_error", { error: "unsupported" });
-      appendSystemMessage("이 브라우저는 음성 인식을 지원하지 않습니다. 아래에 말씀을 적어 주세요.", "warning");
+      const reason = typeof window !== "undefined" && !window.isSecureContext
+        ? "마이크 녹음은 HTTPS 또는 localhost에서만 사용할 수 있습니다."
+        : "이 브라우저는 서버 음성 녹음을 지원하지 않습니다.";
+      showPublicNotice({ kind: "permission", text: "마이크 녹음을 사용할 수 없어 직접 입력을 열었어요.", action: "manual" });
+      logClientEvent("stt_error", {
+        error: "server_stt_unsupported",
+        media_devices_supported: browserCapabilities.mediaDevices,
+        secure_context: typeof window !== "undefined" ? window.isSecureContext : false,
+      });
+      appendSystemMessage(`${reason} 아래에 말씀을 적어 주세요.`, "warning");
       return;
     }
     clearPublicNotice("permission");
@@ -486,6 +525,197 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
   }
 
   function startListening() {
+    if (serverSttSupported) {
+      void startServerSttListening();
+      return;
+    }
+    setManualOpen(true);
+    showPublicNotice({ kind: "permission", text: "마이크 녹음을 사용할 수 없어 직접 입력을 열었어요.", action: "manual" });
+    appendSystemMessage("서버 음성 인식용 마이크 녹음을 시작할 수 없습니다. HTTPS/localhost 접속과 마이크 권한을 확인해 주세요.", "warning");
+  }
+
+  async function startServerSttListening() {
+    if (listening || serverSttRecorderRef.current) {
+      return;
+    }
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
+      setManualOpen(true);
+      showPublicNotice({ kind: "permission", text: "마이크 녹음을 사용할 수 없어 직접 입력을 열었어요.", action: "manual" });
+      appendSystemMessage("서버 음성 인식용 마이크 녹음을 시작할 수 없습니다. HTTPS/localhost 접속과 마이크 권한을 확인해 주세요.", "warning");
+      return;
+    }
+    if (speakingRef.current) {
+      setTimeout(() => startListening(), 250);
+      return;
+    }
+    manualStopRef.current = false;
+    const runId = serverSttRunRef.current + 1;
+    serverSttRunRef.current = runId;
+    turnTimingRef.current = { sttStart: performance.now() };
+    setListening(true);
+    logClientEvent("stt_start", { provider: "server_audio" });
+
+    let stream: MediaStream | null = null;
+    let audioContext: AudioContext | null = null;
+    let meterFrame: number | null = null;
+    let stopFallbackTimer: ReturnType<typeof setTimeout> | null = null;
+    let recorder: MediaRecorder | null = null;
+    const chunks: Blob[] = [];
+
+    const cleanup = () => {
+      if (meterFrame !== null) {
+        cancelAnimationFrame(meterFrame);
+        meterFrame = null;
+      }
+      if (stopFallbackTimer) {
+        clearTimeout(stopFallbackTimer);
+        stopFallbackTimer = null;
+      }
+      stream?.getTracks().forEach((track) => track.stop());
+      stream = null;
+      void audioContext?.close();
+      audioContext = null;
+      if (serverSttRecorderRef.current === recorder) {
+        serverSttRecorderRef.current = null;
+      }
+      if (serverSttStopRef.current === stopRecording) {
+        serverSttStopRef.current = null;
+      }
+      setListening(false);
+    };
+
+    const stopRecording = () => {
+      if (recorder && recorder.state !== "inactive") {
+        recorder.stop();
+      }
+    };
+
+    serverSttStopRef.current = stopRecording;
+
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+        },
+        video: false,
+      });
+      if (serverSttRunRef.current !== runId || manualStopRef.current) {
+        cleanup();
+        return;
+      }
+
+      const mimeType = preferredAudioMimeType();
+      recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+      serverSttRecorderRef.current = recorder;
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          chunks.push(event.data);
+        }
+      };
+      const finished = new Promise<Blob>((resolve, reject) => {
+        recorder!.onstop = () => resolve(new Blob(chunks, { type: recorder?.mimeType || mimeType || "audio/webm" }));
+        recorder!.onerror = () => reject(new Error("audio_recording_failed"));
+      });
+
+      recorder.start();
+      startServerSttSilenceDetector(stream, stopRecording);
+      stopFallbackTimer = setTimeout(stopRecording, SERVER_STT_MAX_RECORDING_MS);
+
+      const audioBlob = await finished;
+      cleanup();
+      if (serverSttRunRef.current !== runId || manualStopRef.current || audioBlob.size === 0) {
+        return;
+      }
+      setInterimText("서버 음성 인식 중...");
+      const file = new File([audioBlob], `odiss-stt-${Date.now()}${audioFileExtension(audioBlob.type)}`, {
+        type: audioBlob.type || "audio/webm",
+      });
+      const result = await transcribeAudio(file, { speakerId, token, language: navigator.language || "ko-KR" });
+      if (serverSttRunRef.current !== runId || manualStopRef.current) {
+        return;
+      }
+      const transcript = result.text.trim();
+      setInterimText("");
+      if (!transcript) {
+        recoverableSttErrorCountRef.current += 1;
+        logClientEvent("stt_error", { error: "empty_transcript", provider: result.provider });
+        if (recoverableSttErrorCountRef.current >= 3) {
+          setManualOpen(true);
+          showPublicNotice({ kind: "permission", text: "말이 잘 들리지 않아 직접 입력을 열었어요.", action: "manual" });
+        }
+      } else if (!(speakingRef.current && isLikelyAssistantEcho(transcript, activeSpeechTextRef.current))) {
+        recoverableSttErrorCountRef.current = 0;
+        clearPublicNotice("permission");
+        pulseFromTranscript();
+        logClientEvent("stt_result", {
+          audio_bytes: result.audio_bytes,
+          final: true,
+          preview: transcript.slice(0, 80),
+          provider: result.provider,
+        });
+        turnTimingRef.current.sttEnd = performance.now();
+        sendText(transcript, "speech");
+      }
+    } catch (error) {
+      cleanup();
+      const message = error instanceof Error ? error.message : "server_stt_failed";
+      logClientEvent("stt_error", { error: message, provider: "server_audio" });
+      if (!manualStopRef.current) {
+        setManualOpen(true);
+        showPublicNotice({ kind: "permission", text: "마이크 녹음이나 서버 음성 인식에 실패했어요.", action: "manual" });
+        appendSystemMessage(`음성 인식 오류: ${message}`, "warning");
+      }
+    } finally {
+      if (voiceArmedRef.current && !manualStopRef.current && serverSttRunRef.current === runId) {
+        setTimeout(() => startListening(), 300);
+      }
+    }
+
+    function startServerSttSilenceDetector(inputStream: MediaStream, stop: () => void) {
+      const AudioContextConstructor = window.AudioContext || (window as any).webkitAudioContext;
+      if (!AudioContextConstructor) {
+        return;
+      }
+      audioContext = new AudioContextConstructor();
+      const analyser = audioContext.createAnalyser();
+      analyser.fftSize = 512;
+      analyser.smoothingTimeConstant = 0.7;
+      const source = audioContext.createMediaStreamSource(inputStream);
+      source.connect(analyser);
+      const data = new Uint8Array(analyser.fftSize);
+      const startedAt = performance.now();
+      let speechStarted = false;
+      let lastVoiceAt = startedAt;
+      const tick = () => {
+        analyser.getByteTimeDomainData(data);
+        let sum = 0;
+        for (let index = 0; index < data.length; index += 1) {
+          const centered = (data[index] - 128) / 128;
+          sum += centered * centered;
+        }
+        const rms = Math.sqrt(sum / data.length);
+        const now = performance.now();
+        setVoiceLevel((previous) => (Math.abs(previous - Math.min(1, rms * 12)) > 0.025 ? Math.min(1, rms * 12) : previous));
+        if (rms >= SERVER_STT_VOICE_THRESHOLD) {
+          speechStarted = true;
+          lastVoiceAt = now;
+        }
+        const noSpeechExpired = !speechStarted && now - startedAt >= SERVER_STT_NO_SPEECH_TIMEOUT_MS;
+        const silenceExpired = speechStarted &&
+          now - startedAt >= SERVER_STT_MIN_RECORDING_MS &&
+          now - lastVoiceAt >= SERVER_STT_SILENCE_AFTER_SPEECH_MS;
+        if (noSpeechExpired || silenceExpired) {
+          stop();
+          return;
+        }
+        meterFrame = requestAnimationFrame(tick);
+      };
+      tick();
+    }
+  }
+
+  function startBrowserSpeechRecognition() {
     const Recognition = speechRecognitionConstructor();
     if (!Recognition) {
       appendSystemMessage("이 브라우저는 음성 인식을 지원하지 않습니다. 텍스트로 입력해 주세요.", "warning");
@@ -580,6 +810,9 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
     manualStopRef.current = true;
     voiceArmedRef.current = false;
     setVoiceArmed(false);
+    serverSttRunRef.current += 1;
+    serverSttStopRef.current?.();
+    serverSttStopRef.current = null;
     recognitionRef.current?.stop?.();
     recognitionRef.current = null;
     setListening(false);
@@ -606,7 +839,7 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
         timing.ttsStart = now;
         turnTimingsRef.current.set(turnId!, timing);
       }
-      if (voiceArmedRef.current && !recognitionRef.current && !manualStopRef.current) {
+      if (!serverSttSupported && voiceArmedRef.current && !recognitionRef.current && !manualStopRef.current) {
         setTimeout(() => startListening(), 120);
       }
     };
@@ -658,16 +891,41 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
     speak(liveReplyText, latestReplyMessage?.turnId);
   }
 
-  async function activateCamera(message = "사진 확인을 준비했습니다.") {
+  async function handleOcrCaptureRequest(payload: WsPayload, requestText: string) {
+    clearAutoCaptureTimer();
+    const ready = await activateCamera("서버가 사진 확인을 요청했습니다. 약봉투나 처방전을 화면에 맞춰주세요.");
+    if (!ready || !shouldAutoCaptureOcrRequest(payload)) {
+      return;
+    }
+    setCameraMessage("카메라가 준비됐습니다. 안내가 끝나면 자동으로 촬영하겠습니다.");
+    autoCaptureTimerRef.current = setTimeout(() => {
+      autoCaptureTimerRef.current = null;
+      if (cameraModeRef.current !== "ready" || ocrBusyRef.current) {
+        return;
+      }
+      void captureAndAnalyze();
+    }, ocrAutoCaptureDelayMs(requestText));
+  }
+
+  function clearAutoCaptureTimer() {
+    if (autoCaptureTimerRef.current) {
+      clearTimeout(autoCaptureTimerRef.current);
+      autoCaptureTimerRef.current = null;
+    }
+  }
+
+  async function activateCamera(message = "사진 확인을 준비했습니다."): Promise<boolean> {
     setCameraMessage(message);
     setCameraMode("opening");
+    cameraModeRef.current = "opening";
     logClientEvent("camera_open");
     if (!navigator.mediaDevices?.getUserMedia) {
       setCameraMode("error");
+      cameraModeRef.current = "error";
       setCameraMessage("카메라를 열 수 없어요. 사진 선택을 사용해 주세요.");
       showPublicNotice({ kind: "permission", text: "카메라를 열 수 없어요.", action: "manual" });
       logClientEvent("camera_error", { error: "unsupported" });
-      return;
+      return false;
     }
     try {
       stopCamera();
@@ -676,19 +934,26 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
         audio: false,
       });
       streamRef.current = stream;
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        await videoRef.current.play().catch(() => undefined);
+      const video = await waitForVideoElement();
+      if (streamRef.current !== stream) {
+        return false;
       }
+      video.srcObject = stream;
+      await video.play().catch(() => undefined);
+      await waitForVideoReady(video);
       setCameraMode("ready");
+      cameraModeRef.current = "ready";
       setCameraMessage("카메라가 준비됐습니다. 약 이름이 크게 보이게 맞춘 뒤 촬영해 주세요.");
       clearPublicNotice("permission");
       logClientEvent("camera_ready");
+      return true;
     } catch {
       setCameraMode("error");
+      cameraModeRef.current = "error";
       setCameraMessage("카메라 권한이 필요해요. 사진 선택도 가능합니다.");
       showPublicNotice({ kind: "permission", text: "카메라 권한을 확인해 주세요.", action: "manual" });
       logClientEvent("camera_error", { error: "permission" });
+      return false;
     }
   }
 
@@ -703,8 +968,11 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
   function closeCameraSession(message = "") {
     ocrRunRef.current += 1;
     setOcrBusy(false);
+    ocrBusyRef.current = false;
+    clearAutoCaptureTimer();
     stopCamera();
     setCameraMode("idle");
+    cameraModeRef.current = "idle";
     updatePreview(null);
     setCameraMessage("약봉투나 처방전을 보여주시면 제가 읽고 대화로 이어갈게요.");
     clearPublicNotice("permission");
@@ -715,11 +983,14 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
   }
 
   async function captureAndAnalyze() {
-    if (ocrBusy) {
+    if (ocrBusyRef.current) {
       return;
     }
     const video = videoRef.current;
     const canvas = canvasRef.current;
+    if (video) {
+      await waitForVideoReady(video, 1000);
+    }
     if (!video || !canvas || video.videoWidth === 0) {
       appendSystemMessage("카메라 화면이 아직 준비되지 않았습니다.", "warning");
       return;
@@ -735,6 +1006,7 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
     const file = new File([blob], `odiss-ocr-${Date.now()}.jpg`, { type: "image/jpeg" });
     updatePreview(file);
     setCameraMode("captured");
+    cameraModeRef.current = "captured";
     stopCamera();
     await analyzeOcrFile(file);
   }
@@ -748,6 +1020,7 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
     updatePreview(file);
     if (file) {
       setCameraMode("captured");
+      cameraModeRef.current = "captured";
       setCameraMessage("사진이 준비됐습니다. 바로 확인하겠습니다.");
       void analyzeOcrFile(file);
     }
@@ -764,6 +1037,7 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
     const runId = ocrRunRef.current + 1;
     ocrRunRef.current = runId;
     setOcrBusy(true);
+    ocrBusyRef.current = true;
     logClientEvent("ocr_start", { file_type: file.type, file_size: file.size });
     appendSystemMessage("사진을 읽고 있습니다. 글자가 잘 보이는지 확인한 뒤 대화로 이어갈게요.");
     try {
@@ -792,7 +1066,7 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
         client_sent_at: new Date().toISOString(),
         client_context: {
           source: "ocr",
-          camera_mode: cameraMode,
+          camera_mode: cameraModeRef.current,
           ocr_file_type: file.type,
           ocr_file_size: file.size,
           user_agent: navigator.userAgent,
@@ -812,6 +1086,7 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
     } finally {
       if (ocrRunRef.current === runId) {
         setOcrBusy(false);
+        ocrBusyRef.current = false;
       }
     }
   }
@@ -845,7 +1120,9 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
       runtime: {
         status,
         websocket_ready_state: wsRef.current?.readyState ?? null,
+        server_stt_supported: serverSttSupported,
         speech_supported: speechSupported,
+        voice_input_supported: voiceInputSupported,
         speech_synthesis_supported: browserCapabilities.speechSynthesis,
         media_devices_supported: browserCapabilities.mediaDevices,
         tts_enabled: ttsEnabled,
@@ -910,7 +1187,7 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
   const stateCopy = assistantModeCopy(mode, {
     cameraMessage,
     interimText,
-    speechSupported,
+    voiceInputSupported,
     status,
     voiceArmed,
   });
@@ -919,7 +1196,7 @@ export default function AssistantApp({ token, adminMode }: AssistantAppProps) {
     cameraMode,
     listening,
     ocrBusy,
-    speechSupported,
+    voiceInputSupported,
     voiceArmed,
   });
   const primaryKind = primaryActionKind({ cameraMode, ocrBusy });
@@ -1339,6 +1616,97 @@ function showCameraPanel(cameraMode: CameraMode, ocrPreview: string, ocrBusy: bo
   return cameraMode !== "idle" || Boolean(ocrPreview) || ocrBusy;
 }
 
+function preferredAudioMimeType(): string {
+  if (typeof MediaRecorder === "undefined" || typeof MediaRecorder.isTypeSupported !== "function") {
+    return "";
+  }
+  return ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"].find((type) => MediaRecorder.isTypeSupported(type)) || "";
+}
+
+function audioFileExtension(mimeType: string): string {
+  if (mimeType.includes("mp4") || mimeType.includes("mpeg")) {
+    return ".m4a";
+  }
+  if (mimeType.includes("ogg")) {
+    return ".ogg";
+  }
+  return ".webm";
+}
+
+function shouldAutoCaptureOcrRequest(payload: WsPayload): boolean {
+  const reason = String(payload.reason || "");
+  if (reason === "uncertain_ocr_result" || reason === "empty_ocr_medications" || reason === "user_requested_recapture") {
+    return false;
+  }
+  return reason === "direct_ocr_capture_request" || (payload.type === "ocr_request" && payload.requires_tts !== false);
+}
+
+function ocrAutoCaptureDelayMs(requestText: string): number {
+  return /5\s*,?\s*4\s*,?\s*3\s*,?\s*2\s*,?\s*1/.test(requestText)
+    ? OCR_AUTO_CAPTURE_DELAY_MS
+    : 1500;
+}
+
+async function waitForVideoElement(): Promise<HTMLVideoElement> {
+  const startedAt = Date.now();
+  return new Promise((resolve, reject) => {
+    const tick = () => {
+      const video = document.querySelector<HTMLVideoElement>(".camera-video");
+      if (video) {
+        resolve(video);
+        return;
+      }
+      if (Date.now() - startedAt > VIDEO_ELEMENT_TIMEOUT_MS) {
+        reject(new Error("Camera video element was not mounted"));
+        return;
+      }
+      nextFrame(tick);
+    };
+    tick();
+  });
+}
+
+async function waitForVideoReady(video: HTMLVideoElement, timeoutMs = VIDEO_READY_TIMEOUT_MS): Promise<void> {
+  if (video.videoWidth > 0) {
+    return;
+  }
+  await new Promise<void>((resolve) => {
+    const startedAt = Date.now();
+    let timeout: ReturnType<typeof setTimeout> | null = null;
+    const cleanup = () => {
+      if (timeout) {
+        clearTimeout(timeout);
+      }
+      video.removeEventListener("loadedmetadata", onReady);
+      video.removeEventListener("canplay", onReady);
+      video.removeEventListener("playing", onReady);
+    };
+    const onReady = () => {
+      cleanup();
+      resolve();
+    };
+    const poll = () => {
+      if (video.videoWidth > 0 || Date.now() - startedAt > timeoutMs) {
+        onReady();
+        return;
+      }
+      timeout = setTimeout(poll, 50);
+    };
+    video.addEventListener("loadedmetadata", onReady, { once: true });
+    video.addEventListener("canplay", onReady, { once: true });
+    video.addEventListener("playing", onReady, { once: true });
+    poll();
+  });
+}
+
+function nextFrame(callback: () => void) {
+  if (typeof window !== "undefined" && window.requestAnimationFrame) {
+    window.requestAnimationFrame(callback);
+    return;
+  }
+  setTimeout(callback, 16);
+}
+
 function isLikelyAssistantEcho(heard: string, spoken: string): boolean {
   const heardNorm = normalizeSpeechText(heard);
   const spokenNorm = normalizeSpeechText(spoken);
@@ -1399,7 +1767,7 @@ function assistantModeCopy(
   input: {
     cameraMessage: string;
     interimText: string;
-    speechSupported: boolean;
+    voiceInputSupported: boolean;
     status: ConnectionStatus;
     voiceArmed: boolean;
   },
@@ -1447,9 +1815,9 @@ function assistantModeCopy(
     };
   }
   return {
-    kicker: input.speechSupported ? "오디스 대기" : "직접 입력 가능",
+    kicker: input.voiceInputSupported ? "오디스 대기" : "직접 입력 가능",
     title: "오디스에게 말씀하세요",
-    subtitle: input.speechSupported
+    subtitle: input.voiceInputSupported
       ? "가운데 마이크를 한 번 누르면, 이후에는 말이 끝날 때마다 오디스가 알아서 듣습니다."
       : "이 브라우저는 음성 입력을 지원하지 않아 직접 입력으로 대화합니다.",
   };
@@ -1459,7 +1827,7 @@ function primaryActionLabel(input: {
   cameraMode: CameraMode;
   listening: boolean;
   ocrBusy: boolean;
-  speechSupported: boolean;
+  voiceInputSupported: boolean;
   voiceArmed: boolean;
 }): string {
   if (input.ocrBusy) return "확인 중";
@@ -1467,7 +1835,7 @@ function primaryActionLabel(input: {
   if (input.cameraMode === "ready") return "촬영하기";
   if (input.cameraMode === "error") return "사진 선택하기";
   if (input.voiceArmed || input.listening) return "듣기 중지";
-  return input.speechSupported ? "오디스 시작" : "직접 입력하기";
+  return input.voiceInputSupported ? "오디스 시작" : "직접 입력하기";
 }
 
 function primaryActionKind(input: { cameraMode: CameraMode; ocrBusy: boolean }): "mic" | "camera" {

@@ -18,6 +18,14 @@ export interface OcrUploadResponse {
   message?: string | null;
 }
 
+export interface SttTranscribeResponse {
+  success: boolean;
+  text: string;
+  provider: string;
+  model: string;
+  audio_bytes: number;
+}
+
 export interface FeedbackResponse {
   success: boolean;
   stored_at: string;
@@ -25,7 +33,22 @@ export interface FeedbackResponse {
 }
 
 export function apiBase(): string {
-  return import.meta.env.VITE_API_BASE_URL?.replace(/\/$/, "") ?? "";
+  const configured = import.meta.env.VITE_API_BASE_URL?.replace(/\/$/, "") ?? "";
+  const pageOrigin = typeof window === "undefined" ? "" : window.location.origin;
+  return resolveApiBase(configured, pageOrigin);
+}
+
+export function resolveApiBase(configured: string, pageOrigin: string): string {
+  const normalized = configured.replace(/\/$/, "");
+  if (!normalized || !pageOrigin) {
+    return normalized;
+  }
+  const configuredUrl = new URL(normalized, pageOrigin);
+  const pageUrl = new URL(pageOrigin);
+  if (!isLocalHost(pageUrl.hostname) && isLocalHost(configuredUrl.hostname)) {
+    return "";
+  }
+  return normalized;
 }
 
 export function storedToken(): string {
@@ -49,6 +72,9 @@ export function tokenFromUrl(): string {
 export function websocketUrl(token: string): string {
   const base = apiBase() || window.location.origin;
   const url = new URL(base);
+  if (url.hostname === "0.0.0.0") {
+    url.hostname = "127.0.0.1";
+  }
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
   url.pathname = "/ws/chat";
   url.search = "";
@@ -56,6 +82,10 @@ export function websocketUrl(token: string): string {
     url.searchParams.set("token", token.trim());
   }
   return url.toString();
+}
+
+function isLocalHost(hostname: string): boolean {
+  return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "0.0.0.0" || hostname === "::1";
 }
 
 export async function uploadOcrImage(file: File, token: string): Promise<OcrUploadResponse> {
@@ -67,6 +97,22 @@ export async function uploadOcrImage(file: File, token: string): Promise<OcrUplo
     body,
   });
   return parseJson<OcrUploadResponse>(response);
+}
+
+export async function transcribeAudio(
+  file: File,
+  input: { speakerId: string; token: string; language?: string },
+): Promise<SttTranscribeResponse> {
+  const body = new FormData();
+  body.set("file", file);
+  body.set("speaker_id", input.speakerId);
+  body.set("language", input.language || "ko-KR");
+  const response = await fetch(`${apiBase()}/api/stt/transcribe`, {
+    method: "POST",
+    headers: authHeaders(input.token),
+    body,
+  });
+  return parseJson<SttTranscribeResponse>(response);
 }
 
 export async function sendTurnFeedback(input: {

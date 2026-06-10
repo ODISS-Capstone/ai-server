@@ -23,6 +23,66 @@
       "display_name": "",
       "seen_count": 10,
       "source": "ws"
+    },
+    {
+      "speaker_id": "android-dd4ca801802e",
+      "platform": "android",
+      "first_seen": "2026-06-10T08:00:01",
+      "last_seen": "2026-06-10T12:55:52",
+      "first_ip": "211.234.199.81",
+      "last_ip": "211.234.199.81",
+      "app_version": "",
+      "display_name": "",
+      "seen_count": 4,
+      "source": "ws"
+    },
+    {
+      "speaker_id": "android-9202f99f97a3",
+      "platform": "android",
+      "first_seen": "2026-06-10T12:43:41",
+      "last_seen": "2026-06-10T12:43:41",
+      "first_ip": "222.109.143.193",
+      "last_ip": "222.109.143.193",
+      "app_version": "",
+      "display_name": "",
+      "seen_count": 1,
+      "source": "ws"
+    },
+    {
+      "speaker_id": "web-speaker-91la8q6k",
+      "platform": "web",
+      "first_seen": "2026-06-10T12:56:08",
+      "last_seen": "2026-06-10T12:56:08",
+      "first_ip": "127.0.0.1",
+      "last_ip": "127.0.0.1",
+      "app_version": "",
+      "display_name": "",
+      "seen_count": 1,
+      "source": "ws"
+    },
+    {
+      "speaker_id": "web-speaker-7znyy22b",
+      "platform": "web",
+      "first_seen": "2026-06-10T13:01:41",
+      "last_seen": "2026-06-10T13:01:41",
+      "first_ip": "211.234.192.118",
+      "last_ip": "211.234.192.118",
+      "app_version": "",
+      "display_name": "",
+      "seen_count": 1,
+      "source": "ws"
+    },
+    {
+      "speaker_id": "web-speaker-q2it8rk6",
+      "platform": "web",
+      "first_seen": "2026-06-10T13:01:49",
+      "last_seen": "2026-06-10T13:01:49",
+      "first_ip": "222.109.143.199",
+      "last_ip": "222.109.143.199",
+      "app_version": "",
+      "display_name": "",
+      "seen_count": 1,
+      "source": "ws"
     }
   ]
 }

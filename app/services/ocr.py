@@ -113,23 +113,25 @@ async def run_ocr_image(image_bytes: bytes, content_type: str = "image/jpeg") ->
     return OcrResponse(raw_text=raw_text, medications=medications)
 
 
+_OCR_PROMPT = (
+    "이 이미지는 처방전, 약봉투, 약 설명서 또는 복약 관련 사진입니다. "
+    "이미지에 보이는 약품명, 용량, 복용량, 복용 빈도, 복용 시점을 가능한 한 모두 한국어로 추출해 주세요. "
+    "각 약은 한 줄로 출력하고, 확실하지 않은 글자는 추측하지 말고 '불확실'이라고 표시하세요. "
+    "설명 문장이나 마크다운 없이 OCR 원문 중심으로만 답하세요."
+)
+
+
 async def _run_gemini_ocr_image(image_bytes: bytes, content_type: str) -> OcrResponse:
     api_key = settings.gemini_api_key
     if not api_key:
-        return OcrResponse(
-            raw_text="",
-            medications=[],
-            success=False,
-            message="OCR API 미설정: GEMINI_API_KEY 또는 DeepSeek OCR 설정이 필요합니다.",
+        return await _run_together_vision_ocr(
+            image_bytes,
+            content_type,
+            no_backend_message="OCR API 미설정: GEMINI_API_KEY, TOGETHER_API_KEY 또는 DeepSeek OCR 설정이 필요합니다.",
         )
 
     b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
-    prompt = (
-        "이 이미지는 처방전, 약봉투, 약 설명서 또는 복약 관련 사진입니다. "
-        "이미지에 보이는 약품명, 용량, 복용량, 복용 빈도, 복용 시점을 가능한 한 모두 한국어로 추출해 주세요. "
-        "각 약은 한 줄로 출력하고, 확실하지 않은 글자는 추측하지 말고 '불확실'이라고 표시하세요. "
-        "설명 문장이나 마크다운 없이 OCR 원문 중심으로만 답하세요."
-    )
+    prompt = _OCR_PROMPT
     body = {
         "contents": [
             {
@@ -178,7 +180,70 @@ async def _run_gemini_ocr_image(image_bytes: bytes, content_type: str) -> OcrRes
             medications = _parse_medications_from_text(raw_text)
             return OcrResponse(raw_text=raw_text, medications=medications, success=bool(raw_text))
 
-    return OcrResponse(raw_text="", medications=[], success=False, message="Gemini OCR 처리 실패")
+    # Gemini 전 모델 실패(429 크레딧 소진/404 등) → Together 비전 모델로 폴백.
+    logger.warning("[GeminiOCR] all models failed; falling back to Together vision OCR")
+    return await _run_together_vision_ocr(image_bytes, content_type)
+
+
+async def _run_together_vision_ocr(
+    image_bytes: bytes,
+    content_type: str,
+    no_backend_message: str = "OCR 처리 실패: Gemini 실패 후 Together 비전 폴백도 미설정입니다.",
+) -> OcrResponse:
+    """Together의 OpenAI 호환 chat/completions로 비전 OCR을 수행하는 폴백 경로."""
+    api_key = settings.together_api_key
+    if not api_key:
+        return OcrResponse(raw_text="", medications=[], success=False, message=no_backend_message)
+
+    b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
+    data_uri = f"data:{content_type or 'image/jpeg'};base64,{b64}"
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": _OCR_PROMPT},
+                {"type": "image_url", "image_url": {"url": data_uri}},
+            ],
+        }
+    ]
+    models = [
+        settings.together_vision_model,
+        *[
+            model.strip()
+            for model in settings.together_vision_fallback_models.split(",")
+            if model.strip()
+        ],
+    ]
+
+    async with httpx.AsyncClient(timeout=settings.together_vision_timeout_seconds) as client:
+        for model in dict.fromkeys(models):
+            try:
+                resp = await client.post(
+                    settings.together_base_url,
+                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                    json={"model": model, "messages": messages, "max_tokens": 1024, "temperature": 0},
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[TogetherVisionOCR] request failed model=%s error=%s", model, exc)
+                continue
+            if resp.status_code >= 400:
+                logger.warning(
+                    "[TogetherVisionOCR] request failed model=%s status=%s body=%s",
+                    model, resp.status_code, resp.text[:500],
+                )
+                continue
+            data = resp.json()
+            choices = data.get("choices") or []
+            raw_text = ""
+            if choices:
+                raw_text = str((choices[0].get("message") or {}).get("content") or "").strip()
+            if not raw_text:
+                logger.warning("[TogetherVisionOCR] empty response model=%s", model)
+                continue
+            medications = _parse_medications_from_text(raw_text)
+            return OcrResponse(raw_text=raw_text, medications=medications, success=True)
+
+    return OcrResponse(raw_text="", medications=[], success=False, message="OCR 처리 실패(Gemini/Together 모두 실패)")
 
 
 def _extract_gemini_text(payload: dict) -> str:
